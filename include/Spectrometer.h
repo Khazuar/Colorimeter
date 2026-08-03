@@ -23,9 +23,15 @@ struct Band {
 
 // bands:  N Baender (je eigenes Zentrum/Breite, Reihenfolge aufsteigend nach Zentrum)
 // values: N Messwerte (kalibrierte Reflexion, ~0..1+), values[i] gehoert zu bands[i]
+// nir:    Sonderfall NIR-Kanal (bei AS7341 910nm) -- genauso dark/white-korrigiert
+//         wie die Baender, aber bewusst NICHT Teil von bands/values: NIR ist kein
+//         "Band" im Sinne dieser Abstraktion (kein sichtbares Spektrum, wuerde bei
+//         einer Fensterkonstruktion wie die Baender eine unsinnig grosse Luecke zu
+//         F8 aufreissen), aber als einzelner, kalibrierter Messwert weiterhin nuetzlich.
 struct Spectrum {
   std::vector<Band> bands;
   std::vector<float> values;
+  float nir = 0.0f;
 };
 
 enum class Precision : uint8_t { Fast, Precise };
@@ -51,6 +57,15 @@ public:
   // Reine Berechnungen auf einem gegebenen Rohspektrum, kein Hardwarezugriff.
   virtual Spectrum getSpectrum(const std::vector<uint32_t>& raw) = 0;
   virtual Lab getColor(const std::vector<uint32_t>& raw) = 0;
+
+  // Nutzung des Sensor-Wertebereichs, UNABHAENGIG von der Dark/White-
+  // Kalibrierung (fiktiver Dunkelwert 0, fiktiver Weisswert = Sensor-eigener
+  // Referenzpunkt fuer "guter Ausschlag"). Sinnvoll z.B. waehrend einer
+  // Dark/White-Referenzmessung selbst: dort waere getSpectrum() sinnlos
+  // selbstbezueglich (die gerade gesetzte Referenz gegen sich selbst normiert
+  // ergibt immer 0%/100%), aber "wie sehr wird der Wertebereich ausgenutzt"
+  // bleibt eine ehrliche, kalibrierungsfreie Diagnose.
+  virtual Spectrum getRangeUtilization(const std::vector<uint32_t>& raw) = 0;
 
   // Setzt Dunkel-/Weiss-Referenzrohwerte (gleiches Format wie getRawSpectrum()).
   // Woher diese Werte kommen und ob/wie sie ueber einen Neustart hinweg persistiert

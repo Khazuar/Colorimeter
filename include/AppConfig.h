@@ -16,7 +16,7 @@ static const uint8_t OLED_ADDR   = 0x3C;
 // EINGEFROREN: identisch fuer Dunkel, Weiss und alle Proben verwenden!
 static const uint8_t       AS_ATIME = 100;
 static const uint16_t      AS_ASTEP = 999;                 // ~281 ms Integration
-static const as7341_gain_t AS_GAIN  = AS7341_GAIN_256X;    // Weiss bleibt unter Vollausschlag
+static const as7341_gain_t AS_GAIN  = AS7341_GAIN_512X;    // Weiss bleibt unter Vollausschlag
 
 // ------------------------- Taster -------------------------
 static const uint8_t  TRIGGER_PIN   = 3;
@@ -25,7 +25,13 @@ static const uint32_t DEBOUNCE_MS   = 40;
 static const uint32_t LONG_PRESS_MS = 600;
 
 // Messmodus: reines Orchestrierungs-Konzept, gehoert nicht in den Spectrometer.
-// Per Mode-Taste (lang) durchgeschaltet: Fast -> Precise -> White -> Dark -> Fast ...
+// Per Mode-Taste (lang) durchgeschaltet: Fast -> Precise -> White -> Dark -> Export -> Fast ...
 // White/Dark messen dabei immer mit Precision::Precise (siehe main.cpp precisionFor()),
 // unabhaengig vom Namen -- die Referenz ist Grundlage jeder spaeteren Reflexionsberechnung.
-enum class MeasureMode : uint8_t { Fast = 0, Precise = 1, White = 2, Dark = 3, COUNT = 4 };
+// Export misst nicht physisch: Trigger sendet dort stattdessen die Messhistorie per BLE.
+enum class MeasureMode : uint8_t { Fast = 0, Precise = 1, White = 2, Dark = 3, Export = 4, COUNT = 5 };
+
+// BLE-Export (Nordic UART Service) -- Geraetename ist app-weit relevant (main.cpp
+// startet/stoppt BleExporter damit); Chunk-Groesse/MTU/Delays bleiben rein interne
+// Implementierungsdetails von BleExporter.cpp.
+static constexpr char BLE_DEVICE_NAME[] = "Colorimeter";

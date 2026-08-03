@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <vector>
 #include "Spectrometer.h"
+#include "AppConfig.h"
 
 // Views arbeiten nur gegen die abstrakte Spectrometer&-Referenz plus vom
 // Aufrufer bereitgestellten Kontext -- bewusst KEIN Zugriff auf AS7341-
@@ -17,6 +18,8 @@ struct ViewContext {
   bool calibrated;                   // von der Orchestrierung getrackt
   const char* modeLabel;             // "F"/"P"/"W"/"D" fuer die Ecken-Anzeige
   const char* lastLabel;             // z.B. "sample_03", "" falls noch keine Messung
+  MeasureMode mode;                  // fuer Spectrum-View: White/Dark zeigen Wertebereich-Nutzung
+                                      // statt selbstbezueglicher Reflexion, siehe DisplayViews.cpp
 };
 
 using ViewRenderFn = void (*)(Adafruit_SSD1306& d, const ViewContext& ctx);

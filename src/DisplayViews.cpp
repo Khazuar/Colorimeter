@@ -108,7 +108,13 @@ static void renderSpectrum(Adafruit_SSD1306& d, const ViewContext& ctx) {
     d.setCursor(0, 0);
     d.println("keine Messung");
   } else {
-    Spectrum spec = ctx.spectrometer.getSpectrum(ctx.raw);
+    // Waehrend einer Dark/White-Referenzmessung ist getSpectrum() sinnlos
+    // selbstbezueglich (die Referenz wird ja gerade erst gegen sich selbst
+    // normiert und zeigt dann immer 0%/100%) -- stattdessen die kalibrierungs-
+    // freie Wertebereich-Nutzung zeigen (fiktiv: Dunkel=0, Weiss=Halb-Vollausschlag).
+    bool showRangeUtilization = (ctx.mode == MeasureMode::White || ctx.mode == MeasureMode::Dark);
+    Spectrum spec = showRangeUtilization ? ctx.spectrometer.getRangeUtilization(ctx.raw)
+                                          : ctx.spectrometer.getSpectrum(ctx.raw);
     size_t n = spec.values.size();
     if (n > MAX_DISPLAYABLE_BANDS) n = MAX_DISPLAYABLE_BANDS;
 

@@ -55,9 +55,15 @@ std::vector<uint32_t> AS7341Spectrometer::measureRawSpectrum(Precision precision
   uint8_t maxSamples = (precision == Precision::Fast) ? FAST_SAMPLES : PRECISE_MAX_SAMPLES;
   uint8_t minSamples = (precision == Precision::Fast) ? FAST_SAMPLES : PRECISE_MIN_SAMPLES;
 
-  // Loest den AS7341-Rohkanal-Quirk auf (Slot 4/5 sind Duplikate von F1-F4;
-  // die echten F5-F8 liegen auf Slot 6-9) -- einzige Stelle im ganzen Code,
-  // die das wissen muss.
+  // Loest die AS7341-Rohkanal-Reihenfolge auf. readAllChannels() macht intern
+  // zwei Integrationszyklen mit unterschiedlicher SMUX-Konfiguration (siehe
+  // Adafruit_AS7341::setup_F1F4_Clear_NIR()/setup_F5F8_Clear_NIR()):
+  //   Zyklus 1 (Slot 0-5):  F1, F2, F3, F4, Clear, NIR
+  //   Zyklus 2 (Slot 6-11): F5, F6, F7, F8, Clear, NIR
+  // Slot 4/5 sind KEINE Duplikate von F1-F4 (fruehere, falsche Annahme in
+  // diesem Kommentar), sondern ein erstes Clear/NIR-Messpaar -- wir ignorieren
+  // es und nehmen stattdessen das zweite Paar aus Slot 10/11. Einzige Stelle
+  // im ganzen Code, die diese Reihenfolge wissen muss.
   static const uint8_t SRC_IDX[N_CH] = { 0, 1, 2, 3, 6, 7, 8, 9, 10, 11 };
 
   static uint16_t buf[PRECISE_MAX_SAMPLES][N_CH];  // ~640B, static um Stack zu schonen
@@ -108,16 +114,22 @@ void AS7341Spectrometer::calibrate(const std::vector<uint32_t>& dark,
 }
 
 void AS7341Spectrometer::computeVisReflectance(const std::vector<uint32_t>& raw,
-                                                float R_vis[N_VIS]) const {
+                                                float R_vis[N_VIS], float& R_nir) const {
   bool haveCal = (dark_.size() == N_CH && white_.size() == N_CH);
   bool haveRaw = (raw.size() == N_CH);
-  for (uint8_t i = 0; i < N_VIS; i++) {
-    if (!haveCal || !haveRaw) { R_vis[i] = 0.0f; continue; }
-    float denom = (float)white_[i] - (float)dark_[i];
-    if (fabsf(denom) < 1e-6f) { R_vis[i] = 0.0f; continue; }
-    float r = ((float)raw[i] - (float)dark_[i]) / denom;
-    R_vis[i] = (r < 0.0f) ? 0.0f : r;  // kein oberes Clamping, spiegelt data/colorimeter.py
-  }
+
+  // Gleiche Formel fuer VIS-Baender und NIR (Index N_CH-1) -- kein oberes
+  // Clamping, spiegelt data/colorimeter.py.
+  auto reflectance = [&](uint8_t ch) -> float {
+    if (!haveCal || !haveRaw) return 0.0f;
+    float denom = (float)white_[ch] - (float)dark_[ch];
+    if (fabsf(denom) < 1e-6f) return 0.0f;
+    float r = ((float)raw[ch] - (float)dark_[ch]) / denom;
+    return (r < 0.0f) ? 0.0f : r;
+  };
+
+  for (uint8_t i = 0; i < N_VIS; i++) R_vis[i] = reflectance(i);
+  R_nir = reflectance(N_CH - 1);
 }
 
 void AS7341Spectrometer::computeXYZ(const float R_vis[N_VIS], float& X, float& Y, float& Z) const {
@@ -126,7 +138,8 @@ void AS7341Spectrometer::computeXYZ(const float R_vis[N_VIS], float& X, float& Y
 
 Spectrum AS7341Spectrometer::getSpectrum(const std::vector<uint32_t>& raw) {
   float R_vis[N_VIS];
-  computeVisReflectance(raw, R_vis);
+  float R_nir;
+  computeVisReflectance(raw, R_vis, R_nir);
 
   Spectrum s;
   s.bands.resize(N_VIS);
@@ -135,13 +148,46 @@ Spectrum AS7341Spectrometer::getSpectrum(const std::vector<uint32_t>& raw) {
     s.bands[i] = Band{ VIS_CENTERS_NM[i], VIS_FWHM_NM[i] };
     s.values[i] = R_vis[i];
   }
+  s.nir = R_nir;
   return s;
 }
 
 Lab AS7341Spectrometer::getColor(const std::vector<uint32_t>& raw) {
   float R_vis[N_VIS];
-  computeVisReflectance(raw, R_vis);
+  float unusedNir;  // NIR ist kein sichtbarer Reiz, fliesst nicht in die Farbberechnung ein
+  computeVisReflectance(raw, R_vis, unusedNir);
   float X, Y, Z;
   computeXYZ(R_vis, X, Y, Z);
   return xyzToLab(X, Y, Z);
+}
+
+// Fiktiver Weissbezug fuer die Wertebereich-Nutzung: die reale AS7341-
+// Vollausschlag-Formel ADCfullscale = (ATIME+1) * (ASTEP+1), gedeckelt auf
+// 65535 (Rohkanalregister sind 16-Bit-Zaehlwerte -- readAllChannels() liefert
+// uint16_t, mehr laesst sich digital gar nicht darstellen). Mit den
+// eingefrorenen Timing-Werten (AS_ATIME=100, AS_ASTEP=999) ergibt die Formel
+// rechnerisch 101000, was ueber der 16-Bit-Registerbreite liegt -- ein Kanal
+// saettigt bei genug Licht also tatsaechlich am Register-Deckel, bevor die
+// Formel "ausgereizt" waere. Deshalb der min()-Deckel; bleibt automatisch
+// korrekt, falls AS_ATIME/AS_ASTEP kuenftig angepasst werden (z.B. beim noch
+// ausstehenden Tuning des Precise-Algorithmus). Bewusst NICHT die
+// Kalibrierung (dark_/white_) -- das waere bei einer gerade laufenden
+// Dark/White-Referenzmessung sinnlos selbstbezueglich.
+static float rangeUtilizationFullScale() {
+  uint32_t theoretical = (uint32_t)(AS_ATIME + 1) * (uint32_t)(AS_ASTEP + 1);
+  return (float)((theoretical > 65535u) ? 65535u : theoretical);
+}
+
+Spectrum AS7341Spectrometer::getRangeUtilization(const std::vector<uint32_t>& raw) {
+  bool haveRaw = (raw.size() == N_CH);
+  float fullScale = rangeUtilizationFullScale();
+  Spectrum s;
+  s.bands.resize(N_VIS);
+  s.values.resize(N_VIS);
+  for (uint8_t i = 0; i < N_VIS; i++) {
+    s.bands[i] = Band{ VIS_CENTERS_NM[i], VIS_FWHM_NM[i] };
+    s.values[i] = haveRaw ? ((float)raw[i] / fullScale) : 0.0f;
+  }
+  s.nir = haveRaw ? ((float)raw[N_CH - 1] / fullScale) : 0.0f;
+  return s;
 }
