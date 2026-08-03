@@ -1,7 +1,6 @@
 #pragma once
 #include <Preferences.h>
-#include <cstdint>
-#include <vector>
+#include "Spectrometer.h"
 
 // Duenner NVS-Wrapper fuer die Dunkel-/Weiss-Kalibrierung. Gehoert der
 // Orchestrierung (main.cpp) -- der Spectrometer selbst fasst kein Flash an.
@@ -12,15 +11,15 @@ public:
   void begin();  // prefs_.begin("colorim", false)
 
   // false, falls nie gespeichert (out bleibt dann leer)
-  bool loadDark(std::vector<uint32_t>& out);
-  bool loadWhite(std::vector<uint32_t>& out);
+  bool loadDark(Measurement& out);
+  bool loadWhite(Measurement& out);
 
-  void saveDark(const std::vector<uint32_t>& v);
-  void saveWhite(const std::vector<uint32_t>& v);
+  void saveDark(const Measurement& v);
+  void saveWhite(const Measurement& v);
 
 private:
-  bool load(const char* key, std::vector<uint32_t>& out);
-  void save(const char* key, const std::vector<uint32_t>& v);
+  bool load(const char* key, Measurement& out);
+  void save(const char* key, const Measurement& v);
 
   Preferences prefs_;
 };

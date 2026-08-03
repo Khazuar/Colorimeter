@@ -2,6 +2,14 @@
 #include <cstdint>
 #include <vector>
 
+// Ergebnis einer physischen Messung: Struktur und Bedeutung der Elemente
+// sind ein Implementierungsdetail des jeweiligen Sensors (Reihenfolge,
+// Anzahl, welcher Kanal an welcher Position steht). Generischer Code soll
+// ein Measurement nur als opake Blackbox durchreichen (an getSpectrum()
+// oder zur Persistierung) -- siehe Spectrometer::measurementLabels() fuer
+// die einzige zulaessige Ausnahme (Debug/Analyse).
+using Measurement = std::vector<float>;
+
 struct Lab {
   float L;
   float a;
@@ -21,17 +29,15 @@ struct Band {
   float fwhm_nm;
 };
 
-// bands:  N Baender (je eigenes Zentrum/Breite, Reihenfolge aufsteigend nach Zentrum)
-// values: N Messwerte (kalibrierte Reflexion, ~0..1+), values[i] gehoert zu bands[i]
-// nir:    Sonderfall NIR-Kanal (bei AS7341 910nm) -- genauso dark/white-korrigiert
-//         wie die Baender, aber bewusst NICHT Teil von bands/values: NIR ist kein
-//         "Band" im Sinne dieser Abstraktion (kein sichtbares Spektrum, wuerde bei
-//         einer Fensterkonstruktion wie die Baender eine unsinnig grosse Luecke zu
-//         F8 aufreissen), aber als einzelner, kalibrierter Messwert weiterhin nuetzlich.
+// Sensor-UNABHAENGIGES Spektrum: N Baender (je eigenes Zentrum/Breite,
+// aufsteigend nach Zentrum) mit kalibrierten Reflexionswerten (~0..1+).
+// Bewusst nur das sichtbare Spektrum -- Kanaele wie Clear oder NIR, die kein
+// "echtes" Band des sichtbaren Spektrums darstellen (NIR waere z.B. eine
+// unsinnig breite Luecke zum letzten VIS-Band), gehoeren NICHT hierher,
+// sondern bleiben Teil des sensor-spezifischen Measurement.
 struct Spectrum {
   std::vector<Band> bands;
   std::vector<float> values;
-  float nir = 0.0f;
 };
 
 enum class Precision : uint8_t { Fast, Precise };
@@ -45,31 +51,27 @@ class Spectrometer {
 public:
   virtual ~Spectrometer() = default;
 
-  // Eine physische Messung, unverarbeitete Rohzaehlwerte. Nuetzlich eigenstaendig
-  // fuer Diagnose/Debug UND als gemeinsame Eingabe fuer getSpectrum()/getColor(),
-  // damit eine Messung genau einmal die Hardware anspricht, aus deren Ergebnis
-  // beliebig viele Ableitungen berechnet werden koennen. onProgress (falls gesetzt)
-  // wird waehrend der Messung wiederholt aufgerufen, damit die Orchestrierung z.B.
-  // eine Fortschrittsanzeige zeichnen kann.
-  virtual std::vector<uint32_t> measureRawSpectrum(Precision precision,
-                                                     ProgressCallback onProgress = nullptr) = 0;
+  // Eine physische Messung. Kapselt alles Sensor-Spezifische (I2C, SMUX-
+  // Konfiguration, Register auslesen/umrechnen) -- das Ergebnis ist ein
+  // opakes Measurement, keine Struktur darauf verlassen. onProgress (falls
+  // gesetzt) wird waehrend der Messung wiederholt aufgerufen, damit die
+  // Orchestrierung z.B. eine Fortschrittsanzeige zeichnen kann.
+  virtual Measurement performMeasurement(Precision precision,
+                                          ProgressCallback onProgress = nullptr) = 0;
 
-  // Reine Berechnungen auf einem gegebenen Rohspektrum, kein Hardwarezugriff.
-  virtual Spectrum getSpectrum(const std::vector<uint32_t>& raw) = 0;
-  virtual Lab getColor(const std::vector<uint32_t>& raw) = 0;
+  // NUR fuer Debug-/Analysezwecke: ein Klartext-Label je Measurement-Element,
+  // in derselben Reihenfolge und Laenge wie ein Measurement desselben Sensors.
+  // Darf NICHT von anderem Code benutzt werden, um den INHALT eines
+  // Measurements zu interpretieren (das waere ein Bruch der Abstraktion) --
+  // einzig zur menschenlesbaren Beschriftung beim Debug-Export gedacht.
+  virtual const char* const* measurementLabels() const = 0;
 
-  // Nutzung des Sensor-Wertebereichs, UNABHAENGIG von der Dark/White-
-  // Kalibrierung (fiktiver Dunkelwert 0, fiktiver Weisswert = Sensor-eigener
-  // Referenzpunkt fuer "guter Ausschlag"). Sinnvoll z.B. waehrend einer
-  // Dark/White-Referenzmessung selbst: dort waere getSpectrum() sinnlos
-  // selbstbezueglich (die gerade gesetzte Referenz gegen sich selbst normiert
-  // ergibt immer 0%/100%), aber "wie sehr wird der Wertebereich ausgenutzt"
-  // bleibt eine ehrliche, kalibrierungsfreie Diagnose.
-  virtual Spectrum getRangeUtilization(const std::vector<uint32_t>& raw) = 0;
-
-  // Setzt Dunkel-/Weiss-Referenzrohwerte (gleiches Format wie getRawSpectrum()).
-  // Woher diese Werte kommen und ob/wie sie ueber einen Neustart hinweg persistiert
-  // werden, ist Sache der Orchestrierung -- diese Klasse liest/schreibt kein Flash.
-  virtual void calibrate(const std::vector<uint32_t>& dark,
-                          const std::vector<uint32_t>& white) = 0;
+  // Reine Berechnung: baut ein sensor-unabhaengiges Spectrum aus einer
+  // Messung plus Weiss-/Dunkelreferenzmessung (gleiches Measurement-Format).
+  // Kein Hardwarezugriff, keine gespeicherte Kalibrierung -- jeder Aufruf ist
+  // eine reine Funktion seiner drei Eingaben. Wie eine leere/fehlende
+  // Referenz zu behandeln ist, entscheidet die jeweilige Implementierung.
+  virtual Spectrum getSpectrum(const Measurement& measurement,
+                                const Measurement& whiteReference,
+                                const Measurement& darkReference) const = 0;
 };

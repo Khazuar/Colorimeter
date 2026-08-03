@@ -28,7 +28,13 @@ void spectrumToXYZ(const float* wavelengths_nm, const float* values, int n,
 Lab  xyzToLab(float X, float Y, float Z);
 void xyzToSRGB255(float X, float Y, float Z, uint8_t& r, uint8_t& g, uint8_t& b);
 
-// Ruecktransformation fuer die Hex/RGB-Anzeige -- arbeitet nur auf dem von
-// getColor() gelieferten Lab, also sensor-unabhaengig.
+// Ruecktransformation fuer die Hex/RGB-Anzeige -- arbeitet nur auf Lab,
+// also sensor-unabhaengig.
 void labToXYZ(const Lab& lab, float& X, float& Y, float& Z);
 void labToSRGB255(const Lab& lab, uint8_t& r, uint8_t& g, uint8_t& b);
+
+// Leitet eine Lab-Farbe aus einem sensor-unabhaengigen Spectrum ab (CIE-
+// Integration ueber die Bandzentren, siehe spectrumToXYZ). Bewusst NICHT Teil
+// der Spectrometer-Abstraktion -- generische Farbwissenschaft, haengt von
+// keinen Sensor-Details ab, nur vom (bereits kalibrierten) Spectrum.
+Lab getColor(const Spectrum& spectrum);

@@ -1,5 +1,6 @@
 #include "ColorimetryTables.h"
 #include <cmath>
+#include <vector>
 
 // Generiert mit colour-science (CIE 1931 2 Degree Standard Observer, D50),
 // 5nm-Raster 380-730nm. Siehe ColorimetryTables.h fuer die Quelle.
@@ -167,4 +168,14 @@ void labToSRGB255(const Lab& lab, uint8_t& r, uint8_t& g, uint8_t& b) {
   float X, Y, Z;
   labToXYZ(lab, X, Y, Z);
   xyzToSRGB255(X, Y, Z, r, g, b);
+}
+
+Lab getColor(const Spectrum& spectrum) {
+  size_t n = spectrum.bands.size();
+  std::vector<float> wavelengths(n);
+  for (size_t i = 0; i < n; i++) wavelengths[i] = spectrum.bands[i].center_nm;
+
+  float X, Y, Z;
+  spectrumToXYZ(wavelengths.data(), spectrum.values.data(), (int)n, X, Y, Z);
+  return xyzToLab(X, Y, Z);
 }

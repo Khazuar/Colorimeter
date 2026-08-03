@@ -42,10 +42,11 @@ static void renderColorInfo(Adafruit_SSD1306& d, const ViewContext& ctx) {
 
   if (!ctx.calibrated) {
     renderNotCalibrated(d);
-  } else if (ctx.raw.empty()) {
+  } else if (ctx.measurement.empty()) {
     renderNoMeasurementYet(d);
   } else {
-    Lab lab = ctx.spectrometer.getColor(ctx.raw);
+    Spectrum spec = ctx.spectrometer.getSpectrum(ctx.measurement, ctx.whiteReference, ctx.darkReference);
+    Lab lab = getColor(spec);
     uint8_t r, g, b;
     labToSRGB255(lab, r, g, b);
     float dE;
@@ -94,27 +95,22 @@ static void drawRotatedLabel(Adafruit_SSD1306& d, const char* text, int leftX, i
   d.setRotation(2);  // zurueck zur normalen, montagekorrigierten Ausrichtung
 }
 
-// Ersetzt die fruehere RawSpectrum-View: nutzt getSpectrum() (8 normierte
-// VIS-Reflexionswerte), Clear/NIR sind hier nicht mehr relevant. Kein
-// Zahlen-Tabellenbereich mehr -- Bandzentrum und Wert (als Prozent) stehen
+// Nutzt getSpectrum() (8 normierte VIS-Reflexionswerte) -- Clear/NIR/rohe
+// Measurement-Werte sind hier nicht relevant (siehe Spectrometer.h). Kein
+// Zahlen-Tabellenbereich -- Bandzentrum und Wert (als Prozent) stehen
 // gedreht direkt unter/im Balken, damit moeglichst viel Hoehe fuer die
-// Balken selbst bleibt.
+// Balken selbst bleibt. White/Dark-Referenzmessungen laufen nicht mehr ueber
+// diese View (eigener Screen in main.cpp), daher hier kein Modus-Sonderfall.
 static void renderSpectrum(Adafruit_SSD1306& d, const ViewContext& ctx) {
   d.clearDisplay();
   d.setTextColor(SSD1306_WHITE);
   d.setTextSize(1);
 
-  if (ctx.raw.empty()) {
+  if (ctx.measurement.empty()) {
     d.setCursor(0, 0);
     d.println("keine Messung");
   } else {
-    // Waehrend einer Dark/White-Referenzmessung ist getSpectrum() sinnlos
-    // selbstbezueglich (die Referenz wird ja gerade erst gegen sich selbst
-    // normiert und zeigt dann immer 0%/100%) -- stattdessen die kalibrierungs-
-    // freie Wertebereich-Nutzung zeigen (fiktiv: Dunkel=0, Weiss=Halb-Vollausschlag).
-    bool showRangeUtilization = (ctx.mode == MeasureMode::White || ctx.mode == MeasureMode::Dark);
-    Spectrum spec = showRangeUtilization ? ctx.spectrometer.getRangeUtilization(ctx.raw)
-                                          : ctx.spectrometer.getSpectrum(ctx.raw);
+    Spectrum spec = ctx.spectrometer.getSpectrum(ctx.measurement, ctx.whiteReference, ctx.darkReference);
     size_t n = spec.values.size();
     if (n > MAX_DISPLAYABLE_BANDS) n = MAX_DISPLAYABLE_BANDS;
 
