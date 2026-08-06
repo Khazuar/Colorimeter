@@ -111,18 +111,34 @@ Measurement AS7341Spectrometer::performMeasurement(Precision precision, Progress
   return m;
 }
 
-void AS7341Spectrometer::computeVisReflectance(const Measurement& measurement,
-                                                const Measurement& whiteReference,
-                                                const Measurement& darkReference,
-                                                float R_vis[N_VIS]) const {
+// Optisches Uebersprechen: NIR-Licht beeinflusst F1-F4 unterschiedlich stark
+// (F1 am staerksten) -- Anteil des NIR-Reflexionswerts, der von der jeweiligen
+// VIS-Reflexion abgezogen werden muss. F5-F8 unbeeinflusst (Faktor 0).
+static const float NIR_CROSSTALK_FACTOR[AS7341Spectrometer::N_VIS] = {
+  0.55f, 0.17f, 0.19f, 0.07f, 0.0f, 0.0f, 0.0f, 0.0f
+};
+
+void AS7341Spectrometer::computeReflectance(const Measurement& measurement,
+                                             const Measurement& whiteReference,
+                                             const Measurement& darkReference,
+                                             float R_vis[N_VIS]) const {
   bool haveCal = (whiteReference.size() == N_CH && darkReference.size() == N_CH);
   bool haveMeasurement = (measurement.size() == N_CH);
+
+  // Gleiche Formel fuer VIS-Kanaele und NIR -- kein oberes Clamping,
+  // spiegelt data/colorimeter.py.
+  auto reflectance = [&](uint8_t ch) -> float {
+    if (!haveCal || !haveMeasurement) return 0.0f;
+    float denom = whiteReference[ch] - darkReference[ch];
+    if (fabsf(denom) < 1e-6f) return 0.0f;
+    float r = (measurement[ch] - darkReference[ch]) / denom;
+    return (r < 0.0f) ? 0.0f : r;
+  };
+
+  float R_nir = reflectance(N_CH - 1);
   for (uint8_t i = 0; i < N_VIS; i++) {
-    if (!haveCal || !haveMeasurement) { R_vis[i] = 0.0f; continue; }
-    float denom = whiteReference[i] - darkReference[i];
-    if (fabsf(denom) < 1e-6f) { R_vis[i] = 0.0f; continue; }
-    float r = (measurement[i] - darkReference[i]) / denom;
-    R_vis[i] = (r < 0.0f) ? 0.0f : r;  // kein oberes Clamping, spiegelt data/colorimeter.py
+    float r = (reflectance(i) - NIR_CROSSTALK_FACTOR[i] * R_nir) / (1 - NIR_CROSSTALK_FACTOR[i]);
+    R_vis[i] = (r < 0.0f) ? 0.0f : r;  // erneut clampen -- die NIR-Korrektur kann ins Negative ziehen
   }
 }
 
@@ -130,7 +146,7 @@ Spectrum AS7341Spectrometer::getSpectrum(const Measurement& measurement,
                                           const Measurement& whiteReference,
                                           const Measurement& darkReference) const {
   float R_vis[N_VIS];
-  computeVisReflectance(measurement, whiteReference, darkReference, R_vis);
+  computeReflectance(measurement, whiteReference, darkReference, R_vis);
 
   Spectrum s;
   s.bands.resize(N_VIS);

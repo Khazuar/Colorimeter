@@ -31,10 +31,15 @@ public:
                         const Measurement& darkReference) const override;
 
 private:
-  void computeVisReflectance(const Measurement& measurement,
-                              const Measurement& whiteReference,
-                              const Measurement& darkReference,
-                              float R_vis[N_VIS]) const;
+  // Berechnet die kalibrierte Reflexion der 8 VIS-Kanaele. Intern wird dabei
+  // auch die NIR-Reflexion bestimmt (gleiche Formel), um optisches
+  // Uebersprechen von NIR-Licht in F1-F4 herauszurechnen -- daher der Name
+  // (nicht mehr nur "Vis"). Das Ergebnis ist weiterhin nur R_vis; NIR selbst
+  // fliesst nicht in das (sensor-unabhaengige) Spectrum ein.
+  void computeReflectance(const Measurement& measurement,
+                          const Measurement& whiteReference,
+                          const Measurement& darkReference,
+                          float R_vis[N_VIS]) const;
 
   Adafruit_AS7341 as7341_;
 };
