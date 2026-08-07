@@ -35,7 +35,6 @@ UptimeLogger uptimeLogger;
 // ------------------------- letzte Messung / Anzeige-Zustand -------------------------
 Measurement lastMeasurement;
 char lastLabel[16] = "";
-uint16_t sampleCount = 0;
 bool busy = false;  // waehrend true: keine weitere Messung/kein weiterer Export ausloesbar
 
 MeasureMode currentMode = MeasureMode::Fast;
@@ -401,13 +400,21 @@ void performMeasurement(MeasureMode mode) {
   }
   lastMeasurement = measurement;
 
+  // Vor der Beschriftung inkrementieren: die Sample-Nummer ist der neue,
+  // lebenslange Zaehlerstand -- so laufen die Nummern ueber Reboots/Sessions
+  // hinweg durch, statt bei jedem Neustart wieder bei 1 anzufangen. Dark/White
+  // verbrauchen dabei ebenfalls eine Nummer (zaehlen als Messung), tauchen aber
+  // nicht als "sample_NN" auf -- entstehende Luecken in der Sample-Numerierung
+  // sind bewusst in Kauf genommen.
+  uptimeLogger.recordMeasurement();
+
   char lbl[16];
   if (mode == MeasureMode::Dark) {
     strncpy(lbl, "dark", sizeof(lbl));
   } else if (mode == MeasureMode::White) {
     strncpy(lbl, "white", sizeof(lbl));
   } else {
-    snprintf(lbl, sizeof(lbl), "sample_%02u", (unsigned)(++sampleCount));
+    snprintf(lbl, sizeof(lbl), "sample_%02u", (unsigned)uptimeLogger.measurementCount());
   }
   lbl[sizeof(lbl) - 1] = '\0';
   strncpy(lastLabel, lbl, sizeof(lastLabel));
@@ -425,7 +432,6 @@ void performMeasurement(MeasureMode mode) {
   calibrated = !darkRef.empty() && !whiteRef.empty();
 
   printCsvRow(lbl, mode, measurement);
-  uptimeLogger.recordMeasurement();
 
   busy = false;
   renderCurrentView();
