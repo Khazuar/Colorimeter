@@ -25,11 +25,13 @@ static const uint32_t DEBOUNCE_MS   = 40;
 static const uint32_t LONG_PRESS_MS = 600;
 
 // Messmodus: reines Orchestrierungs-Konzept, gehoert nicht in den Spectrometer.
-// Per Mode-Taste (lang) durchgeschaltet: Fast -> Precise -> White -> Dark -> Export -> Fast ...
+// Per Mode-Taste (lang) durchgeschaltet: Fast -> Precise -> White -> Dark -> Export -> Info -> Fast ...
 // White/Dark messen dabei immer mit Precision::Precise (siehe main.cpp precisionFor()),
 // unabhaengig vom Namen -- die Referenz ist Grundlage jeder spaeteren Reflexionsberechnung.
 // Export misst nicht physisch: Trigger sendet dort stattdessen die Messhistorie per BLE.
-enum class MeasureMode : uint8_t { Fast = 0, Precise = 1, White = 2, Dark = 3, Export = 4, COUNT = 5 };
+// Info misst ueberhaupt nicht (Trigger ist dort ein No-Op): reiner Statusbildschirm fuer
+// Betriebszeit/Messzaehler aus UptimeLogger.
+enum class MeasureMode : uint8_t { Fast = 0, Precise = 1, White = 2, Dark = 3, Export = 4, Info = 5, COUNT = 6 };
 
 // BLE-Export (Nordic UART Service) -- Geraetename ist app-weit relevant (main.cpp
 // startet/stoppt BleExporter damit); Chunk-Groesse/MTU/Delays bleiben rein interne

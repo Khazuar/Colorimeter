@@ -14,6 +14,7 @@
 #include "DisplayViews.h"
 #include "BleExporter.h"
 #include "ColorimetryTables.h"
+#include "UptimeLogger.h"
 
 // ------------------------- Display -------------------------
 Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
@@ -27,6 +28,9 @@ Spectrometer& spectrometer = sensorImpl;
 CalibrationStore calStore;
 Measurement darkRef, whiteRef;
 bool calibrated = false;
+
+// ------------------------- Betriebszeit-Logging (dedizierte NVS-Partition) -------------------------
+UptimeLogger uptimeLogger;
 
 // ------------------------- letzte Messung / Anzeige-Zustand -------------------------
 Measurement lastMeasurement;
@@ -74,6 +78,7 @@ const char* modeLabel(MeasureMode m) {
     case MeasureMode::White:   return "W";
     case MeasureMode::Dark:    return "D";
     case MeasureMode::Export:  return "E";
+    case MeasureMode::Info:    return "I";
     default:                   return "S";
   }
 }
@@ -158,6 +163,17 @@ std::string buildHistoryCsv(bool includeRaw) {
     for (size_t i = 0; i < n; i++) { out += ','; out += labels[i]; }
   }
   out += '\n';
+
+  // Kumulierte Betriebszeit (Alterungs-Tracking der durchgehend an bleibenden
+  // Beleuchtungs-LED) -- immer mitgeschickt, auch im "Normal"-Export, da es
+  // nur ein einzelner Wert ist, keine Kalibrierung/Reflexion voraussetzt.
+  char uptimeLine[32];
+  snprintf(uptimeLine, sizeof(uptimeLine), "uptime_seconds,%lu\n",
+           (unsigned long)uptimeLogger.totalSeconds());
+  out += uptimeLine;
+  snprintf(uptimeLine, sizeof(uptimeLine), "measurement_count,%lu\n",
+           (unsigned long)uptimeLogger.measurementCount());
+  out += uptimeLine;
 
   if (includeRaw) {
     if (!darkRef.empty())  appendCsvRow(out, "dark_ref",  darkRef,  false, true, nBandCols);
@@ -277,6 +293,34 @@ void renderReferenceStatus() {
   display.display();
 }
 
+// Reiner Statusbildschirm fuer Info-Modus -- Betriebszeit im hh:mm-Format
+// (Stundenanteil bewusst nicht auf 2 Stellen begrenzt, da er ueber die
+// Geraete-Lebensdauer durchaus dreistellig werden kann) sowie der lebenslange
+// Messzaehler aus UptimeLogger.
+void renderInfoStatus() {
+  if (!displayOk) return;
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+
+  display.setCursor(0, 0);
+  display.println("Info");
+
+  uint32_t totalSec = uptimeLogger.totalSeconds();
+  uint32_t hh = totalSec / 3600;
+  uint32_t mm = (totalSec % 3600) / 60;
+  char line[24];
+  snprintf(line, sizeof(line), "Betrieb: %lu:%02lu", (unsigned long)hh, (unsigned long)mm);
+  display.setCursor(0, 20);
+  display.println(line);
+
+  snprintf(line, sizeof(line), "Messungen: %lu", (unsigned long)uptimeLogger.measurementCount());
+  display.setCursor(0, 32);
+  display.println(line);
+
+  display.display();
+}
+
 void renderCurrentView() {
   if (!displayOk) return;
   if (currentMode == MeasureMode::Export) {
@@ -285,6 +329,10 @@ void renderCurrentView() {
   }
   if (currentMode == MeasureMode::White || currentMode == MeasureMode::Dark) {
     renderReferenceStatus();
+    return;
+  }
+  if (currentMode == MeasureMode::Info) {
+    renderInfoStatus();
     return;
   }
 
@@ -377,6 +425,7 @@ void performMeasurement(MeasureMode mode) {
   calibrated = !darkRef.empty() && !whiteRef.empty();
 
   printCsvRow(lbl, mode, measurement);
+  uptimeLogger.recordMeasurement();
 
   busy = false;
   renderCurrentView();
@@ -485,6 +534,8 @@ void setup() {
   bool haveWhite = calStore.loadWhite(whiteRef);
   calibrated = haveDark && haveWhite;
 
+  uptimeLogger.begin();
+
   displayOk = display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
   if (displayOk) {
     display.setRotation(2);  // Display ist 180 Grad verdreht montiert
@@ -526,7 +577,9 @@ void loop() {
   if (triggerBtn.poll() == DebouncedButton::Event::Pressed) {
     if (currentMode == MeasureMode::Export) {
       performExport();
-    } else {
+    } else if (currentMode != MeasureMode::Info) {
+      // Info ist ein reiner Statusbildschirm -- Trigger loest dort bewusst
+      // keine (sinnlose) Messung aus.
       performMeasurement(currentMode);
     }
   }
@@ -539,4 +592,5 @@ void loop() {
   }
 
   bleExporter.loop();
+  uptimeLogger.loop();
 }
