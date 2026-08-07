@@ -18,6 +18,15 @@ public:
   bool isActive() const { return advertising_; }  // begin() wurde aufgerufen, end() noch nicht
   bool isConnected() const { return connected_; }
 
+  // Liefert true GENAU EINMAL nach einem Verbindungswechsel (connect ODER
+  // disconnect) seit dem letzten Aufruf, danach false bis zum naechsten
+  // Wechsel -- Pull statt Push (main.cpp wird nie direkt aus dem Bluedroid-
+  // Callback-Kontext heraus aufgerufen), analog zu isConnected()/isActive().
+  // main.cpp nutzt das, um den Export-Screen GENAU DANN neu zu zeichnen, wenn
+  // sich der (asynchron im BLE-Stack geaenderte) Verbindungsstatus tatsaechlich
+  // geaendert hat, statt ihn blind periodisch zu pollen.
+  bool takeConnectionChanged();
+
   // Sendet 'payload' vollstaendig, in an das ausgehandelte MTU angepassten
   // Haeppchen mit kurzer Pause dazwischen (sonst Stau im BLE-Stack). Gibt
   // sofort false zurueck, falls nicht verbunden; bricht ab (false), falls
@@ -41,6 +50,7 @@ private:
   bool initialized_ = false;
   bool advertising_ = false;
   volatile bool connected_ = false;
+  volatile bool connectionChanged_ = false;
   bool disconnectPending_ = false;
   uint32_t disconnectAtMs_ = 0;
 

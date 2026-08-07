@@ -15,6 +15,7 @@
 #include "BleExporter.h"
 #include "ColorimetryTables.h"
 #include "UptimeLogger.h"
+#include "HistoryStore.h"
 
 // ------------------------- Display -------------------------
 Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
@@ -40,15 +41,11 @@ bool busy = false;  // waehrend true: keine weitere Messung/kein weiterer Export
 MeasureMode currentMode = MeasureMode::Fast;
 DisplayView currentView = DisplayView::ColorInfo;
 
-// ------------------------- Messhistorie (nur RAM, nicht persistiert) -------------------------
+// ------------------------- Messhistorie (persistiert, siehe HistoryStore) -------------------------
 // Jede Messung wird hier zusammen mit ihrem Modus gesammelt -- Grundlage fuer
-// den Serial- und BLE-Export (buildHistoryCsv()).
-struct MeasurementRecord {
-  char label[16];
-  MeasureMode mode;
-  Measurement measurement;
-};
-std::vector<MeasurementRecord> history;
+// den Serial- und BLE-Export (buildHistoryCsv()). Ueberlebt Neustarts/
+// Stromausfaelle (LittleFS auf der "spiffs"-Partition), siehe HistoryStore.h.
+HistoryStore historyStore;
 
 // ------------------------- BLE-Export -------------------------
 BleExporter bleExporter;
@@ -57,12 +54,15 @@ bool exportSentOk  = false;
 bool exportHint    = false;  // "kein Handy verbunden"
 size_t exportSentBytes = 0, exportTotalBytes = 0;
 
-// "Normal" exportiert nur Spectrum/Lab/Hex; "Debug" haengt zusaetzlich das
-// rohe Measurement (mit measurementLabels() beschriftet) an jede Zeile an.
-// Per kurzem Mode-Druck im Export-Modus umschaltbar (siehe cycleView()).
-// Ueber USB wird IMMER die Debug-Variante gesendet, unabhaengig von diesem
-// Flag (siehe loop()) -- das Flag steuert nur den BLE-Export.
-bool includeRawValues = false;
+// Der Export-Modus hat drei per kurzem Mode-Druck durchschaltbare "Seiten"
+// (siehe cycleView()): Normal/Debug steuern wie bisher, ob der BLE-Export
+// zusaetzlich das rohe Measurement (mit measurementLabels() beschriftet) an
+// jede Zeile anhaengt -- ueber USB wird IMMER die Debug-Variante gesendet,
+// unabhaengig davon (siehe loop()). Clear ist eine eigene Seite zum Loeschen
+// der persistierten Historie (siehe renderExportClear() / loop()-Trigger-
+// Dispatch) -- bewusst per LANGEM statt kurzem Trigger-Druck ausgeloest.
+enum class ExportPage : uint8_t { Normal = 0, Debug = 1, Clear = 2, COUNT = 3 };
+ExportPage exportPage = ExportPage::Normal;
 
 // ------------------------- Taster -------------------------
 DebouncedButton triggerBtn(TRIGGER_PIN, DEBOUNCE_MS, LONG_PRESS_MS);
@@ -70,6 +70,9 @@ DebouncedButton modeBtn(MODE_PIN, DEBOUNCE_MS, LONG_PRESS_MS);
 
 // ------------------------- Serial (reiner Datenexport, siehe loop()) -------------------------
 bool serialWasConnected = false;
+
+// Periodischer Auto-Refresh des Info-Screens (siehe loop()/renderInfoStatus()).
+uint32_t lastInfoRenderMs = 0;
 
 const char* modeLabel(MeasureMode m) {
   switch (m) {
@@ -92,6 +95,17 @@ Precision precisionFor(MeasureMode m) {
 // buildHistoryCsv() (voller Dump) und printCsvRow() (Live-Zeile), damit beide
 // garantiert dasselbe Format erzeugen.
 //
+// Kontext-Spalten (Temperatur/Laufzeit/Betriebszeit) fuer eine CSV-Zeile --
+// siehe MeasurementRecord-Kommentar in HistoryStore.h. ctx==nullptr fuer die
+// "*_ref"-Zeilen weiter unten (die zeigen die AKTUELL geladene Kalibrierung,
+// nicht ein konkretes Messereignis -- fuer sie gibt es keinen sinnvollen
+// Zeitpunkt/Temperatur, die Spalten bleiben dort leer).
+struct MeasurementContext {
+  float tempC;
+  uint32_t sessionMs;
+  uint32_t uptimeS;
+};
+
 // computeSpectrum=false (fuer Dark/White-Referenzen und die weiter unten
 // angehaengten "*_ref"-Zeilen): es gibt keine sinnvolle "Reflexion einer
 // Referenz gegen sich selbst" mehr, seit getSpectrum() explizite Referenzen
@@ -101,9 +115,18 @@ Precision precisionFor(MeasureMode m) {
 // Measurement-Werte (nBandCols dient nur dazu, in diesem Fall die richtige
 // Anzahl Leerspalten auszugeben).
 void appendCsvRow(std::string& out, const char* label, const Measurement& measurement,
-                   bool computeSpectrum, bool includeRaw, size_t nBandCols) {
+                   bool computeSpectrum, bool includeRaw, size_t nBandCols,
+                   const MeasurementContext* ctx = nullptr) {
   out += label;
   char buf[16];
+
+  if (ctx) {
+    snprintf(buf, sizeof(buf), ",%.1f", ctx->tempC); out += buf;
+    snprintf(buf, sizeof(buf), ",%.1f", ctx->sessionMs / 1000.0f); out += buf;
+    snprintf(buf, sizeof(buf), ",%lu", (unsigned long)ctx->uptimeS); out += buf;
+  } else {
+    out += ",,,";
+  }
 
   if (computeSpectrum) {
     Spectrum spec = spectrometer.getSpectrum(measurement, whiteRef, darkRef);
@@ -134,6 +157,22 @@ void appendCsvRow(std::string& out, const char* label, const Measurement& measur
   out += '\n';
 }
 
+// HistoryStore::forEach()-Visitor: haengt einen persistierten Datensatz per
+// appendCsvRow() an 'out' an -- appendCsvRow() bleibt dabei unveraendert und
+// berechnet Spectrum/Lab/Hex weiterhin frisch gegen die AKTUELL geladene
+// Kalibrierung, nicht gegen eine zum Messzeitpunkt eingefrorene.
+struct CsvBuildCtx {
+  std::string* out;
+  bool includeRaw;
+  size_t nBandCols;
+};
+void appendRecordToCsv(const MeasurementRecord& rec, void* userData) {
+  CsvBuildCtx* ctx = reinterpret_cast<CsvBuildCtx*>(userData);
+  bool isRef = (rec.mode == MeasureMode::Dark || rec.mode == MeasureMode::White);
+  MeasurementContext mctx{ rec.tempC, rec.sessionMs, rec.uptimeS };
+  appendCsvRow(*ctx->out, rec.label, rec.measurement, !isRef, ctx->includeRaw, ctx->nBandCols, &mctx);
+}
+
 // Baut die komplette Messhistorie als CSV. includeRaw haengt zusaetzlich die
 // rohen Measurement-Spalten an (Spaltennamen aus measurementLabels() --
 // einzige Stelle im Code, die diese Labels benutzt). Die aktuell gueltige
@@ -146,7 +185,7 @@ std::string buildHistoryCsv(bool includeRaw) {
   Spectrum headerSpec = spectrometer.getSpectrum(Measurement(), Measurement(), Measurement());
   size_t nBandCols = headerSpec.bands.size();
 
-  out += "label";
+  out += "label,temp_c,session_s,uptime_s";
   for (size_t i = 0; i < nBandCols; i++) {
     out += ',';
     out += std::to_string((int)lroundf(headerSpec.bands[i].center_nm));
@@ -157,8 +196,7 @@ std::string buildHistoryCsv(bool includeRaw) {
     const char* const* labels = spectrometer.measurementLabels();
     size_t n = !darkRef.empty()  ? darkRef.size()
              : !whiteRef.empty() ? whiteRef.size()
-             : !history.empty() ? history[0].measurement.size()
-                                 : 0;
+                                 : historyStore.firstRecordChannelCount();
     for (size_t i = 0; i < n; i++) { out += ','; out += labels[i]; }
   }
   out += '\n';
@@ -179,21 +217,20 @@ std::string buildHistoryCsv(bool includeRaw) {
     if (!whiteRef.empty()) appendCsvRow(out, "white_ref", whiteRef, false, true, nBandCols);
   }
 
-  for (const MeasurementRecord& rec : history) {
-    bool isRef = (rec.mode == MeasureMode::Dark || rec.mode == MeasureMode::White);
-    appendCsvRow(out, rec.label, rec.measurement, !isRef, includeRaw, nBandCols);
-  }
+  CsvBuildCtx ctx{ &out, includeRaw, nBandCols };
+  historyStore.forEach(appendRecordToCsv, &ctx);
   return out;
 }
 
 // Live-Zeile nach jeder Einzelmessung. Nutzt denselben appendCsvRow() wie der
-// volle Dump, ueber USB IMMER mit Rohwerten (siehe includeRawValues-Kommentar
+// volle Dump, ueber USB IMMER mit Rohwerten (siehe ExportPage-Kommentar
 // weiter oben).
-void printCsvRow(const char* label, MeasureMode mode, const Measurement& measurement) {
-  bool isRef = (mode == MeasureMode::Dark || mode == MeasureMode::White);
+void printCsvRow(const MeasurementRecord& rec) {
+  bool isRef = (rec.mode == MeasureMode::Dark || rec.mode == MeasureMode::White);
   Spectrum headerSpec = spectrometer.getSpectrum(Measurement(), Measurement(), Measurement());
   std::string row;
-  appendCsvRow(row, label, measurement, !isRef, /*includeRaw=*/true, headerSpec.bands.size());
+  MeasurementContext ctx{ rec.tempC, rec.sessionMs, rec.uptimeS };
+  appendCsvRow(row, rec.label, rec.measurement, !isRef, /*includeRaw=*/true, headerSpec.bands.size(), &ctx);
   Serial.print(row.c_str());
 }
 
@@ -210,7 +247,7 @@ void renderExportStatus() {
   display.println("Export-Modus");
 
   display.setCursor(0, 10);
-  display.println(includeRawValues ? "Modus: Debug" : "Modus: Normal");
+  display.println(exportPage == ExportPage::Debug ? "Modus: Debug" : "Modus: Normal");
 
   display.setCursor(0, 20);
   if (!bleExporter.isActive()) {
@@ -222,7 +259,7 @@ void renderExportStatus() {
   }
 
   char line[24];
-  snprintf(line, sizeof(line), "%u Messungen", (unsigned)history.size());
+  snprintf(line, sizeof(line), "%u Messungen", (unsigned)historyStore.count());
   display.setCursor(0, 30);
   display.println(line);
 
@@ -269,7 +306,7 @@ void renderReferenceStatus() {
   if (ref.empty()) {
     display.setCursor(0, 16);
     display.println("keine Messung");
-    display.println("Trigger druecken");
+    display.println("Trigger halten");
   } else {
     const char* const* labels = spectrometer.measurementLabels();
     char line[27];
@@ -294,8 +331,12 @@ void renderReferenceStatus() {
 
 // Reiner Statusbildschirm fuer Info-Modus -- Betriebszeit im hh:mm-Format
 // (Stundenanteil bewusst nicht auf 2 Stellen begrenzt, da er ueber die
-// Geraete-Lebensdauer durchaus dreistellig werden kann) sowie der lebenslange
-// Messzaehler aus UptimeLogger.
+// Geraete-Lebensdauer durchaus dreistellig werden kann), der lebenslange
+// Messzaehler aus UptimeLogger, sowie die aktuelle ESP32-Die-Temperatur (kein
+// Ersatz fuer eine echte LED-Temperaturmessung, aber ein greifbarer Hinweis
+// bei spaeterer Auswertung unerklaerter Abweichungen). Wird waehrend des
+// Aufenthalts in diesem Modus alle 10s automatisch neu gezeichnet (siehe
+// loop()), damit die Temperatur/Betriebszeit sichtbar mitlaeuft.
 void renderInfoStatus() {
   if (!displayOk) return;
   display.clearDisplay();
@@ -317,13 +358,47 @@ void renderInfoStatus() {
   display.setCursor(0, 32);
   display.println(line);
 
+  snprintf(line, sizeof(line), "Temp: %.1f C", temperatureRead());
+  display.setCursor(0, 44);
+  display.println(line);
+
+  display.display();
+}
+
+// Dritte "Seite" des Export-Modus: loescht die persistierte Historie, aber
+// nur nach LANGEM Trigger-Druck (siehe loop()) -- ein kurzer Druck hier tut
+// bewusst nichts, daher der Hinweistext. Nach dem Loeschen zeigt dieselbe
+// Seite direkt "0 Messungen" -- das ist die Erfolgsrueckmeldung.
+void renderExportClear() {
+  if (!displayOk) return;
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+
+  display.setCursor(0, 0);
+  display.println("Verlauf loeschen?");
+
+  char line[24];
+  snprintf(line, sizeof(line), "%u Messungen", (unsigned)historyStore.count());
+  display.setCursor(0, 16);
+  display.println(line);
+
+  display.setCursor(0, 32);
+  display.println("Trigger halten");
+  display.setCursor(0, 42);
+  display.println("zum Loeschen");
+
   display.display();
 }
 
 void renderCurrentView() {
   if (!displayOk) return;
   if (currentMode == MeasureMode::Export) {
-    renderExportStatus();
+    if (exportPage == ExportPage::Clear) {
+      renderExportClear();
+    } else {
+      renderExportStatus();
+    }
     return;
   }
   if (currentMode == MeasureMode::White || currentMode == MeasureMode::Dark) {
@@ -425,13 +500,21 @@ void performMeasurement(MeasureMode mode) {
   rec.label[sizeof(rec.label) - 1] = '\0';
   rec.mode = mode;
   rec.measurement = measurement;
-  history.push_back(rec);
+  // Kontext zum Messzeitpunkt -- siehe MeasurementRecord-Kommentar in
+  // HistoryStore.h: kein Ersatz fuer eine echte LED-Temperaturmessung, aber
+  // ein greifbarer Hinweis bei spaeterer Auswertung unerklaerter Abweichungen.
+  rec.tempC = temperatureRead();
+  rec.sessionMs = millis();
+  rec.uptimeS = uptimeLogger.totalSeconds();
+  if (!historyStore.append(rec)) {
+    Serial.println("# history append failed (Flash voll?)");
+  }
 
   if (mode == MeasureMode::Dark)  { darkRef  = measurement; calStore.saveDark(darkRef); }
   if (mode == MeasureMode::White) { whiteRef = measurement; calStore.saveWhite(whiteRef); }
   calibrated = !darkRef.empty() && !whiteRef.empty();
 
-  printCsvRow(lbl, mode, measurement);
+  printCsvRow(rec);
 
   busy = false;
   renderCurrentView();
@@ -477,7 +560,7 @@ void performExport() {
   exportTotalBytes = 0;
   renderExportStatus();
 
-  std::string csv = buildHistoryCsv(includeRawValues);
+  std::string csv = buildHistoryCsv(exportPage == ExportPage::Debug);
   bool ok = bleExporter.send(csv, onExportProgress);
 
   exportSending = false;
@@ -486,12 +569,13 @@ void performExport() {
   renderExportStatus();
 }
 
-// Kurzer Mode-Druck: in Fast/Precise/Export-Modus View bzw. Export-Variante
+// Kurzer Mode-Druck: in Fast/Precise/Export-Modus View bzw. Export-Seite
 // wechseln. In White/Dark gibt es (seit dem eigenen Referenz-Screen) nichts
 // zum Umschalten -- Aufruf bleibt dort ein harmloses No-op.
 void cycleView() {
   if (currentMode == MeasureMode::Export) {
-    includeRawValues = !includeRawValues;
+    uint8_t n = (static_cast<uint8_t>(exportPage) + 1) % static_cast<uint8_t>(ExportPage::COUNT);
+    exportPage = static_cast<ExportPage>(n);
     renderCurrentView();
     return;
   }
@@ -514,6 +598,9 @@ void cycleMode() {
     exportSentOk = false;
     exportHint = false;
     exportSentBytes = exportTotalBytes = 0;
+    // Verhindert, dass man nach einem Modus-Rundgang unbemerkt wieder auf der
+    // Loeschen-Seite landet.
+    exportPage = ExportPage::Normal;
   }
 
   // Die zuletzt gezeigte Messung gehoert zum vorherigen Modus -- nach einem
@@ -523,6 +610,11 @@ void cycleMode() {
   lastLabel[0] = '\0';
 
   renderCurrentView();
+
+  // Startpunkt fuer den periodischen 10s-Refresh im Info-Modus (siehe loop())
+  // -- verhindert ein sofortiges, redundantes zweites Neuzeichnen direkt nach
+  // dem obigen renderCurrentView().
+  if (currentMode == MeasureMode::Info) lastInfoRenderMs = millis();
 }
 
 void setup() {
@@ -541,6 +633,7 @@ void setup() {
   calibrated = haveDark && haveWhite;
 
   uptimeLogger.begin();
+  historyStore.begin();  // nicht fatal bei Fehlschlag -- Kernfunktion laeuft ohne Historie weiter
 
   displayOk = display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
   if (displayOk) {
@@ -580,12 +673,31 @@ void loop() {
   }
   serialWasConnected = nowSerialConnected;
 
-  if (triggerBtn.poll() == DebouncedButton::Event::Pressed) {
-    if (currentMode == MeasureMode::Export) {
+  // White/Dark (ueberschreibt die Kalibrierreferenz) und die Export-
+  // Clear-Seite (loescht die Historie) verlangen einen LANGEN statt kurzen
+  // Trigger-Druck -- gleiche "haltbewusst statt versehentlich"-Absicherung
+  // wie der bestehende lange Mode-Druck fuer den Moduswechsel. Fast/Precise
+  // und das Ausloesen des BLE-Sendens bleiben bei sofortigem, kurzem Druck,
+  // da sie haeufig und unkritisch sind.
+  DebouncedButton::Event te = triggerBtn.poll();
+  if (currentMode == MeasureMode::Export) {
+    if (exportPage == ExportPage::Clear) {
+      if (te == DebouncedButton::Event::LongPress) {
+        flashBorder();
+        historyStore.clear();
+        renderCurrentView();
+      }
+    } else if (te == DebouncedButton::Event::Pressed) {
       performExport();
-    } else if (currentMode != MeasureMode::Info) {
-      // Info ist ein reiner Statusbildschirm -- Trigger loest dort bewusst
-      // keine (sinnlose) Messung aus.
+    }
+  } else if (currentMode == MeasureMode::White || currentMode == MeasureMode::Dark) {
+    if (te == DebouncedButton::Event::LongPress) {
+      performMeasurement(currentMode);
+    }
+  } else if (currentMode != MeasureMode::Info) {
+    // Info ist ein reiner Statusbildschirm -- Trigger loest dort bewusst
+    // keine (sinnlose) Messung aus.
+    if (te == DebouncedButton::Event::Pressed) {
       performMeasurement(currentMode);
     }
   }
@@ -595,6 +707,23 @@ void loop() {
     cycleView();
   } else if (me == DebouncedButton::Event::LongPress) {
     cycleMode();
+  }
+
+  // Info ist ein rein passiver Statusbildschirm (kein Tastendruck loest dort
+  // ein Neuzeichnen aus) -- deshalb hier per Zeitgeber alle 10s aufgefrischt,
+  // damit Temperatur/Betriebszeit sichtbar mitlaufen.
+  if (currentMode == MeasureMode::Info && (millis() - lastInfoRenderMs) >= 10000UL) {
+    lastInfoRenderMs = millis();
+    renderCurrentView();
+  }
+
+  // Export: der BLE-Verbindungsstatus aendert sich asynchron im Bluedroid-
+  // Callback (siehe BleExporter::onConnect()/onDisconnect()), nicht durch
+  // einen Tastendruck hier. Event-getrieben statt periodisch gepollt --
+  // takeConnectionChanged() liefert nur GENAU DANN true, wenn sich seit dem
+  // letzten Aufruf tatsaechlich etwas geaendert hat.
+  if (currentMode == MeasureMode::Export && bleExporter.takeConnectionChanged()) {
+    renderCurrentView();
   }
 
   bleExporter.loop();

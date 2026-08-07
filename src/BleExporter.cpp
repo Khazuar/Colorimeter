@@ -27,12 +27,14 @@ public:
   void onConnect(BLEServer*) override {
     owner_.connected_ = true;
     owner_.disconnectPending_ = false;
+    owner_.connectionChanged_ = true;
   }
 
   void onDisconnect(BLEServer*) override {
     owner_.connected_ = false;
     owner_.disconnectPending_ = true;
     owner_.disconnectAtMs_ = millis();
+    owner_.connectionChanged_ = true;
   }
 
 private:
@@ -100,6 +102,12 @@ void BleExporter::loop() {
     server_->startAdvertising();
     disconnectPending_ = false;
   }
+}
+
+bool BleExporter::takeConnectionChanged() {
+  if (!connectionChanged_) return false;
+  connectionChanged_ = false;
+  return true;
 }
 
 bool BleExporter::send(const std::string& payload, ProgressCallback onProgress) {
