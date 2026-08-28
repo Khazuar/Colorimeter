@@ -618,11 +618,36 @@ void cycleMode() {
 }
 
 void setup() {
-  Serial.begin(115200);
-  delay(2000);
+  // Thermik: 160->80MHz halbiert die aktive Rechenleistung praktisch ohne
+  // Risiko -- auf dem C3 haengt der APB-Takt (u.a. I2C/USB-Timing) NICHT von
+  // der CPU-Frequenz ab (anders als bei Frequenzen < 80MHz, die deshalb WLAN/
+  // BT/USB brechen koennen und hier bewusst nicht angefasst werden).
+  setCpuFrequencyMhz(80);
 
+  // Display so frueh wie moeglich initialisieren -- VOR dem 2s-USB-CDC-Delay
+  // und den NVS/LittleFS-Reads weiter unten, damit so schnell wie physikalisch
+  // moeglich (begrenzt nur noch durch die ESP32-eigene Bootloader-Zeit) etwas
+  // auf dem Bildschirm erscheint, statt mehrere hundert ms bis >2s leer zu
+  // bleiben. Das Display selbst hat kein nichtfluechtiges Speicher (GDDRAM ist
+  // reines SRAM im Controller) -- "so frueh wie moeglich zeigen" ist die
+  // einzige Stellschraube, "vor dem ESP anzeigen" ist auf dieser Hardware
+  // schlicht nicht moeglich.
   Wire.begin(SDA_PIN, SCL_PIN);
   Wire.setClock(I2C_HZ);
+  displayOk = display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
+  if (displayOk) {
+    display.setRotation(2);  // Display ist 180 Grad verdreht montiert
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println("Colorimeter");
+    display.println("startet ...");
+    display.display();  // sofort push -- kein "Schnee"-Frame mehr sichtbar
+  }
+
+  Serial.begin(115200);
+  delay(2000);
 
   triggerBtn.begin();
   modeBtn.begin();
@@ -635,16 +660,14 @@ void setup() {
   uptimeLogger.begin();
   historyStore.begin();  // nicht fatal bei Fehlschlag -- Kernfunktion laeuft ohne Historie weiter
 
-  displayOk = display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
   if (displayOk) {
-    display.setRotation(2);  // Display ist 180 Grad verdreht montiert
+    // Ersetzt den "startet ..."-Text von oben, sobald Kalibrierstatus etc.
+    // tatsaechlich bekannt sind.
     display.clearDisplay();
-    display.setTextSize(1);
-    display.setTextColor(SSD1306_WHITE);
     display.setCursor(0, 0);
     display.println("Colorimeter");
     display.println(calibrated ? "ready" : "need cal: d/w");
-    display.display();  // sofort push -- kein "Schnee"-Frame mehr sichtbar
+    display.display();
   } else {
     // Reine Boot-Diagnose auf einem Fehlerpfad -- vermischt sich nie mit dem
     // eigentlichen CSV-Export (der erst spaeter/live in loop() beginnt).
@@ -728,4 +751,10 @@ void loop() {
 
   bleExporter.loop();
   uptimeLogger.loop();
+
+  // Thermik: ohne dieses delay() spinnt die Idle-Schleife (reine
+  // Tasterabfrage) mit 100% Duty-Cycle, praktisch die ganze Zeit, in der das
+  // Geraet nur auf einen Tastendruck wartet. delay() gibt an den FreeRTOS-
+  // Idle-Task ab (WFI) -- 1ms ist gegenueber dem 40ms-Debounce vernachlaessigbar.
+  delay(1);
 }

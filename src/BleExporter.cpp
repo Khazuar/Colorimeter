@@ -54,6 +54,11 @@ void BleExporter::begin(const char* deviceName) {
   if (!initialized_) {
     BLEDevice::init(deviceName);
     BLEDevice::setMTU(BLE_PREFERRED_MTU);
+    // Thermik + bewusst kurze Reichweite (~2-5m): Default waere +3dBm
+    // (ESP_PWR_LVL_P3, siehe esp_bt.h). -9dBm ist ein Startwert -- auf echter
+    // Hardware ggf. nachjustieren, die tatsaechliche Reichweite haengt stark
+    // von Antenne/Umgebung ab und laesst sich nicht zuverlaessig vorausberechnen.
+    BLEDevice::setPower(ESP_PWR_LVL_N9);
 
     server_ = BLEDevice::createServer();
     server_->setCallbacks(new BleServerCallbacksImpl(*this));
