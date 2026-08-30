@@ -33,7 +33,7 @@ FilterState darkRefFilterState  = FilterState::None;  // eingefroren MIT darkRef
 FilterState whiteRefFilterState = FilterState::None;  // eingefroren MIT whiteRef
 bool calibrated = false;  // "Referenz passt zum AKTUELL gewaehlten Filter" -- siehe calibrationValidFor()
 
-// Aktuell im Settings-Modus gewaehlter Filter (siehe MeasureMode::Settings).
+// Aktuell im Settings-Modus gewaehlter Filter (siehe DisplayMode::Settings).
 FilterState currentFilterState = FilterState::None;
 
 // Liefert true, wenn sowohl Dark- als auch White-Referenz vorhanden sind UND
@@ -59,8 +59,17 @@ char lastLabel[16] = "";
 FilterState lastMeasurementFilterState = FilterState::None;
 bool busy = false;  // waehrend true: keine weitere Messung/kein weiterer Export ausloesbar
 
-MeasureMode currentMode = MeasureMode::Fast;
+DisplayMode currentDisplayMode = DisplayMode::Fast;
 DisplayView currentView = DisplayView::ColorInfo;
+
+// Innerhalb des Calibration-DisplayMode per kurzem Mode-Druck gewaehlte
+// Referenz -- langer Trigger-Druck misst dann genau diese. Bewusst ein
+// eigenes, main.cpp-lokales Enum statt SampleKind mitzubenutzen: das eine ist
+// fluechtiger UI-Zustand ("welche Seite sehe ich gerade"), das andere ein
+// Datenmodell-Konzept ("was ist das fuer ein gespeicherter Messwert") --
+// obwohl beide White/Dark kennen, sind es unterschiedliche Fragen.
+enum class CalibrationTarget : uint8_t { White = 0, Dark = 1 };
+CalibrationTarget calibrationTarget = CalibrationTarget::White;
 
 // ------------------------- Messhistorie (persistiert, siehe HistoryStore) -------------------------
 // Jede Messung wird hier zusammen mit ihrem Modus gesammelt -- Grundlage fuer
@@ -137,22 +146,29 @@ bool serialWasConnected = false;
 // Periodischer Auto-Refresh des Info-Screens (siehe loop()/renderInfoStatus()).
 uint32_t lastInfoRenderMs = 0;
 
-const char* modeLabel(MeasureMode m) {
+const char* displayModeLabel(DisplayMode m) {
   switch (m) {
-    case MeasureMode::Precise: return "P";
-    case MeasureMode::White:   return "W";
-    case MeasureMode::Dark:    return "D";
-    case MeasureMode::Export:  return "E";
-    case MeasureMode::Settings: return "C";
-    case MeasureMode::Info:    return "I";
-    default:                   return "S";
+    case DisplayMode::Precise:     return "P";
+    case DisplayMode::Calibration: return "K";  // in der Praxis nie direkt angezeigt, siehe activeModeLabel()
+    case DisplayMode::Export:      return "E";
+    case DisplayMode::Settings:    return "C";
+    case DisplayMode::Info:        return "I";
+    default:                       return "S";  // Fast
   }
 }
+const char* calibrationTargetLabel(CalibrationTarget t) {
+  return (t == CalibrationTarget::White) ? "W" : "D";
+}
 
-// White/Dark messen immer genau -- die Referenz ist Grundlage jeder spaeteren
-// Reflexionsberechnung, Fehler dort pflanzen sich in jede Messung fort.
-Precision precisionFor(MeasureMode m) {
-  return (m == MeasureMode::Fast) ? Precision::Fast : Precision::Precise;
+// Liefert das fuer die aktuelle Anzeige (z.B. "MESSUNG"-Screen) passende
+// Modus-Kuerzel -- im Calibration-Modus das der aktuell gewaehlten Referenz
+// (White/Dark), sonst das des DisplayMode selbst. Noetig, weil
+// showMeasuringScreen() als ProgressCallback eine feste Signatur hat und
+// daher nicht direkt wissen kann, welche Referenz calibrationTarget gerade meint.
+const char* activeModeLabel() {
+  return (currentDisplayMode == DisplayMode::Calibration)
+      ? calibrationTargetLabel(calibrationTarget)
+      : displayModeLabel(currentDisplayMode);
 }
 
 // Haengt eine einzelne CSV-Zeile an 'out' an. Gemeinsam genutzt von
@@ -245,7 +261,7 @@ struct BandCollectCtx {
 };
 void collectBandsVisitor(const MeasurementRecord& rec, void* userData) {
   BandCollectCtx* c = reinterpret_cast<BandCollectCtx*>(userData);
-  bool isRef = (rec.mode == MeasureMode::Dark || rec.mode == MeasureMode::White);
+  bool isRef = (rec.kind != SampleKind::Regular);
   if (isRef || !calibrationValidFor(rec.filterState)) return;
   Spectrum spec = spectrometer.getSpectrum(rec.measurement, whiteRef, darkRef, rec.filterState);
   for (const Band& b : spec.bands) {
@@ -270,7 +286,7 @@ struct CsvBuildCtx {
 };
 void appendRecordToCsv(const MeasurementRecord& rec, void* userData) {
   CsvBuildCtx* ctx = reinterpret_cast<CsvBuildCtx*>(userData);
-  bool isRef = (rec.mode == MeasureMode::Dark || rec.mode == MeasureMode::White);
+  bool isRef = (rec.kind != SampleKind::Regular);
   bool computeSpectrum = !isRef && calibrationValidFor(rec.filterState);
   MeasurementContext mctx{ rec.tempC, rec.sessionMs, rec.uptimeS, rec.filterState };
   appendCsvRow(*ctx->out, rec.label, rec.measurement, rec.filterState, computeSpectrum,
@@ -342,7 +358,7 @@ std::string buildHistoryCsv(bool includeRaw) {
 // viele/benannte Spalten haben als andere Zeilen -- unausweichliche Folge der
 // Filter-Abhaengigkeit, kein Bug.
 void printCsvRow(const MeasurementRecord& rec) {
-  bool isRef = (rec.mode == MeasureMode::Dark || rec.mode == MeasureMode::White);
+  bool isRef = (rec.kind != SampleKind::Regular);
   bool computeSpectrum = !isRef && calibrationValidFor(rec.filterState);
   std::vector<Band> bandColumns;
   if (computeSpectrum) {
@@ -406,37 +422,39 @@ void renderExportStatus() {
   display.display();
 }
 
-// Eigener Screen fuer White/Dark: zeigt die aktuelle Referenz als rohes
-// Measurement (ueber measurementLabels() beschriftet) statt sie als
-// kalibrierte Reflexion darzustellen -- seit getSpectrum() explizite
-// Referenzen statt einer gespeicherten Kalibrierung nimmt, gibt es fuer "die
-// Referenz gegen sich selbst" keine sinnvolle Reflexion mehr (siehe
-// appendCsvRow()-Kommentar). Zeigt bewusst IMMER die aktuell guenstige
-// Referenz (auch aus dem Flash geladen, nicht nur frisch gemessen).
+// Gemeinsamer Screen fuer den Calibration-Modus (Weiss- ODER Dunkelreferenz,
+// je nach calibrationTarget -- kurzer Mode-Druck wechselt dazwischen): zeigt
+// die gewaehlte Referenz als rohes Measurement (ueber measurementLabels()
+// beschriftet) statt sie als kalibrierte Reflexion darzustellen -- seit
+// getSpectrum() explizite Referenzen statt einer gespeicherten Kalibrierung
+// nimmt, gibt es fuer "die Referenz gegen sich selbst" keine sinnvolle
+// Reflexion mehr (siehe appendCsvRow()-Kommentar).
+//
+// Passt der Filter der gespeicherten Referenz NICHT zum aktuell gewaehlten
+// (siehe calibrationValidFor()), gilt sie hier als nicht vorhanden -- exakt
+// dasselbe Verhalten wie beim Messen/Exportieren, keine Sonderbehandlung
+// (kein Warnhinweis, sie wird schlicht nicht angezeigt).
 void renderReferenceStatus() {
   if (!displayOk) return;
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(1);
 
-  bool isWhite = (currentMode == MeasureMode::White);
+  bool isWhite = (calibrationTarget == CalibrationTarget::White);
   display.setCursor(0, 0);
   display.println(isWhite ? "Weiss-Referenz" : "Dunkel-Referenz");
 
   const Measurement& ref = isWhite ? whiteRef : darkRef;
   FilterState refFilter = isWhite ? whiteRefFilterState : darkRefFilterState;
-  if (ref.empty()) {
+  bool refValid = !ref.empty() && (refFilter == currentFilterState);
+
+  if (!refValid) {
     display.setCursor(0, 16);
     display.println("keine Messung");
     display.println("Trigger halten");
   } else {
-    // Ohne diesen Hinweis waere nicht ersichtlich, WARUM eine an sich
-    // vorhandene Referenz ploetzlich wie "nicht kalibriert" behandelt wird,
-    // nachdem im Settings-Modus der Filter gewechselt wurde (siehe
-    // calibrationValidFor()).
     char filterLine[24];
-    snprintf(filterLine, sizeof(filterLine), "Filter: %s%s", filterStateUiLabel(refFilter),
-             (refFilter != currentFilterState) ? " (!)" : "");
+    snprintf(filterLine, sizeof(filterLine), "Filter: %s", filterStateUiLabel(refFilter));
     display.setCursor(0, 10);
     display.println(filterLine);
 
@@ -549,7 +567,7 @@ void renderSettingsStatus() {
 
 void renderCurrentView() {
   if (!displayOk) return;
-  if (currentMode == MeasureMode::Export) {
+  if (currentDisplayMode == DisplayMode::Export) {
     if (exportPage == ExportPage::Clear) {
       renderExportClear();
     } else {
@@ -557,15 +575,15 @@ void renderCurrentView() {
     }
     return;
   }
-  if (currentMode == MeasureMode::White || currentMode == MeasureMode::Dark) {
+  if (currentDisplayMode == DisplayMode::Calibration) {
     renderReferenceStatus();
     return;
   }
-  if (currentMode == MeasureMode::Settings) {
+  if (currentDisplayMode == DisplayMode::Settings) {
     renderSettingsStatus();
     return;
   }
-  if (currentMode == MeasureMode::Info) {
+  if (currentDisplayMode == DisplayMode::Info) {
     renderInfoStatus();
     return;
   }
@@ -589,7 +607,7 @@ void renderCurrentView() {
   const Measurement& effWhite = haveMatchingCal ? whiteRef : emptyRef;
 
   ViewContext ctx{ spectrometer, lastMeasurement, effWhite, effDark, haveMatchingCal,
-                   modeLabel(currentMode), lastLabel, calCheckFilterState };
+                   displayModeLabel(currentDisplayMode), lastLabel, calCheckFilterState };
   VIEW_RENDERERS[static_cast<uint8_t>(currentView)](display, ctx);
 }
 
@@ -605,7 +623,7 @@ void showMeasuringScreen(uint8_t current, uint8_t maxEstimate) {
   display.setTextSize(1);
   display.setCursor(0, 30);
   display.print("Modus: ");
-  display.println(modeLabel(currentMode));
+  display.println(activeModeLabel());
 
   int barX = 4, barY = 44, barW = OLED_WIDTH - 8, barH = 10;
   display.drawRect(barX, barY, barW, barH, SSD1306_WHITE);
@@ -638,15 +656,17 @@ void flashBorder() {
 }
 
 // Gemeinsamer Einstiegspunkt fuer den Trigger-Taster in allen Mess-Modi.
-void performMeasurement(MeasureMode mode) {
+// precision/kind werden vom Aufrufer (loop()) bestimmt, nicht hier -- diese
+// Funktion kennt keinen DisplayMode mehr, nur noch "wie genau messen" und
+// "was fuer ein Messwert ist das".
+void performMeasurement(Precision precision, SampleKind kind) {
   if (busy) return;  // keine zweite Messung waehrend eine laeuft
   busy = true;
 
   flashBorder();  // nur hier, also nur wenn tatsaechlich gestartet wird
   showMeasuringScreen(0, 1);
 
-  Precision prec = precisionFor(mode);
-  Measurement measurement = spectrometer.performMeasurement(prec, showMeasuringScreen);
+  Measurement measurement = spectrometer.performMeasurement(precision, showMeasuringScreen);
   if (measurement.empty()) {
     busy = false;
     renderCurrentView();
@@ -664,9 +684,9 @@ void performMeasurement(MeasureMode mode) {
   uptimeLogger.recordMeasurement();
 
   char lbl[16];
-  if (mode == MeasureMode::Dark) {
+  if (kind == SampleKind::Dark) {
     strncpy(lbl, "dark", sizeof(lbl));
-  } else if (mode == MeasureMode::White) {
+  } else if (kind == SampleKind::White) {
     strncpy(lbl, "white", sizeof(lbl));
   } else {
     snprintf(lbl, sizeof(lbl), "sample_%02u", (unsigned)uptimeLogger.measurementCount());
@@ -678,7 +698,7 @@ void performMeasurement(MeasureMode mode) {
   MeasurementRecord rec;
   strncpy(rec.label, lbl, sizeof(rec.label));
   rec.label[sizeof(rec.label) - 1] = '\0';
-  rec.mode = mode;
+  rec.kind = kind;
   rec.measurement = measurement;
   // Kontext zum Messzeitpunkt -- siehe MeasurementRecord-Kommentar in
   // HistoryStore.h: kein Ersatz fuer eine echte LED-Temperaturmessung, aber
@@ -691,12 +711,12 @@ void performMeasurement(MeasureMode mode) {
     Serial.println("# history append failed (Flash voll?)");
   }
 
-  if (mode == MeasureMode::Dark) {
+  if (kind == SampleKind::Dark) {
     darkRef = measurement;
     darkRefFilterState = currentFilterState;  // Filter zum Aufnahmezeitpunkt einfrieren
     calStore.saveDark(darkRef, darkRefFilterState);
   }
-  if (mode == MeasureMode::White) {
+  if (kind == SampleKind::White) {
     whiteRef = measurement;
     whiteRefFilterState = currentFilterState;
     calStore.saveWhite(whiteRef, whiteRefFilterState);
@@ -759,18 +779,22 @@ void performExport() {
 }
 
 // Kurzer Mode-Druck: in Fast/Precise/Export-Modus View bzw. Export-Seite
-// wechseln, in Settings die zu editierende Einstellung wechseln. In
-// White/Dark gibt es (seit dem eigenen Referenz-Screen) nichts zum
-// Umschalten -- Aufruf bleibt dort ein harmloses No-op.
+// wechseln, in Settings die zu editierende Einstellung wechseln, in
+// Calibration zwischen Weiss-/Dunkelreferenz wechseln.
 void cycleView() {
-  if (currentMode == MeasureMode::Export) {
+  if (currentDisplayMode == DisplayMode::Export) {
     uint8_t n = (static_cast<uint8_t>(exportPage) + 1) % static_cast<uint8_t>(ExportPage::COUNT);
     exportPage = static_cast<ExportPage>(n);
     renderCurrentView();
     return;
   }
-  if (currentMode == MeasureMode::Settings) {
+  if (currentDisplayMode == DisplayMode::Settings) {
     currentSettingIndex = (currentSettingIndex + 1) % SETTINGS_COUNT;
+    renderCurrentView();
+    return;
+  }
+  if (currentDisplayMode == DisplayMode::Calibration) {
+    calibrationTarget = (calibrationTarget == CalibrationTarget::White) ? CalibrationTarget::Dark : CalibrationTarget::White;
     renderCurrentView();
     return;
   }
@@ -780,14 +804,14 @@ void cycleView() {
 }
 
 void cycleMode() {
-  MeasureMode previous = currentMode;
-  uint8_t n = (static_cast<uint8_t>(currentMode) + 1) % static_cast<uint8_t>(MeasureMode::COUNT);
-  currentMode = static_cast<MeasureMode>(n);
+  DisplayMode previous = currentDisplayMode;
+  uint8_t n = (static_cast<uint8_t>(currentDisplayMode) + 1) % static_cast<uint8_t>(DisplayMode::COUNT);
+  currentDisplayMode = static_cast<DisplayMode>(n);
 
-  if (previous == MeasureMode::Export && currentMode != MeasureMode::Export) {
+  if (previous == DisplayMode::Export && currentDisplayMode != DisplayMode::Export) {
     bleExporter.end();  // no-op, falls BLE in diesem Aufenthalt nie aktiviert wurde
   }
-  if (currentMode == MeasureMode::Export && previous != MeasureMode::Export) {
+  if (currentDisplayMode == DisplayMode::Export && previous != DisplayMode::Export) {
     // BLE wird bewusst NICHT hier gestartet, siehe performExport().
     exportSending = false;
     exportSentOk = false;
@@ -797,9 +821,13 @@ void cycleMode() {
     // Loeschen-Seite landet.
     exportPage = ExportPage::Normal;
   }
-  if (currentMode == MeasureMode::Settings && previous != MeasureMode::Settings) {
+  if (currentDisplayMode == DisplayMode::Settings && previous != DisplayMode::Settings) {
     // Gleiche Ueberlegung wie bei exportPage oben.
     currentSettingIndex = 0;
+  }
+  if (currentDisplayMode == DisplayMode::Calibration && previous != DisplayMode::Calibration) {
+    // Gleiche Ueberlegung -- nicht unbemerkt auf "Dark" landen.
+    calibrationTarget = CalibrationTarget::White;
   }
 
   // Die zuletzt gezeigte Messung gehoert zum vorherigen Modus -- nach einem
@@ -813,7 +841,7 @@ void cycleMode() {
   // Startpunkt fuer den periodischen 10s-Refresh im Info-Modus (siehe loop())
   // -- verhindert ein sofortiges, redundantes zweites Neuzeichnen direkt nach
   // dem obigen renderCurrentView().
-  if (currentMode == MeasureMode::Info) lastInfoRenderMs = millis();
+  if (currentDisplayMode == DisplayMode::Info) lastInfoRenderMs = millis();
 }
 
 void setup() {
@@ -903,7 +931,7 @@ void loop() {
   // und das Ausloesen des BLE-Sendens bleiben bei sofortigem, kurzem Druck,
   // da sie haeufig und unkritisch sind.
   DebouncedButton::Event te = triggerBtn.poll();
-  if (currentMode == MeasureMode::Export) {
+  if (currentDisplayMode == DisplayMode::Export) {
     if (exportPage == ExportPage::Clear) {
       if (te == DebouncedButton::Event::LongPress) {
         flashBorder();
@@ -913,11 +941,12 @@ void loop() {
     } else if (te == DebouncedButton::Event::Pressed) {
       performExport();
     }
-  } else if (currentMode == MeasureMode::White || currentMode == MeasureMode::Dark) {
+  } else if (currentDisplayMode == DisplayMode::Calibration) {
     if (te == DebouncedButton::Event::LongPress) {
-      performMeasurement(currentMode);
+      SampleKind kind = (calibrationTarget == CalibrationTarget::White) ? SampleKind::White : SampleKind::Dark;
+      performMeasurement(Precision::Precise, kind);  // Referenzmessungen immer Precise, wie bisher
     }
-  } else if (currentMode == MeasureMode::Settings) {
+  } else if (currentDisplayMode == DisplayMode::Settings) {
     // Kurzer Druck reicht -- eine Einstellung aendern ist jederzeit sichtbar
     // und folgenlos korrigierbar, kein "versehentlich zerstoert"-Risiko wie
     // bei Referenz-Ueberschreiben/Loeschen.
@@ -926,11 +955,12 @@ void loop() {
       s.setValue((s.getValue() + 1) % s.valueCount);
       renderCurrentView();
     }
-  } else if (currentMode != MeasureMode::Info) {
-    // Info ist ein reiner Statusbildschirm -- Trigger loest dort bewusst
-    // keine (sinnlose) Messung aus.
+  } else if (currentDisplayMode != DisplayMode::Info) {
+    // Fast oder Precise. Info ist ein reiner Statusbildschirm -- Trigger
+    // loest dort bewusst keine (sinnlose) Messung aus.
     if (te == DebouncedButton::Event::Pressed) {
-      performMeasurement(currentMode);
+      Precision prec = (currentDisplayMode == DisplayMode::Fast) ? Precision::Fast : Precision::Precise;
+      performMeasurement(prec, SampleKind::Regular);
     }
   }
 
@@ -944,7 +974,7 @@ void loop() {
   // Info ist ein rein passiver Statusbildschirm (kein Tastendruck loest dort
   // ein Neuzeichnen aus) -- deshalb hier per Zeitgeber alle 10s aufgefrischt,
   // damit Temperatur/Betriebszeit sichtbar mitlaufen.
-  if (currentMode == MeasureMode::Info && (millis() - lastInfoRenderMs) >= 10000UL) {
+  if (currentDisplayMode == DisplayMode::Info && (millis() - lastInfoRenderMs) >= 10000UL) {
     lastInfoRenderMs = millis();
     renderCurrentView();
   }
@@ -954,7 +984,7 @@ void loop() {
   // einen Tastendruck hier. Event-getrieben statt periodisch gepollt --
   // takeConnectionChanged() liefert nur GENAU DANN true, wenn sich seit dem
   // letzten Aufruf tatsaechlich etwas geaendert hat.
-  if (currentMode == MeasureMode::Export && bleExporter.takeConnectionChanged()) {
+  if (currentDisplayMode == DisplayMode::Export && bleExporter.takeConnectionChanged()) {
     renderCurrentView();
   }
 

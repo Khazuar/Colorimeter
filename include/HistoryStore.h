@@ -6,7 +6,7 @@
 
 struct MeasurementRecord {
   char label[16];
-  MeasureMode mode;
+  SampleKind kind = SampleKind::Regular;
   Measurement measurement;
   // Kontext zum Messzeitpunkt -- nicht repraesentativ fuer die tatsaechliche
   // LED-Temperatur (misst nur den ESP32-Die), aber ein greifbarer Hinweis bei

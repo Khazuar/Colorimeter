@@ -7,8 +7,8 @@
 
 static const char* HISTORY_PATH = "/history.csv";
 
-// Zeilenformat: <label>,<modeNum>,<tempC>,<sessionMs>,<uptimeS>,<filterStateNum>,<v0>,...,<vN-1>
-// Bounds-Check auf modeNum/filterStateNum schuetzt vor einer durch
+// Zeilenformat: <label>,<kindNum>,<tempC>,<sessionMs>,<uptimeS>,<filterStateNum>,<v0>,...,<vN-1>
+// Bounds-Check auf kindNum/filterStateNum schuetzt vor einer durch
 // Stromausfall verstuemmelten Zeile, die zufaellig trotzdem mit '\n' endet.
 static bool parseLine(const std::string& line, MeasurementRecord& rec) {
   size_t pos = 0;
@@ -26,9 +26,9 @@ static bool parseLine(const std::string& line, MeasurementRecord& rec) {
   rec.label[sizeof(rec.label) - 1] = '\0';
 
   if (!nextField(field)) return false;
-  int modeNum = atoi(field.c_str());
-  if (modeNum < 0 || modeNum >= static_cast<int>(MeasureMode::COUNT)) return false;
-  rec.mode = static_cast<MeasureMode>(modeNum);
+  int kindNum = atoi(field.c_str());
+  if (kindNum < 0 || kindNum >= static_cast<int>(SampleKind::COUNT)) return false;
+  rec.kind = static_cast<SampleKind>(kindNum);
 
   if (!nextField(field)) return false;
   rec.tempC = strtof(field.c_str(), nullptr);
@@ -80,7 +80,7 @@ bool HistoryStore::append(const MeasurementRecord& rec) {
 
   f.print(rec.label);
   f.print(',');
-  f.print((int)rec.mode);
+  f.print((int)rec.kind);
   f.print(',');
   f.print(rec.tempC, 2);
   f.print(',');
