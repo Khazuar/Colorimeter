@@ -20,6 +20,11 @@ struct ViewContext {
   bool calibrated;                      // von der Orchestrierung getrackt
   const char* modeLabel;                // "S"/"P"/"W"/"D"/"E" fuer die Ecken-Anzeige
   const char* lastLabel;                // z.B. "sample_03", "" falls noch keine Messung
+  // Filter, der zum Zeitpunkt VON 'measurement' tatsaechlich eingesetzt war
+  // (NICHT notwendigerweise der aktuell im Settings-Modus gewaehlte) -- siehe
+  // main.cpp::renderCurrentView() fuer die Begruendung dieser Asymmetrie
+  // gegenueber whiteReference/darkReference.
+  FilterState filterState;
 };
 
 using ViewRenderFn = void (*)(Adafruit_SSD1306& d, const ViewContext& ctx);

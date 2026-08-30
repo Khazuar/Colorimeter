@@ -7,9 +7,9 @@
 
 static const char* HISTORY_PATH = "/history.csv";
 
-// Zeilenformat: <label>,<modeNum>,<tempC>,<sessionMs>,<uptimeS>,<v0>,...,<vN-1>
-// Bounds-Check auf modeNum schuetzt vor einer durch Stromausfall
-// verstuemmelten Zeile, die zufaellig trotzdem mit '\n' endet.
+// Zeilenformat: <label>,<modeNum>,<tempC>,<sessionMs>,<uptimeS>,<filterStateNum>,<v0>,...,<vN-1>
+// Bounds-Check auf modeNum/filterStateNum schuetzt vor einer durch
+// Stromausfall verstuemmelten Zeile, die zufaellig trotzdem mit '\n' endet.
 static bool parseLine(const std::string& line, MeasurementRecord& rec) {
   size_t pos = 0;
   auto nextField = [&](std::string& out) -> bool {
@@ -38,6 +38,11 @@ static bool parseLine(const std::string& line, MeasurementRecord& rec) {
 
   if (!nextField(field)) return false;
   rec.uptimeS = static_cast<uint32_t>(strtoul(field.c_str(), nullptr, 10));
+
+  if (!nextField(field)) return false;
+  int filterNum = atoi(field.c_str());
+  if (filterNum < 0 || filterNum >= static_cast<int>(FilterState::COUNT)) return false;
+  rec.filterState = static_cast<FilterState>(filterNum);
 
   rec.measurement.clear();
   while (nextField(field)) {
@@ -82,6 +87,8 @@ bool HistoryStore::append(const MeasurementRecord& rec) {
   f.print(rec.sessionMs);
   f.print(',');
   f.print(rec.uptimeS);
+  f.print(',');
+  f.print((int)rec.filterState);
   for (float v : rec.measurement) {
     f.print(',');
     f.print(v, 3);

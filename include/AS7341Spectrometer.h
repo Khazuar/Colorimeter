@@ -14,11 +14,7 @@ public:
   // 12 Rohslots (auch measurementLabels() ist rein zur Beschriftung gedacht,
   // nicht zur Interpretation durch generischen Code).
   static const uint8_t N_CH  = 10;  // Laenge jedes Measurement dieses Sensors
-  static const uint8_t N_VIS = 8;   // erste 8 Eintraege sind die VIS-Baender (Clear=8, NIR=9)
 
-  static const float VIS_CENTERS_NM[N_VIS];  // {415,445,480,515,555,590,630,680}
-  static const float VIS_FWHM_NM[N_VIS];     // Bandbreite je Kanal lt. AS7341-Datenblatt
-                                              // ("Optical Characteristics"), verifiziert.
   static const char* const MEASUREMENT_LABELS[N_CH];
 
   bool begin();  // as7341_.begin() + setATIME/ASTEP/GAIN. Kein NVS-Zugriff.
@@ -28,18 +24,21 @@ public:
   const char* const* measurementLabels() const override { return MEASUREMENT_LABELS; }
   Spectrum getSpectrum(const Measurement& measurement,
                         const Measurement& whiteReference,
-                        const Measurement& darkReference) const override;
+                        const Measurement& darkReference,
+                        FilterState filterState) const override;
 
 private:
-  // Berechnet die kalibrierte Reflexion der 8 VIS-Kanaele. Intern wird dabei
-  // auch die NIR-Reflexion bestimmt (gleiche Formel), um optisches
-  // Uebersprechen von NIR-Licht in F1-F4 herauszurechnen -- daher der Name
-  // (nicht mehr nur "Vis"). Das Ergebnis ist weiterhin nur R_vis; NIR selbst
-  // fliesst nicht in das (sensor-unabhaengige) Spectrum ein.
+  // Berechnet die kalibrierte Reflexion der je nach FilterState nutzbaren
+  // VIS-Kanaele (siehe die BANDS_*-Tabellen in der .cpp) direkt in 'out'.
+  // Intern wird dabei auch die NIR-Reflexion bestimmt (gleiche Formel), um
+  // optisches Uebersprechen von NIR-Licht herauszurechnen -- die Staerke
+  // dieser Korrektur ist filterabhaengig. Das Ergebnis ist weiterhin nur
+  // R_vis; NIR selbst fliesst nicht in das (sensor-unabhaengige) Spectrum ein.
   void computeReflectance(const Measurement& measurement,
                           const Measurement& whiteReference,
                           const Measurement& darkReference,
-                          float R_vis[N_VIS]) const;
+                          FilterState filterState,
+                          Spectrum& out) const;
 
   Adafruit_AS7341 as7341_;
 };

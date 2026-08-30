@@ -10,12 +10,20 @@ class CalibrationStore {
 public:
   void begin();  // prefs_.begin("colorim", false)
 
-  // false, falls nie gespeichert (out bleibt dann leer)
-  bool loadDark(Measurement& out);
-  bool loadWhite(Measurement& out);
+  // false, falls nie gespeichert (out bleibt dann leer, filterState unveraendert)
+  bool loadDark(Measurement& out, FilterState& filterState);
+  bool loadWhite(Measurement& out, FilterState& filterState);
 
-  void saveDark(const Measurement& v);
-  void saveWhite(const Measurement& v);
+  // filterState wird zusammen mit den Rohwerten gespeichert -- Referenz und
+  // ihr Filter-Tag gehoeren untrennbar zusammen (siehe main.cpp::calibrationValidFor()).
+  void saveDark(const Measurement& v, FilterState filterState);
+  void saveWhite(const Measurement& v, FilterState filterState);
+
+  // Die aktuell im Settings-Modus gewaehlte Einstellung -- unabhaengig davon,
+  // was gerade als Dark/White-Referenz kalibriert ist. false, falls nie
+  // gespeichert (out faellt dann auf FilterState::None zurueck).
+  bool loadFilterState(FilterState& out);
+  void saveFilterState(FilterState v);
 
 private:
   bool load(const char* key, Measurement& out);

@@ -5,6 +5,7 @@
 #include <cstring>
 #include <cmath>
 #include <string>
+#include <algorithm>
 
 #include "AppConfig.h"
 #include "Spectrometer.h"
@@ -28,7 +29,23 @@ Spectrometer& spectrometer = sensorImpl;
 // ------------------------- Kalibrierung: Sache der Orchestrierung -------------------------
 CalibrationStore calStore;
 Measurement darkRef, whiteRef;
-bool calibrated = false;
+FilterState darkRefFilterState  = FilterState::None;  // eingefroren MIT darkRef, siehe CalibrationStore
+FilterState whiteRefFilterState = FilterState::None;  // eingefroren MIT whiteRef
+bool calibrated = false;  // "Referenz passt zum AKTUELL gewaehlten Filter" -- siehe calibrationValidFor()
+
+// Aktuell im Settings-Modus gewaehlter Filter (siehe MeasureMode::Settings).
+FilterState currentFilterState = FilterState::None;
+
+// Liefert true, wenn sowohl Dark- als auch White-Referenz vorhanden sind UND
+// beide unter GENAU dem angegebenen Filterzustand aufgenommen wurden. Zentrale
+// Stelle fuer die Regel "passt der Filter nicht, gilt die Referenz als nicht
+// vorhanden" -- wird fuer die Live-Anzeige (gegen lastMeasurementFilterState),
+// den globalen "ready/need cal"-Status (gegen currentFilterState) UND den
+// CSV-Export (gegen rec.filterState jeder Zeile) gleichermassen benutzt.
+bool calibrationValidFor(FilterState fs) {
+  return !darkRef.empty() && !whiteRef.empty()
+      && darkRefFilterState == fs && whiteRefFilterState == fs;
+}
 
 // ------------------------- Betriebszeit-Logging (dedizierte NVS-Partition) -------------------------
 UptimeLogger uptimeLogger;
@@ -36,6 +53,10 @@ UptimeLogger uptimeLogger;
 // ------------------------- letzte Messung / Anzeige-Zustand -------------------------
 Measurement lastMeasurement;
 char lastLabel[16] = "";
+// Filter, der zum Zeitpunkt VON lastMeasurement tatsaechlich eingesetzt war --
+// eingefroren, NICHT der live im Settings-Modus editierbare currentFilterState
+// (siehe renderCurrentView() fuer die Begruendung dieser Asymmetrie).
+FilterState lastMeasurementFilterState = FilterState::None;
 bool busy = false;  // waehrend true: keine weitere Messung/kein weiterer Export ausloesbar
 
 MeasureMode currentMode = MeasureMode::Fast;
@@ -64,6 +85,48 @@ size_t exportSentBytes = 0, exportTotalBytes = 0;
 enum class ExportPage : uint8_t { Normal = 0, Debug = 1, Clear = 2, COUNT = 3 };
 ExportPage exportPage = ExportPage::Normal;
 
+// ------------------------- Settings-Modus -------------------------
+// Kurzer Mode-Druck waehlt, WELCHE Einstellung editiert wird (aktuell nur
+// eine); kurzer Trigger-Druck rotiert deren Wert. Klein gehalten, aber
+// erweiterbar: eine neue Einstellung ist nur ein weiterer SETTINGS-Eintrag,
+// keine Aenderung an der Render-/Tasten-Logik.
+const char* filterStateUiLabel(FilterState fs) {
+  switch (fs) {
+    case FilterState::Filter650nm: return "650nm";
+    case FilterState::Filter700nm: return "700nm";
+    default:                       return "kein Filter";
+  }
+}
+const char* filterStateCsvLabel(FilterState fs) {
+  switch (fs) {
+    case FilterState::Filter650nm: return "650nm";
+    case FilterState::Filter700nm: return "700nm";
+    default:                       return "none";
+  }
+}
+
+struct SettingDescriptor {
+  const char* name;
+  uint8_t valueCount;
+  const char* (*valueLabel)(uint8_t index);
+  uint8_t (*getValue)();
+  void (*setValue)(uint8_t index);
+};
+
+const char* filterSettingLabel(uint8_t i) { return filterStateUiLabel(static_cast<FilterState>(i)); }
+uint8_t getFilterSetting() { return static_cast<uint8_t>(currentFilterState); }
+void setFilterSetting(uint8_t i) {
+  currentFilterState = static_cast<FilterState>(i);
+  calStore.saveFilterState(currentFilterState);
+  calibrated = calibrationValidFor(currentFilterState);  // ein reiner Filterwechsel kann das sofort kippen
+}
+
+const SettingDescriptor SETTINGS[] = {
+  { "Filter", static_cast<uint8_t>(FilterState::COUNT), filterSettingLabel, getFilterSetting, setFilterSetting },
+};
+const uint8_t SETTINGS_COUNT = sizeof(SETTINGS) / sizeof(SETTINGS[0]);
+uint8_t currentSettingIndex = 0;
+
 // ------------------------- Taster -------------------------
 DebouncedButton triggerBtn(TRIGGER_PIN, DEBOUNCE_MS, LONG_PRESS_MS);
 DebouncedButton modeBtn(MODE_PIN, DEBOUNCE_MS, LONG_PRESS_MS);
@@ -80,6 +143,7 @@ const char* modeLabel(MeasureMode m) {
     case MeasureMode::White:   return "W";
     case MeasureMode::Dark:    return "D";
     case MeasureMode::Export:  return "E";
+    case MeasureMode::Settings: return "C";
     case MeasureMode::Info:    return "I";
     default:                   return "S";
   }
@@ -95,27 +159,37 @@ Precision precisionFor(MeasureMode m) {
 // buildHistoryCsv() (voller Dump) und printCsvRow() (Live-Zeile), damit beide
 // garantiert dasselbe Format erzeugen.
 //
-// Kontext-Spalten (Temperatur/Laufzeit/Betriebszeit) fuer eine CSV-Zeile --
-// siehe MeasurementRecord-Kommentar in HistoryStore.h. ctx==nullptr fuer die
-// "*_ref"-Zeilen weiter unten (die zeigen die AKTUELL geladene Kalibrierung,
-// nicht ein konkretes Messereignis -- fuer sie gibt es keinen sinnvollen
-// Zeitpunkt/Temperatur, die Spalten bleiben dort leer).
+// Kontext-Spalten (Temperatur/Laufzeit/Betriebszeit/Filter) fuer eine CSV-
+// Zeile -- siehe MeasurementRecord-Kommentar in HistoryStore.h. ctx==nullptr
+// fuer die "*_ref"-Zeilen weiter unten (die zeigen die AKTUELL geladene
+// Kalibrierung, nicht ein konkretes Messereignis -- fuer sie gibt es keinen
+// sinnvollen Zeitpunkt/Temperatur/Filter, die Spalten bleiben dort leer).
 struct MeasurementContext {
   float tempC;
   uint32_t sessionMs;
   uint32_t uptimeS;
+  FilterState filterState;
 };
 
-// computeSpectrum=false (fuer Dark/White-Referenzen und die weiter unten
-// angehaengten "*_ref"-Zeilen): es gibt keine sinnvolle "Reflexion einer
-// Referenz gegen sich selbst" mehr, seit getSpectrum() explizite Referenzen
-// statt einer gespeicherten Kalibrierung nimmt -- die Spectrum/Lab/Hex-Spalten
-// bleiben dann leer (aber vorhanden, gleiche Spaltenzahl wie jede andere
-// Zeile). Das eigentliche Ergebnis dieser Referenz-Zeilen sind ihre rohen
-// Measurement-Werte (nBandCols dient nur dazu, in diesem Fall die richtige
-// Anzahl Leerspalten auszugeben).
+// "674/45nm" -- Center/FWHM, angelehnt an uebliche Bandpassfilter-Notation
+// (z.B. "680/52 BrightLine"). Noetig, weil verschiedene FilterStates
+// unterschiedliche Baender liefern -- ein reiner "674nm"-Name waere nicht
+// mehr eindeutig genug.
+std::string bandColumnName(const Band& b) {
+  char buf[24];
+  snprintf(buf, sizeof(buf), "%d/%dnm", (int)lroundf(b.center_nm), (int)lroundf(b.fwhm_nm));
+  return buf;
+}
+
+// computeSpectrum=false (fuer Dark/White-Referenzen, die weiter unten
+// angehaengten "*_ref"-Zeilen, ODER eine Messung, deren Filter nicht zur
+// aktuell geladenen Kalibrierung passt -- siehe calibrationValidFor()): es
+// gibt keine sinnvolle abgeleitete Reflexion -- die Spectrum/Lab/Hex-Spalten
+// bleiben dann leer (aber vorhanden, `bandColumns.size()` Leerspalten). Die
+// rohen Measurement-Werte (falls includeRaw) bleiben davon unberuehrt.
 void appendCsvRow(std::string& out, const char* label, const Measurement& measurement,
-                   bool computeSpectrum, bool includeRaw, size_t nBandCols,
+                   FilterState filterState, bool computeSpectrum, bool includeRaw,
+                   const std::vector<Band>& bandColumns,
                    const MeasurementContext* ctx = nullptr) {
   out += label;
   char buf[16];
@@ -124,16 +198,21 @@ void appendCsvRow(std::string& out, const char* label, const Measurement& measur
     snprintf(buf, sizeof(buf), ",%.1f", ctx->tempC); out += buf;
     snprintf(buf, sizeof(buf), ",%.1f", ctx->sessionMs / 1000.0f); out += buf;
     snprintf(buf, sizeof(buf), ",%lu", (unsigned long)ctx->uptimeS); out += buf;
+    out += ',';
+    out += filterStateCsvLabel(ctx->filterState);
   } else {
-    out += ",,,";
+    out += ",,,,";
   }
 
   if (computeSpectrum) {
-    Spectrum spec = spectrometer.getSpectrum(measurement, whiteRef, darkRef);
-    for (size_t i = 0; i < spec.values.size(); i++) {
+    Spectrum spec = spectrometer.getSpectrum(measurement, whiteRef, darkRef, filterState);
+    for (const Band& col : bandColumns) {
       out += ',';
-      snprintf(buf, sizeof(buf), "%.4f", spec.values[i]);
-      out += buf;
+      int idx = -1;
+      for (size_t k = 0; k < spec.bands.size(); k++) {
+        if (spec.bands[k].center_nm == col.center_nm && spec.bands[k].fwhm_nm == col.fwhm_nm) { idx = (int)k; break; }
+      }
+      if (idx >= 0) { snprintf(buf, sizeof(buf), "%.4f", spec.values[idx]); out += buf; }
     }
     Lab lab = getColor(spec);
     uint8_t r, g, b;
@@ -143,7 +222,7 @@ void appendCsvRow(std::string& out, const char* label, const Measurement& measur
     snprintf(buf, sizeof(buf), ",%.2f", lab.b); out += buf;
     snprintf(buf, sizeof(buf), ",#%02X%02X%02X", r, g, b); out += buf;
   } else {
-    for (size_t i = 0; i < nBandCols; i++) out += ',';
+    for (size_t i = 0; i < bandColumns.size(); i++) out += ',';
     out += ",,,,";
   }
 
@@ -157,20 +236,45 @@ void appendCsvRow(std::string& out, const char* label, const Measurement& measur
   out += '\n';
 }
 
+// HistoryStore::forEach()-Visitor: sammelt die Vereinigungsmenge aller
+// vorkommenden Baender (nur von Datensaetzen, deren Filter zur aktuell
+// geladenen Kalibrierung passt -- alle anderen bekommen ohnehin keine echten
+// Spectrum-Spalten, ihre Baender "verdienen" also keine Kopfzeilen-Spalte).
+struct BandCollectCtx {
+  std::vector<Band>* cols;
+};
+void collectBandsVisitor(const MeasurementRecord& rec, void* userData) {
+  BandCollectCtx* c = reinterpret_cast<BandCollectCtx*>(userData);
+  bool isRef = (rec.mode == MeasureMode::Dark || rec.mode == MeasureMode::White);
+  if (isRef || !calibrationValidFor(rec.filterState)) return;
+  Spectrum spec = spectrometer.getSpectrum(rec.measurement, whiteRef, darkRef, rec.filterState);
+  for (const Band& b : spec.bands) {
+    bool known = false;
+    for (const Band& existing : *c->cols) {
+      if (existing.center_nm == b.center_nm && existing.fwhm_nm == b.fwhm_nm) { known = true; break; }
+    }
+    if (!known) c->cols->push_back(b);
+  }
+}
+
 // HistoryStore::forEach()-Visitor: haengt einen persistierten Datensatz per
 // appendCsvRow() an 'out' an -- appendCsvRow() bleibt dabei unveraendert und
 // berechnet Spectrum/Lab/Hex weiterhin frisch gegen die AKTUELL geladene
-// Kalibrierung, nicht gegen eine zum Messzeitpunkt eingefrorene.
+// Kalibrierung, nicht gegen eine zum Messzeitpunkt eingefrorene. Zeilen, deren
+// Filter nicht zur Kalibrierung passt, bekommen keine abgeleiteten Spalten
+// (computeSpectrum=false), behalten aber ihre Rohwerte.
 struct CsvBuildCtx {
   std::string* out;
   bool includeRaw;
-  size_t nBandCols;
+  const std::vector<Band>* bandColumns;
 };
 void appendRecordToCsv(const MeasurementRecord& rec, void* userData) {
   CsvBuildCtx* ctx = reinterpret_cast<CsvBuildCtx*>(userData);
   bool isRef = (rec.mode == MeasureMode::Dark || rec.mode == MeasureMode::White);
-  MeasurementContext mctx{ rec.tempC, rec.sessionMs, rec.uptimeS };
-  appendCsvRow(*ctx->out, rec.label, rec.measurement, !isRef, ctx->includeRaw, ctx->nBandCols, &mctx);
+  bool computeSpectrum = !isRef && calibrationValidFor(rec.filterState);
+  MeasurementContext mctx{ rec.tempC, rec.sessionMs, rec.uptimeS, rec.filterState };
+  appendCsvRow(*ctx->out, rec.label, rec.measurement, rec.filterState, computeSpectrum,
+               ctx->includeRaw, *ctx->bandColumns, &mctx);
 }
 
 // Baut die komplette Messhistorie als CSV. includeRaw haengt zusaetzlich die
@@ -179,17 +283,25 @@ void appendRecordToCsv(const MeasurementRecord& rec, void* userData) {
 // Kalibrierreferenz wird (nur im Debug/Raw-Modus, sonst gaebe es nichts
 // Sinnvolles zu zeigen) immer als eigene Zeile mitgeschickt, auch wenn sie
 // nicht in dieser Sitzung neu gemessen, sondern aus dem Flash geladen wurde.
+//
+// Zwei Durchlaeufe durch die Historie: der erste bestimmt die Vereinigungsmenge
+// aller vorkommenden Baender (unterschiedliche FilterStates koennen strukturell
+// unterschiedliche Baender liefern -- keine feste Spaltenzahl mehr moeglich),
+// der zweite gibt die eigentlichen Zeilen aus.
 std::string buildHistoryCsv(bool includeRaw) {
   std::string out;
 
-  Spectrum headerSpec = spectrometer.getSpectrum(Measurement(), Measurement(), Measurement());
-  size_t nBandCols = headerSpec.bands.size();
+  std::vector<Band> bandColumns;
+  BandCollectCtx collectCtx{ &bandColumns };
+  historyStore.forEach(collectBandsVisitor, &collectCtx);
+  std::sort(bandColumns.begin(), bandColumns.end(), [](const Band& a, const Band& b) {
+    return a.center_nm < b.center_nm;
+  });
 
-  out += "label,temp_c,session_s,uptime_s";
-  for (size_t i = 0; i < nBandCols; i++) {
+  out += "label,temp_c,session_s,uptime_s,filter";
+  for (const Band& b : bandColumns) {
     out += ',';
-    out += std::to_string((int)lroundf(headerSpec.bands[i].center_nm));
-    out += "nm";
+    out += bandColumnName(b);
   }
   out += ",L,a,b,hex";
   if (includeRaw) {
@@ -213,24 +325,33 @@ std::string buildHistoryCsv(bool includeRaw) {
   out += uptimeLine;
 
   if (includeRaw) {
-    if (!darkRef.empty())  appendCsvRow(out, "dark_ref",  darkRef,  false, true, nBandCols);
-    if (!whiteRef.empty()) appendCsvRow(out, "white_ref", whiteRef, false, true, nBandCols);
+    if (!darkRef.empty())  appendCsvRow(out, "dark_ref",  darkRef,  FilterState::None, false, true, bandColumns);
+    if (!whiteRef.empty()) appendCsvRow(out, "white_ref", whiteRef, FilterState::None, false, true, bandColumns);
   }
 
-  CsvBuildCtx ctx{ &out, includeRaw, nBandCols };
+  CsvBuildCtx ctx{ &out, includeRaw, &bandColumns };
   historyStore.forEach(appendRecordToCsv, &ctx);
   return out;
 }
 
 // Live-Zeile nach jeder Einzelmessung. Nutzt denselben appendCsvRow() wie der
-// volle Dump, ueber USB IMMER mit Rohwerten (siehe ExportPage-Kommentar
-// weiter oben).
+// volle Dump, ueber USB IMMER mit Rohwerten (siehe ExportPage-Kommentar weiter
+// oben). Braucht KEINE Spalten-Vereinigungsmenge (nur eine Zeile, nichts womit
+// sie sich abgleichen muesste) -- nutzt einfach die eigenen Baender. Kann
+// daher, je nach Filter-Status/Kalibrierungs-Uebereinstimmung, unterschiedlich
+// viele/benannte Spalten haben als andere Zeilen -- unausweichliche Folge der
+// Filter-Abhaengigkeit, kein Bug.
 void printCsvRow(const MeasurementRecord& rec) {
   bool isRef = (rec.mode == MeasureMode::Dark || rec.mode == MeasureMode::White);
-  Spectrum headerSpec = spectrometer.getSpectrum(Measurement(), Measurement(), Measurement());
+  bool computeSpectrum = !isRef && calibrationValidFor(rec.filterState);
+  std::vector<Band> bandColumns;
+  if (computeSpectrum) {
+    bandColumns = spectrometer.getSpectrum(rec.measurement, whiteRef, darkRef, rec.filterState).bands;
+  }
   std::string row;
-  MeasurementContext ctx{ rec.tempC, rec.sessionMs, rec.uptimeS };
-  appendCsvRow(row, rec.label, rec.measurement, !isRef, /*includeRaw=*/true, headerSpec.bands.size(), &ctx);
+  MeasurementContext ctx{ rec.tempC, rec.sessionMs, rec.uptimeS, rec.filterState };
+  appendCsvRow(row, rec.label, rec.measurement, rec.filterState, computeSpectrum,
+               /*includeRaw=*/true, bandColumns, &ctx);
   Serial.print(row.c_str());
 }
 
@@ -303,14 +424,25 @@ void renderReferenceStatus() {
   display.println(isWhite ? "Weiss-Referenz" : "Dunkel-Referenz");
 
   const Measurement& ref = isWhite ? whiteRef : darkRef;
+  FilterState refFilter = isWhite ? whiteRefFilterState : darkRefFilterState;
   if (ref.empty()) {
     display.setCursor(0, 16);
     display.println("keine Messung");
     display.println("Trigger halten");
   } else {
+    // Ohne diesen Hinweis waere nicht ersichtlich, WARUM eine an sich
+    // vorhandene Referenz ploetzlich wie "nicht kalibriert" behandelt wird,
+    // nachdem im Settings-Modus der Filter gewechselt wurde (siehe
+    // calibrationValidFor()).
+    char filterLine[24];
+    snprintf(filterLine, sizeof(filterLine), "Filter: %s%s", filterStateUiLabel(refFilter),
+             (refFilter != currentFilterState) ? " (!)" : "");
+    display.setCursor(0, 10);
+    display.println(filterLine);
+
     const char* const* labels = spectrometer.measurementLabels();
     char line[27];
-    int y = 16;
+    int y = 24;
     size_t i = 0;
     for (; i + 1 < ref.size(); i += 2) {
       snprintf(line, sizeof(line), "%-4.4s %5.0f %-4.4s %5.0f",
@@ -391,6 +523,30 @@ void renderExportClear() {
   display.display();
 }
 
+// Statusbildschirm fuer den Settings-Modus: Name der aktuell per kurzem
+// Mode-Druck gewaehlten Einstellung (siehe SETTINGS-Registry weiter oben),
+// grosser Wertetext darunter.
+void renderSettingsStatus() {
+  if (!displayOk) return;
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+
+  display.setCursor(0, 0);
+  display.println("Einstellungen");
+
+  const SettingDescriptor& s = SETTINGS[currentSettingIndex];
+  display.setCursor(0, 20);
+  display.print(s.name);
+  display.println(":");
+
+  display.setTextSize(2);
+  display.setCursor(0, 34);
+  display.println(s.valueLabel(s.getValue()));
+
+  display.display();
+}
+
 void renderCurrentView() {
   if (!displayOk) return;
   if (currentMode == MeasureMode::Export) {
@@ -405,12 +561,35 @@ void renderCurrentView() {
     renderReferenceStatus();
     return;
   }
+  if (currentMode == MeasureMode::Settings) {
+    renderSettingsStatus();
+    return;
+  }
   if (currentMode == MeasureMode::Info) {
     renderInfoStatus();
     return;
   }
 
-  ViewContext ctx{ spectrometer, lastMeasurement, whiteRef, darkRef, calibrated, modeLabel(currentMode), lastLabel };
+  // Effektive Referenz gegen lastMeasurementFilterState (NICHT gegen
+  // currentFilterState!) -- ein Rohmesswert wurde physisch durch einen
+  // bestimmten Filter hindurch aufgenommen, ein spaeterer Wechsel der
+  // Settings-Einstellung macht ihn nicht nachtraeglich "durch einen anderen
+  // Filter gemessen". Solange aber noch GAR KEINE Messung vorliegt
+  // (lastMeasurement leer), gibt es nichts einzufrieren -- lastMeasurementFilterState
+  // stuende dann noch auf seinem Boot-Default (FilterState::None), was faelschlich
+  // als Mismatch gegen eine tatsaechlich gueltige Kalibrierung fuer einen ANDEREN
+  // Filter durchschlagen wuerde ("nicht kalibriert" direkt nach dem Start, obwohl
+  // eine passende Referenz gespeichert ist). In diesem Fall daher gegen
+  // currentFilterState pruefen (die eigentlich relevante Frage: "waere eine JETZT
+  // gestartete Messung gueltig kalibriert").
+  FilterState calCheckFilterState = lastMeasurement.empty() ? currentFilterState : lastMeasurementFilterState;
+  bool haveMatchingCal = calibrationValidFor(calCheckFilterState);
+  static const Measurement emptyRef;
+  const Measurement& effDark  = haveMatchingCal ? darkRef  : emptyRef;
+  const Measurement& effWhite = haveMatchingCal ? whiteRef : emptyRef;
+
+  ViewContext ctx{ spectrometer, lastMeasurement, effWhite, effDark, haveMatchingCal,
+                   modeLabel(currentMode), lastLabel, calCheckFilterState };
   VIEW_RENDERERS[static_cast<uint8_t>(currentView)](display, ctx);
 }
 
@@ -474,6 +653,7 @@ void performMeasurement(MeasureMode mode) {
     return;
   }
   lastMeasurement = measurement;
+  lastMeasurementFilterState = currentFilterState;
 
   // Vor der Beschriftung inkrementieren: die Sample-Nummer ist der neue,
   // lebenslange Zaehlerstand -- so laufen die Nummern ueber Reboots/Sessions
@@ -506,13 +686,22 @@ void performMeasurement(MeasureMode mode) {
   rec.tempC = temperatureRead();
   rec.sessionMs = millis();
   rec.uptimeS = uptimeLogger.totalSeconds();
+  rec.filterState = currentFilterState;
   if (!historyStore.append(rec)) {
     Serial.println("# history append failed (Flash voll?)");
   }
 
-  if (mode == MeasureMode::Dark)  { darkRef  = measurement; calStore.saveDark(darkRef); }
-  if (mode == MeasureMode::White) { whiteRef = measurement; calStore.saveWhite(whiteRef); }
-  calibrated = !darkRef.empty() && !whiteRef.empty();
+  if (mode == MeasureMode::Dark) {
+    darkRef = measurement;
+    darkRefFilterState = currentFilterState;  // Filter zum Aufnahmezeitpunkt einfrieren
+    calStore.saveDark(darkRef, darkRefFilterState);
+  }
+  if (mode == MeasureMode::White) {
+    whiteRef = measurement;
+    whiteRefFilterState = currentFilterState;
+    calStore.saveWhite(whiteRef, whiteRefFilterState);
+  }
+  calibrated = calibrationValidFor(currentFilterState);
 
   printCsvRow(rec);
 
@@ -570,12 +759,18 @@ void performExport() {
 }
 
 // Kurzer Mode-Druck: in Fast/Precise/Export-Modus View bzw. Export-Seite
-// wechseln. In White/Dark gibt es (seit dem eigenen Referenz-Screen) nichts
-// zum Umschalten -- Aufruf bleibt dort ein harmloses No-op.
+// wechseln, in Settings die zu editierende Einstellung wechseln. In
+// White/Dark gibt es (seit dem eigenen Referenz-Screen) nichts zum
+// Umschalten -- Aufruf bleibt dort ein harmloses No-op.
 void cycleView() {
   if (currentMode == MeasureMode::Export) {
     uint8_t n = (static_cast<uint8_t>(exportPage) + 1) % static_cast<uint8_t>(ExportPage::COUNT);
     exportPage = static_cast<ExportPage>(n);
+    renderCurrentView();
+    return;
+  }
+  if (currentMode == MeasureMode::Settings) {
+    currentSettingIndex = (currentSettingIndex + 1) % SETTINGS_COUNT;
     renderCurrentView();
     return;
   }
@@ -601,6 +796,10 @@ void cycleMode() {
     // Verhindert, dass man nach einem Modus-Rundgang unbemerkt wieder auf der
     // Loeschen-Seite landet.
     exportPage = ExportPage::Normal;
+  }
+  if (currentMode == MeasureMode::Settings && previous != MeasureMode::Settings) {
+    // Gleiche Ueberlegung wie bei exportPage oben.
+    currentSettingIndex = 0;
   }
 
   // Die zuletzt gezeigte Messung gehoert zum vorherigen Modus -- nach einem
@@ -653,9 +852,10 @@ void setup() {
   modeBtn.begin();
 
   calStore.begin();
-  bool haveDark  = calStore.loadDark(darkRef);
-  bool haveWhite = calStore.loadWhite(whiteRef);
-  calibrated = haveDark && haveWhite;
+  calStore.loadDark(darkRef, darkRefFilterState);
+  calStore.loadWhite(whiteRef, whiteRefFilterState);
+  calStore.loadFilterState(currentFilterState);
+  calibrated = calibrationValidFor(currentFilterState);
 
   uptimeLogger.begin();
   historyStore.begin();  // nicht fatal bei Fehlschlag -- Kernfunktion laeuft ohne Historie weiter
@@ -716,6 +916,15 @@ void loop() {
   } else if (currentMode == MeasureMode::White || currentMode == MeasureMode::Dark) {
     if (te == DebouncedButton::Event::LongPress) {
       performMeasurement(currentMode);
+    }
+  } else if (currentMode == MeasureMode::Settings) {
+    // Kurzer Druck reicht -- eine Einstellung aendern ist jederzeit sichtbar
+    // und folgenlos korrigierbar, kein "versehentlich zerstoert"-Risiko wie
+    // bei Referenz-Ueberschreiben/Loeschen.
+    if (te == DebouncedButton::Event::Pressed) {
+      const SettingDescriptor& s = SETTINGS[currentSettingIndex];
+      s.setValue((s.getValue() + 1) % s.valueCount);
+      renderCurrentView();
     }
   } else if (currentMode != MeasureMode::Info) {
     // Info ist ein reiner Statusbildschirm -- Trigger loest dort bewusst

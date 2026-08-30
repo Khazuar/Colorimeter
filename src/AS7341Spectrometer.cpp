@@ -2,14 +2,6 @@
 #include "AppConfig.h"
 #include <cmath>
 
-const float AS7341Spectrometer::VIS_CENTERS_NM[AS7341Spectrometer::N_VIS] = {
-  415.0f, 445.0f, 480.0f, 515.0f, 555.0f, 590.0f, 630.0f, 680.0f
-};
-
-const float AS7341Spectrometer::VIS_FWHM_NM[AS7341Spectrometer::N_VIS] = {
-  26.0f, 30.0f, 36.0f, 39.0f, 39.0f, 40.0f, 50.0f, 52.0f
-};
-
 // Debug-/Analysezwecke: Klartext-Label je Measurement-Element, in derselben
 // Reihenfolge wie performMeasurement() sie liefert (F1..F8, Clear, NIR).
 // NICHT von generischem Code nutzen, um den Measurement-Inhalt zu interpretieren.
@@ -111,17 +103,86 @@ Measurement AS7341Spectrometer::performMeasurement(Precision precision, Progress
   return m;
 }
 
-// Optisches Uebersprechen: NIR-Licht beeinflusst F1-F4 unterschiedlich stark
-// (F1 am staerksten) -- Anteil des NIR-Reflexionswerts, der von der jeweiligen
-// VIS-Reflexion abgezogen werden muss. F5-F8 unbeeinflusst (Faktor 0).
-static const float NIR_CROSSTALK_FACTOR[AS7341Spectrometer::N_VIS] = {
-  0.55f, 0.17f, 0.19f, 0.07f, 0.0f, 0.0f, 0.0f, 0.0f
+// Optisches Uebersprechen: NIR-Licht beeinflusst die VIS-Kanaele
+// unterschiedlich stark -- WELCHE Kanaele ueberhaupt auswertbar sind und mit
+// welchem Faktor sie korrigiert werden muessen, haengt vom eingesetzten
+// IR-Cut-Filter ab (empirisch bestimmt per Vergleichsmessungen derselben
+// Proben mit/ohne 650nm- bzw. 700nm-Filter). channelIndex verweist auf den
+// zugehoerigen rohen F1..F8-Slot (0..7) -- die Rohkanal-Erfassung selbst
+// bleibt davon unberuehrt.
+struct VisBandDef {
+  uint8_t channelIndex;
+  float center_nm;
+  float fwhm_nm;
+  float nirFactor;
+  float nirFactorErr;  // Unsicherheit von nirFactor -- Basis von Spectrum::valueErrors
 };
+
+// Kein Filter: F1-F7 korrigierbar, F8 hat einen Korrekturfaktor unbekannter
+// Groesse -> komplett weggelassen statt unkorrigiert auszugeben.
+static const VisBandDef BANDS_NONE[] = {
+  { 0, 415.0f, 26.0f, 0.355f, 0.060f },  // F1
+  { 1, 445.0f, 30.0f, 0.109f, 0.019f },  // F2
+  { 2, 480.0f, 36.0f, 0.089f, 0.012f },  // F3
+  { 3, 515.0f, 39.0f, 0.036f, 0.007f },  // F4
+  { 4, 555.0f, 39.0f, 0.057f, 0.011f },  // F5
+  { 5, 590.0f, 40.0f, 0.0f,   0.12f  },  // F6
+  { 6, 630.0f, 50.0f, 0.0f,   0.0f   },  // F7
+};
+
+// 700nm-Filter: F1-F7 mit praeziseren Faktoren; F8 UMDEFINIERT als eigenes
+// 674nm/45nm-Band statt als "abgeschnittener 680nm/52nm-Kanal" verworfen --
+// der 700nm-Cut-Filter macht diesen engeren, effektiv genutzten
+// Empfindlichkeitsbereich per Konstruktion NIR-frei (daher Faktor 0).
+static const VisBandDef BANDS_700NM[] = {
+  { 0, 415.0f, 26.0f, 0.125f, 0.045f },  // F1
+  { 1, 445.0f, 30.0f, 0.032f, 0.017f },  // F2
+  { 2, 480.0f, 36.0f, 0.024f, 0.013f },  // F3
+  { 3, 515.0f, 39.0f, 0.009f, 0.011f },  // F4
+  { 4, 555.0f, 39.0f, 0.026f, 0.014f },  // F5
+  { 5, 590.0f, 40.0f, 0.0f,   0.14f  },  // F6
+  { 6, 630.0f, 50.0f, 0.0f,   0.07f  },  // F7
+  { 7, 674.0f, 45.0f, 0.0f,   0.03f  },  // F8, umdefiniert, NIR-frei per Konstruktion, Unsicherheit geometrisch bedingt (keine saubere Sigmoid Form)
+};
+
+// 650nm-Filter: blockt bereits ab 650nm -> F1-F6 per Konstruktion NIR-frei
+// (Faktor 0), F7/F8 entfallen (der Filter schneidet bereits in ihren
+// eigentlichen Empfindlichkeitsbereich, "nicht nutzbar").
+// Die Unsicherheit "0.0f" ist eine Annahme, die nicht weiter geprüft wurde. 
+// Es fehlt an verfügbaren Methoden, diese Unsicherheit zu charakterisieren. 
+// Ziemlich sicher ist der verbleibende "echte" NIR-Anteil aber vernachlässigbar. 
+// Verbleibender Roh-Anzeigewert ist durch VIZ-Übersprechen in den NIR-Kanal bedingt.
+static const VisBandDef BANDS_650NM[] = {
+  { 0, 415.0f, 26.0f, 0.0f, 0.0f },  // F1
+  { 1, 445.0f, 30.0f, 0.0f, 0.0f },  // F2
+  { 2, 480.0f, 36.0f, 0.0f, 0.0f },  // F3
+  { 3, 515.0f, 39.0f, 0.0f, 0.0f },  // F4
+  { 4, 555.0f, 39.0f, 0.0f, 0.0f },  // F5
+  { 5, 590.0f, 40.0f, 0.0f, 0.0f },  // F6
+};
+
+static void bandsForFilterState(FilterState fs, const VisBandDef*& defs, size_t& count) {
+  switch (fs) {
+    case FilterState::Filter700nm:
+      defs = BANDS_700NM;
+      count = sizeof(BANDS_700NM) / sizeof(BANDS_700NM[0]);
+      break;
+    case FilterState::Filter650nm:
+      defs = BANDS_650NM;
+      count = sizeof(BANDS_650NM) / sizeof(BANDS_650NM[0]);
+      break;
+    default:
+      defs = BANDS_NONE;
+      count = sizeof(BANDS_NONE) / sizeof(BANDS_NONE[0]);
+      break;
+  }
+}
 
 void AS7341Spectrometer::computeReflectance(const Measurement& measurement,
                                              const Measurement& whiteReference,
                                              const Measurement& darkReference,
-                                             float R_vis[N_VIS]) const {
+                                             FilterState filterState,
+                                             Spectrum& out) const {
   bool haveCal = (whiteReference.size() == N_CH && darkReference.size() == N_CH);
   bool haveMeasurement = (measurement.size() == N_CH);
 
@@ -136,24 +197,41 @@ void AS7341Spectrometer::computeReflectance(const Measurement& measurement,
   };
 
   float R_nir = reflectance(N_CH - 1);
-  for (uint8_t i = 0; i < N_VIS; i++) {
-    float r = (reflectance(i) - NIR_CROSSTALK_FACTOR[i] * R_nir) / (1 - NIR_CROSSTALK_FACTOR[i]);
-    R_vis[i] = (r < 0.0f) ? 0.0f : r;  // erneut clampen -- die NIR-Korrektur kann ins Negative ziehen
+
+  const VisBandDef* defs;
+  size_t n;
+  bandsForFilterState(filterState, defs, n);
+
+  out.bands.resize(n);
+  out.values.resize(n);
+  out.valueErrors.resize(n);
+
+  for (size_t i = 0; i < n; i++) {
+    const VisBandDef& def = defs[i];
+    out.bands[i] = Band{ def.center_nm, def.fwhm_nm };
+
+    float rawR = reflectance(def.channelIndex);
+    auto correct = [&](float factor) -> float {
+      float r = (rawR - factor * R_nir) / (1.0f - factor);
+      return (r < 0.0f) ? 0.0f : r;  // erneut clampen -- die NIR-Korrektur kann ins Negative ziehen
+    };
+    out.values[i] = correct(def.nirFactor);
+
+    // Fehler-Range: halbe Spannweite der Korrektur bei +-1 Sigma des Faktors
+    // -- eine einfache numerische Sensitivitaetsabschaetzung statt einer
+    // analytisch hergeleiteten Ableitung; bei ohnehin nur grob bekannten
+    // Unsicherheiten ausreichend und weniger fehleranfaellig.
+    out.valueErrors[i] = (def.nirFactorErr > 0.0f)
+        ? fabsf(correct(def.nirFactor + def.nirFactorErr) - correct(def.nirFactor - def.nirFactorErr)) / 2.0f
+        : 0.0f;
   }
 }
 
 Spectrum AS7341Spectrometer::getSpectrum(const Measurement& measurement,
                                           const Measurement& whiteReference,
-                                          const Measurement& darkReference) const {
-  float R_vis[N_VIS];
-  computeReflectance(measurement, whiteReference, darkReference, R_vis);
-
+                                          const Measurement& darkReference,
+                                          FilterState filterState) const {
   Spectrum s;
-  s.bands.resize(N_VIS);
-  s.values.resize(N_VIS);
-  for (uint8_t i = 0; i < N_VIS; i++) {
-    s.bands[i] = Band{ VIS_CENTERS_NM[i], VIS_FWHM_NM[i] };
-    s.values[i] = R_vis[i];
-  }
+  computeReflectance(measurement, whiteReference, darkReference, filterState, s);
   return s;
 }

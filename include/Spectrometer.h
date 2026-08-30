@@ -38,9 +38,20 @@ struct Band {
 struct Spectrum {
   std::vector<Band> bands;
   std::vector<float> values;
+  // Absolute Unsicherheit je Band, abgeleitet aus der Unsicherheit des dafuer
+  // verwendeten NIR-Korrekturfaktors (siehe AS7341Spectrometer.cpp) -- 0.0, wo
+  // kein Fehlermodell vorliegt. Vorerst nur intern mitgefuehrt (kein CSV-
+  // Export), Grundlage fuer eine spaetere DeltaE-Unsicherheitsberechnung.
+  std::vector<float> valueErrors;
 };
 
 enum class Precision : uint8_t { Fast, Precise };
+
+// Welcher physische (Bandpass-/Cut-)Filter aktuell vor dem Sensor sitzt.
+// Generisches Konzept (jeder Spectrometer koennte sowas unterstuetzen), auch
+// wenn die konkreten Werte aktuell nur von AS7341Spectrometer befuellt werden
+// -- gleiche Pragmatik wie bei Precision::Fast/Precise.
+enum class FilterState : uint8_t { None = 0, Filter650nm = 1, Filter700nm = 2, COUNT = 3 };
 
 // current: wie viele Einzelproben bereits genommen wurden; maxEstimate: Obergrenze
 // (bei Precision::Precise ggf. nicht ausgeschoepft, falls vorher konvergiert).
@@ -73,5 +84,6 @@ public:
   // Referenz zu behandeln ist, entscheidet die jeweilige Implementierung.
   virtual Spectrum getSpectrum(const Measurement& measurement,
                                 const Measurement& whiteReference,
-                                const Measurement& darkReference) const = 0;
+                                const Measurement& darkReference,
+                                FilterState filterState) const = 0;
 };
