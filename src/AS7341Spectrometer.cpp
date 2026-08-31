@@ -23,7 +23,11 @@ bool AS7341Spectrometer::begin() {
 // getunte Loesung -- siehe Plan/Kontext: welche Stoppschwelle tatsaechlich
 // <1 DeltaE Messgenauigkeit liefert, muss noch empirisch getestet werden.
 static const uint8_t FAST_SAMPLES           = 1;
-static const uint8_t PRECISE_MIN_SAMPLES    = 4;
+// n=4 hatte ~41% relative Unsicherheit der SD-Schaetzung selbst
+// (1/sqrt(2*(n-1))) -- der allererste converged()-Check konnte dadurch rein
+// zufaellig zu frueh positiv ausfallen. n=8 (~27%) ist spuerbar robuster,
+// weiteres Erhoehen bringt abnehmenden Ertrag -- TODO tunen.
+static const uint8_t PRECISE_MIN_SAMPLES    = 8;
 static const uint8_t PRECISE_MAX_SAMPLES    = 32;    // Cap, ersetzt frueheres festes N_AVG=16
 static const float   PRECISE_TARGET_REL_SEM = 0.01f; // 1% rel. Standardfehler d. Mittelwerts -- TODO tunen
 static const float   NOISE_FLOOR_COUNTS     = 50.0f;  // Kanaele darunter zaehlen nicht zur Konvergenzpruefung
@@ -31,13 +35,19 @@ static const float   NOISE_FLOOR_COUNTS     = 50.0f;  // Kanaele darunter zaehle
 // Schlechtester relativer Standardfehler des Mittelwerts ueber alle Kanaele mit
 // Signal oberhalb NOISE_FLOOR_COUNTS (sonst dominiert das Rauschen sehr dunkler
 // Kanaele den relativen Fehler, ohne etwas ueber die Messqualitaet auszusagen).
-static bool converged(const uint16_t buf[][AS7341Spectrometer::N_CH], uint8_t taken) {
+// anyChannelEvaluated meldet, ob ueberhaupt ein Kanal oberhalb der
+// Rauschgrenze lag -- der Rueckgabewert ist bedeutungslos, wenn nicht (worst
+// bleibt bei seinem Initialwert 0.0). performMeasurement() behandelt diesen
+// Fall (z.B. sehr dunkle Probe/Dunkelmessung) explizit separat, siehe dort.
+static bool converged(const uint16_t buf[][AS7341Spectrometer::N_CH], uint8_t taken, bool& anyChannelEvaluated) {
   float worst = 0.0f;
+  anyChannelEvaluated = false;
   for (uint8_t ch = 0; ch < AS7341Spectrometer::N_CH; ch++) {
     float mean = 0.0f;
     for (uint8_t i = 0; i < taken; i++) mean += buf[i][ch];
     mean /= taken;
     if (mean < NOISE_FLOOR_COUNTS) continue;
+    anyChannelEvaluated = true;
 
     float varSum = 0.0f;
     for (uint8_t i = 0; i < taken; i++) { float d = buf[i][ch] - mean; varSum += d * d; }
@@ -48,7 +58,8 @@ static bool converged(const uint16_t buf[][AS7341Spectrometer::N_CH], uint8_t ta
   return worst <= PRECISE_TARGET_REL_SEM;
 }
 
-Measurement AS7341Spectrometer::performMeasurement(Precision precision, ProgressCallback onProgress) {
+Measurement AS7341Spectrometer::performMeasurement(Precision precision, ProgressCallback onProgress,
+                                                    MeasurementStatus* outStatus) {
   uint8_t maxSamples = (precision == Precision::Fast) ? FAST_SAMPLES : PRECISE_MAX_SAMPLES;
   uint8_t minSamples = (precision == Precision::Fast) ? FAST_SAMPLES : PRECISE_MIN_SAMPLES;
 
@@ -64,6 +75,8 @@ Measurement AS7341Spectrometer::performMeasurement(Precision precision, Progress
 
   static uint16_t buf[PRECISE_MAX_SAMPLES][N_CH];  // ~640B, static um Stack zu schonen
   uint8_t taken = 0;
+  uint8_t consecutiveConverged = 0;
+  bool stoppedShortNoSignal = false;  // siehe "kein Kanal evaluiert"-Kurzschluss unten
 
   for (uint8_t n = 0; n < maxSamples; n++) {
     if (onProgress) onProgress(taken, maxSamples);
@@ -71,34 +84,65 @@ Measurement AS7341Spectrometer::performMeasurement(Precision precision, Progress
     if (!as7341_.readAllChannels(r)) continue;
     for (uint8_t i = 0; i < N_CH; i++) buf[taken][i] = r[SRC_IDX[i]];
     taken++;
-    if (precision == Precision::Precise && taken >= minSamples && converged(buf, taken)) break;
+
+    if (precision == Precision::Precise && taken >= minSamples) {
+      bool anyChannelEvaluated;
+      bool isConverged = converged(buf, taken, anyChannelEvaluated);
+      if (!anyChannelEvaluated) {
+        // Bewusste Kurzschluss-Entscheidung: kein Kanal hat Signal oberhalb
+        // der Rauschgrenze (z.B. sehr dunkle Probe/Dunkelmessung) -- die
+        // relative Praezisionsschwelle ist fuer Kanaele ohne Signal nicht
+        // aussagekraeftig, mehr Samples aendern daran systematisch nichts.
+        // Deshalb sofortiger Abbruch bei minSamples, ohne die sonst uebliche
+        // 2-von-2-Bestaetigung (siehe unten) abzuwarten.
+        stoppedShortNoSignal = true;
+        break;
+      }
+      if (isConverged) {
+        // Zwei aufeinanderfolgende Treffer verlangt statt nur einem --
+        // mildert "optional stopping"-Bias ab (ein einzelner zufaellig
+        // guenstiger Zwischenwert wuerde die Messung sonst vorzeitig
+        // optimistisch verzerrt beenden). Bei Cap 32 ist der praktische
+        // Schaden eines einzelnen Treffers begrenzt, die Korrektur ist aber
+        // billig genug, um sie trotzdem mitzunehmen -- TODO tunen.
+        consecutiveConverged++;
+        if (consecutiveConverged >= 2) break;
+      } else {
+        consecutiveConverged = 0;
+      }
+    }
   }
   if (onProgress) onProgress(taken, maxSamples);
-  if (taken == 0) return Measurement();  // Fehler-Sentinel: leeres Measurement
 
-  // Ausreisser-Trimmung (einfaches Verfahren): pro Kanal hoechsten/niedrigsten
-  // Einzelwert verwerfen (ab 5 Samples), Rest mitteln. Kompensiert einzelne
-  // verwackelte/durch Fremdlicht gestoerte Messungen etwas -- siehe Plan fuer
-  // moegliche Verfeinerung (Ausreisser als ganze Probe statt pro Kanal erkennen).
+  if (taken == 0) {
+    // Sensor liefert ueberhaupt keine gueltigen Daten -- Hardware-Fehler.
+    if (outStatus) *outStatus = MeasurementStatus::SensorError;
+    return Measurement();
+  }
+
+  bool converged_enough = (precision != Precision::Precise)
+                        || stoppedShortNoSignal
+                        || (consecutiveConverged >= 2);
+  if (!converged_enough) {
+    // maxSamples ausgeschoepft, ohne dass die Zielpraezision (zwei
+    // aufeinanderfolgende converged()-Treffer) bestaetigt wurde -- z.B. eine
+    // andauernde Stoerung waehrend der Messung (Geraet wird bewegt). Explizit
+    // vom Sensorfehler-Fall oben unterscheidbar, siehe MeasurementStatus.
+    if (outStatus) *outStatus = MeasurementStatus::NotConverged;
+    return Measurement();
+  }
+
+  if (outStatus) *outStatus = MeasurementStatus::Ok;
+
+  // Schlichter Mittelwert ueber alle gesammelten Samples -- keine
+  // Ausreisser-Trimmung mehr (siehe Kontext: die adaptive Stichprobenziehung
+  // selbst daempft kurze Stoerungen bereits, ohne die von converged()
+  // zertifizierte Praezision auf ungetrimmten Daten zu unterlaufen).
   Measurement m(N_CH);
   for (uint8_t ch = 0; ch < N_CH; ch++) {
-    if (taken >= 5) {
-      uint16_t mn = buf[0][ch], mx = buf[0][ch];
-      uint32_t sum = 0;
-      for (uint8_t i = 0; i < taken; i++) {
-        uint16_t v = buf[i][ch];
-        sum += v;
-        if (v < mn) mn = v;
-        if (v > mx) mx = v;
-      }
-      sum -= mn;
-      sum -= mx;
-      m[ch] = (float)sum / (float)(taken - 2);
-    } else {
-      uint32_t sum = 0;
-      for (uint8_t i = 0; i < taken; i++) sum += buf[i][ch];
-      m[ch] = (float)sum / (float)taken;
-    }
+    uint32_t sum = 0;
+    for (uint8_t i = 0; i < taken; i++) sum += buf[i][ch];
+    m[ch] = (float)sum / (float)taken;
   }
   return m;
 }

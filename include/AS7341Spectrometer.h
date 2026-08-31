@@ -20,7 +20,8 @@ public:
   bool begin();  // as7341_.begin() + setATIME/ASTEP/GAIN. Kein NVS-Zugriff.
 
   Measurement performMeasurement(Precision precision,
-                                  ProgressCallback onProgress = nullptr) override;
+                                  ProgressCallback onProgress = nullptr,
+                                  MeasurementStatus* outStatus = nullptr) override;
   const char* const* measurementLabels() const override { return MEASUREMENT_LABELS; }
   Spectrum getSpectrum(const Measurement& measurement,
                         const Measurement& whiteReference,

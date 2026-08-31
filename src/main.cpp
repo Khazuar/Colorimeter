@@ -655,6 +655,35 @@ void flashBorder() {
   delay(80);
 }
 
+// Eigener Screen fuer einen fehlgeschlagenen Messversuch (leeres Measurement
+// von spectrometer.performMeasurement()) -- bleibt stehen, bis die naechste
+// Aktion (erneuter Trigger-/Mode-Druck) einen regulaeren Re-Render ausloest,
+// gleiches Muster wie z.B. das "gesendet"/"Kein Handy verbunden"-Feedback im
+// Export-Modus. Gilt fuer alle performMeasurement()-Aufrufer gleichermassen
+// (Fast/Precise/Calibration) -- die Ursache ist unabhaengig davon relevant.
+void renderMeasurementError(MeasurementStatus status) {
+  if (!displayOk) return;
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+
+  display.setCursor(0, 0);
+  display.println("Fehler");
+
+  display.setCursor(0, 20);
+  if (status == MeasurementStatus::NotConverged) {
+    display.println("Messung zu stark");
+    display.println("verrauscht");
+    display.println("Geraet ruhig halten");
+    display.println("und erneut versuchen");
+  } else {
+    display.println("Sensor antwortet");
+    display.println("nicht");
+  }
+
+  display.display();
+}
+
 // Gemeinsamer Einstiegspunkt fuer den Trigger-Taster in allen Mess-Modi.
 // precision/kind werden vom Aufrufer (loop()) bestimmt, nicht hier -- diese
 // Funktion kennt keinen DisplayMode mehr, nur noch "wie genau messen" und
@@ -666,10 +695,16 @@ void performMeasurement(Precision precision, SampleKind kind) {
   flashBorder();  // nur hier, also nur wenn tatsaechlich gestartet wird
   showMeasuringScreen(0, 1);
 
-  Measurement measurement = spectrometer.performMeasurement(precision, showMeasuringScreen);
+  MeasurementStatus status = MeasurementStatus::Ok;
+  Measurement measurement = spectrometer.performMeasurement(precision, showMeasuringScreen, &status);
   if (measurement.empty()) {
+    if (status == MeasurementStatus::NotConverged) {
+      Serial.println("# Messung nicht konvergiert -- Geraet ruhig halten und erneut versuchen");
+    } else {
+      Serial.println("# Sensorfehler bei der Messung");
+    }
     busy = false;
-    renderCurrentView();
+    renderMeasurementError(status);
     return;
   }
   lastMeasurement = measurement;

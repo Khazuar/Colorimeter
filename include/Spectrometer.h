@@ -58,6 +58,19 @@ enum class FilterState : uint8_t { None = 0, Filter650nm = 1, Filter700nm = 2, C
 // Reiner Funktionszeiger (kein std::function) -- kein Heap-Bedarf.
 using ProgressCallback = void (*)(uint8_t current, uint8_t maxEstimate);
 
+// Ergebnis eines performMeasurement()-Aufrufs jenseits der reinen Messdaten.
+// Optionaler Out-Parameter -- Aufrufer, die nur wissen wollen "hat's
+// geklappt", pruefen weiterhin einfach Measurement::empty() wie bisher.
+// SensorError: der Sensor liefert ueberhaupt keine gueltigen Daten
+// (Hardware-Fehler). NotConverged: nur bei Precision::Precise moeglich --
+// die Zielpraezision wurde innerhalb des Sample-Budgets nicht erreicht (z.B.
+// das Geraet wurde waehrend der Messung durchgehend bewegt). Beide Faelle
+// geben ein leeres Measurement zurueck (nicht nutzbare Daten bleiben nicht
+// nutzbar), unterscheiden sich aber in der Ursache -- fuer eine dem Nutzer
+// gegenueber unterschiedliche Fehlermeldung ("Sensorfehler" vs. "Geraet ruhig
+// halten und erneut versuchen").
+enum class MeasurementStatus : uint8_t { Ok, SensorError, NotConverged };
+
 class Spectrometer {
 public:
   virtual ~Spectrometer() = default;
@@ -66,9 +79,12 @@ public:
   // Konfiguration, Register auslesen/umrechnen) -- das Ergebnis ist ein
   // opakes Measurement, keine Struktur darauf verlassen. onProgress (falls
   // gesetzt) wird waehrend der Messung wiederholt aufgerufen, damit die
-  // Orchestrierung z.B. eine Fortschrittsanzeige zeichnen kann.
+  // Orchestrierung z.B. eine Fortschrittsanzeige zeichnen kann. outStatus
+  // (falls gesetzt) liefert den Grund, falls ein leeres Measurement
+  // zurueckkommt -- siehe MeasurementStatus.
   virtual Measurement performMeasurement(Precision precision,
-                                          ProgressCallback onProgress = nullptr) = 0;
+                                          ProgressCallback onProgress = nullptr,
+                                          MeasurementStatus* outStatus = nullptr) = 0;
 
   // NUR fuer Debug-/Analysezwecke: ein Klartext-Label je Measurement-Element,
   // in derselben Reihenfolge und Laenge wie ein Measurement desselben Sensors.
