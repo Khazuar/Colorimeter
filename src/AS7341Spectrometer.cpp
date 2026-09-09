@@ -1,5 +1,6 @@
 #include "AS7341Spectrometer.h"
 #include "AppConfig.h"
+#include <Arduino.h>
 #include <cmath>
 
 // Debug-/Analysezwecke: Klartext-Label je Measurement-Element, in derselben
@@ -32,11 +33,30 @@ static const uint8_t SINGLE_SAMPLES         = 1;
 static const uint8_t PRECISE_MIN_SAMPLES    = 8;
 static const uint8_t PRECISE_MAX_SAMPLES    = 32;    // Cap, ersetzt frueheres festes N_AVG=16
 static const float   PRECISE_TARGET_REL_SEM = 0.01f; // 1% rel. Standardfehler d. Mittelwerts -- TODO tunen
-static const float   NOISE_FLOOR_COUNTS     = 50.0f;  // Kanaele darunter zaehlen nicht zur Konvergenzpruefung
+static const float   NOISE_FLOOR_COUNTS     = 50.0f;  // Kanaele darunter zaehlen nicht zur Konvergenzpruefung,
+                                                        // werden aber ueber anyChannelUnmeasurable an
+                                                        // performMeasurement() gemeldet, damit ein nicht
+                                                        // messbarer Kanal nicht stillschweigend zu einer
+                                                        // beschoenigten Praezisionsangabe fuehrt (siehe unten).
 
 // Schlechtester relativer Standardfehler des Mittelwerts ueber alle Kanaele mit
 // Signal oberhalb NOISE_FLOOR_COUNTS (sonst dominiert das Rauschen sehr dunkler
 // Kanaele den relativen Fehler, ohne etwas ueber die Messqualitaet auszusagen).
+// worstOut beschreibt also weiterhin NUR die messbaren Kanaele -- anyChannelUnmeasurable
+// macht sichtbar, wenn das nicht ALLE Kanaele waren, damit ein Aufrufer diese
+// Teilinformation nicht faelschlich als vollstaendige Praezisionsaussage fuer
+// die GESAMTE Messung missversteht (z.B. eine bunte Probe, bei der nur ein
+// einzelnes, stark absorbierendes Band unter der Rauschgrenze bleibt --
+// vorher wurde dieser Kanal einfach ignoriert, was das Ergebnis optimistischer
+// aussehen liess, als es war). Das Stopp-/Akzeptanzkriterium selbst bleibt
+// bewusst NUR von den messbaren Kanaelen abhaengig (siehe Rueckgabewert unten)
+// -- ein nicht messbarer Kanal soll die Konvergenz nicht verhindern, denn mehr
+// Samples wuerden seinen Mittelwert ohnehin nicht anheben (sonst waere z.B.
+// eine schwarze Probe im Precise-Modus nie mehr messbar). Die eigentliche
+// Korrektur (den berichteten relSEM-Wert bei anyChannelUnmeasurable auf NAN zu
+// setzen, statt eine beschoenigte Zahl aus nur den guten Kanaelen zu melden)
+// passiert daher NICHT hier, sondern in performMeasurement().
+//
 // anyChannelEvaluated meldet, ob ueberhaupt ein Kanal oberhalb der
 // Rauschgrenze lag -- worstOut ist bedeutungslos, wenn nicht (bleibt bei
 // seinem Initialwert 0.0). performMeasurement() behandelt diesen Fall (z.B.
@@ -45,14 +65,18 @@ static const float   NOISE_FLOOR_COUNTS     = 50.0f;  // Kanaele darunter zaehle
 // damit performMeasurement() den erreichten Wert als Telemetrie (relSemWorst)
 // mitgeben kann, statt ihn wie bisher nach der Ja/Nein-Entscheidung zu verwerfen.
 static bool converged(const uint16_t buf[][AS7341Spectrometer::N_CH], uint8_t taken,
-                       bool& anyChannelEvaluated, float& worstOut) {
+                       bool& anyChannelEvaluated, bool& anyChannelUnmeasurable, float& worstOut) {
   float worst = 0.0f;
   anyChannelEvaluated = false;
+  anyChannelUnmeasurable = false;
   for (uint8_t ch = 0; ch < AS7341Spectrometer::N_CH; ch++) {
     float mean = 0.0f;
     for (uint8_t i = 0; i < taken; i++) mean += buf[i][ch];
     mean /= taken;
-    if (mean < NOISE_FLOOR_COUNTS) continue;
+    if (mean < NOISE_FLOOR_COUNTS) {
+      anyChannelUnmeasurable = true;
+      continue;
+    }
     anyChannelEvaluated = true;
 
     float varSum = 0.0f;
@@ -62,7 +86,7 @@ static bool converged(const uint16_t buf[][AS7341Spectrometer::N_CH], uint8_t ta
     if (relSEM > worst) worst = relSEM;
   }
   worstOut = worst;
-  return worst <= PRECISE_TARGET_REL_SEM;
+  return anyChannelEvaluated && (worst <= PRECISE_TARGET_REL_SEM);
 }
 
 // Kleiner Helfer statt Aggregat-Initialisierung: MeasurementTelemetry hat
@@ -97,6 +121,7 @@ Measurement AS7341Spectrometer::performMeasurement(Precision precision, Progress
   uint8_t consecutiveConverged = 0;
   bool stoppedShortNoSignal = false;  // siehe "kein Kanal evaluiert"-Kurzschluss unten
   float lastRelSemWorst = NAN;  // nur bei Precision::Precise UND mind. einem evaluierten Kanal gesetzt
+  bool lastAnyUnmeasurable = false;  // mind. 1 (aber nicht alle) Kanaele unterhalb der Rauschgrenze -- siehe converged()
 
   for (uint8_t n = 0; n < maxSamples; n++) {
     if (onProgress) onProgress(taken, maxSamples);
@@ -107,8 +132,9 @@ Measurement AS7341Spectrometer::performMeasurement(Precision precision, Progress
 
     if (precision == Precision::Precise && taken >= minSamples) {
       bool anyChannelEvaluated;
+      bool anyChannelUnmeasurable;
       float relSemWorst;
-      bool isConverged = converged(buf, taken, anyChannelEvaluated, relSemWorst);
+      bool isConverged = converged(buf, taken, anyChannelEvaluated, anyChannelUnmeasurable, relSemWorst);
       if (!anyChannelEvaluated) {
         // Bewusste Kurzschluss-Entscheidung: kein Kanal hat Signal oberhalb
         // der Rauschgrenze (z.B. sehr dunkle Probe/Dunkelmessung) -- die
@@ -121,6 +147,7 @@ Measurement AS7341Spectrometer::performMeasurement(Precision precision, Progress
         break;
       }
       lastRelSemWorst = relSemWorst;
+      lastAnyUnmeasurable = anyChannelUnmeasurable;
       if (isConverged) {
         // Zwei aufeinanderfolgende Treffer verlangt statt nur einem --
         // mildert "optional stopping"-Bias ab (ein einzelner zufaellig
@@ -159,7 +186,20 @@ Measurement AS7341Spectrometer::performMeasurement(Precision precision, Progress
 
   // Precision::Single berechnet nie ein relSEM (der obige Konvergenz-Zweig
   // laeuft dort gar nicht) -- lastRelSemWorst bleibt dann korrekt NAN.
-  setTelemetry(outTelemetry, MeasurementStatus::Ok, taken, lastRelSemWorst);
+  //
+  // Ein nicht messbarer Kanal (unterhalb der Rauschgrenze) darf die
+  // berichtete Praezision nicht beschoenigen -- die Messung selbst bleibt
+  // gueltig (wird weiterhin zurueckgegeben/gespeichert, z.B. fuer eine
+  // schwarze oder stark absorbierende Probe), aber ohne eine Zahl, die
+  // faelschlich Praezision fuer einen gar nicht beurteilten Kanal
+  // unterstellt. Gleiche NAN-Konvention wie beim bereits bestehenden
+  // "komplett dunkle Probe"-Fall oben (stoppedShortNoSignal).
+  float reportedRelSemWorst = lastRelSemWorst;
+  if (lastAnyUnmeasurable) {
+    Serial.println("# Hinweis: mindestens ein Kanal blieb unterhalb der Rauschgrenze -- relSEM daher nicht ausgewiesen");
+    reportedRelSemWorst = NAN;
+  }
+  setTelemetry(outTelemetry, MeasurementStatus::Ok, taken, reportedRelSemWorst);
 
   // Schlichter Mittelwert ueber alle gesammelten Samples -- keine
   // Ausreisser-Trimmung mehr (siehe Kontext: die adaptive Stichprobenziehung

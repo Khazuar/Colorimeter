@@ -78,11 +78,17 @@ enum class MeasurementStatus : uint8_t { Ok, SensorError, NotConverged };
 // Standardfehler des Mittelwerts ueber alle Kanaele oberhalb der
 // Rauschgrenze (siehe AS7341Spectrometer.cpp converged()) -- ein oberer
 // Schrankwert, KEIN Wert je Kanal (der tatsaechliche relSEM einzelner
-// Kanaele kann darunter liegen). NAN, wenn kein relSEM berechnet wurde:
-// bei Precision::Single (dort wird gar nicht konvergiert), UND bei
-// Precision::Precise, falls kein Kanal ueber der Rauschgrenze lag (z.B.
-// eine sehr dunkle Probe/Dunkelmessung) -- bewusst NICHT 0.0, das waere eine
-// falsche Aussage ueber tatsaechlich erreichte Praezision.
+// Kanaele kann darunter liegen). NAN, wenn kein relSEM berechnet wurde: bei
+// Precision::Single (dort wird gar nicht konvergiert); bei Precision::Precise,
+// falls KEIN Kanal ueber der Rauschgrenze lag (z.B. eine sehr dunkle Probe/
+// Dunkelmessung); UND bei Precision::Precise, falls WAEHREND einer ansonsten
+// erfolgreichen Messung mindestens ein (aber nicht alle) Kanaele unterhalb
+// der Rauschgrenze blieben -- die Messung selbst (Measurement) ist in diesem
+// Fall trotzdem gueltig und nicht leer, nur die Praezisionsaussage entfaellt
+// bewusst fuer die GESAMTE Messung (nicht nur den betroffenen Kanal), statt
+// eine Zahl zu berichten, die Praezision fuer einen gar nicht beurteilten
+// Kanal unterstellt. Bewusst NICHT 0.0, das waere eine falsche Aussage ueber
+// tatsaechlich erreichte Praezision.
 struct MeasurementTelemetry {
   MeasurementStatus status = MeasurementStatus::Ok;
   uint8_t sampleCount = 0;
