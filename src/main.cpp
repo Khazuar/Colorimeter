@@ -17,6 +17,7 @@
 #include "ColorimetryTables.h"
 #include "UptimeLogger.h"
 #include "HistoryStore.h"
+#include "DigitEditor.h"
 
 // ------------------------- Display -------------------------
 Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
@@ -29,22 +30,23 @@ Spectrometer& spectrometer = sensorImpl;
 // ------------------------- Kalibrierung: Sache der Orchestrierung -------------------------
 CalibrationStore calStore;
 Measurement darkRef, whiteRef;
-FilterState darkRefFilterState  = FilterState::None;  // eingefroren MIT darkRef, siehe CalibrationStore
-FilterState whiteRefFilterState = FilterState::None;  // eingefroren MIT whiteRef
-bool calibrated = false;  // "Referenz passt zum AKTUELL gewaehlten Filter" -- siehe calibrationValidFor()
+AcquisitionSettings darkRefSettings;   // eingefroren MIT darkRef, siehe CalibrationStore
+AcquisitionSettings whiteRefSettings;  // eingefroren MIT whiteRef
+bool calibrated = false;  // "Referenz passt zu den AKTUELL gewaehlten Einstellungen" -- siehe calibrationValidFor()
 
-// Aktuell im Settings-Modus gewaehlter Filter (siehe DisplayMode::Settings).
-FilterState currentFilterState = FilterState::None;
+// Aktuell im Settings-Modus gewaehlte Einstellungen (siehe DisplayMode::Settings).
+AcquisitionSettings currentSettings;
 
 // Liefert true, wenn sowohl Dark- als auch White-Referenz vorhanden sind UND
-// beide unter GENAU dem angegebenen Filterzustand aufgenommen wurden. Zentrale
-// Stelle fuer die Regel "passt der Filter nicht, gilt die Referenz als nicht
-// vorhanden" -- wird fuer die Live-Anzeige (gegen lastMeasurementFilterState),
-// den globalen "ready/need cal"-Status (gegen currentFilterState) UND den
-// CSV-Export (gegen rec.filterState jeder Zeile) gleichermassen benutzt.
-bool calibrationValidFor(FilterState fs) {
+// beide unter GENAU dem angegebenen Einstellungs-Buendel (Filter+Gain+ATIME+
+// ASTEP) aufgenommen wurden. Zentrale Stelle fuer die Regel "weicht auch nur
+// eine Einstellung ab, gilt die Referenz als nicht vorhanden" -- wird fuer die
+// Live-Anzeige (gegen lastMeasurementSettings), den globalen "ready/need cal"-
+// Status (gegen currentSettings) UND den CSV-Export (gegen rec.settings jeder
+// Zeile) gleichermassen benutzt.
+bool calibrationValidFor(const AcquisitionSettings& s) {
   return !darkRef.empty() && !whiteRef.empty()
-      && darkRefFilterState == fs && whiteRefFilterState == fs;
+      && darkRefSettings == s && whiteRefSettings == s;
 }
 
 // ------------------------- Betriebszeit-Logging (dedizierte NVS-Partition) -------------------------
@@ -53,10 +55,11 @@ UptimeLogger uptimeLogger;
 // ------------------------- letzte Messung / Anzeige-Zustand -------------------------
 Measurement lastMeasurement;
 char lastLabel[16] = "";
-// Filter, der zum Zeitpunkt VON lastMeasurement tatsaechlich eingesetzt war --
-// eingefroren, NICHT der live im Settings-Modus editierbare currentFilterState
-// (siehe renderCurrentView() fuer die Begruendung dieser Asymmetrie).
-FilterState lastMeasurementFilterState = FilterState::None;
+// Einstellungen, die zum Zeitpunkt VON lastMeasurement tatsaechlich aktiv
+// waren -- eingefroren, NICHT die live im Settings-Modus editierbaren
+// currentSettings (siehe renderCurrentView() fuer die Begruendung dieser
+// Asymmetrie).
+AcquisitionSettings lastMeasurementSettings;
 bool busy = false;  // waehrend true: keine weitere Messung/kein weiterer Export ausloesbar
 
 DisplayMode currentDisplayMode = DisplayMode::Fast;
@@ -95,10 +98,15 @@ enum class ExportPage : uint8_t { Normal = 0, Debug = 1, Clear = 2, COUNT = 3 };
 ExportPage exportPage = ExportPage::Normal;
 
 // ------------------------- Settings-Modus -------------------------
-// Kurzer Mode-Druck waehlt, WELCHE Einstellung editiert wird (aktuell nur
-// eine); kurzer Trigger-Druck rotiert deren Wert. Klein gehalten, aber
-// erweiterbar: eine neue Einstellung ist nur ein weiterer SETTINGS-Eintrag,
-// keine Aenderung an der Render-/Tasten-Logik.
+// Kurzer Mode-Druck waehlt (ausserhalb einer Bearbeitung), WELCHE Einstellung
+// angezeigt wird. Jede Einstellung wird ueber denselben DigitEditor bedient
+// (siehe DigitEditor.h): langer Trigger-Druck startet die Bearbeitung, kurzer
+// Trigger-Druck erhoeht die aktuelle Ziffer, kurzer Mode-Druck verringert sie,
+// langer Trigger/Mode-Druck wechselt zur naechsten/vorigen Ziffer -- am
+// jeweiligen Ende (letzte Ziffer vorwaerts bzw. erste rueckwaerts) wird der
+// zusammengesetzte Wert uebernommen (siehe loop()). Enum-artige Einstellungen
+// (Filter, Gain) sind dabei "einstellige Zahlen": digitCount=1, die Ziffer
+// ist der Options-Index.
 const char* filterStateUiLabel(FilterState fs) {
   switch (fs) {
     case FilterState::Filter650nm: return "650nm";
@@ -114,27 +122,78 @@ const char* filterStateCsvLabel(FilterState fs) {
   }
 }
 
+// Reihenfolge == as7341_gain_t (siehe Adafruit_AS7341.h), verifiziert.
+static const char* const GAIN_LABELS[AS7341_GAIN_COUNT] = {
+  "0.5X", "1X", "2X", "4X", "8X", "16X", "32X", "64X", "128X", "256X", "512X"
+};
+const char* gainCsvLabel(as7341_gain_t g) {
+  uint8_t i = static_cast<uint8_t>(g);
+  return (i < AS7341_GAIN_COUNT) ? GAIN_LABELS[i] : "?";
+}
+
 struct SettingDescriptor {
   const char* name;
-  uint8_t valueCount;
-  const char* (*valueLabel)(uint8_t index);
-  uint8_t (*getValue)();
-  void (*setValue)(uint8_t index);
+  uint8_t digitCount;                             // 1 = enum-artig (Filter, Gain)
+  uint8_t digitCycleLen[DigitEditor::MAX_DIGITS];  // Zyklus-Laenge je Ziffernposition
+  uint32_t maxValue;                               // Clamp des Endwerts (siehe DigitEditor::assembledValue())
+  const char* (*valueLabel)(uint32_t value);       // nur bei digitCount==1, sonst nullptr (Ziffern direkt gerendert)
+  uint32_t (*getValue)();
+  void (*setValue)(uint32_t value);                // einmalig beim Abschluss der Bearbeitung aufgerufen
 };
 
-const char* filterSettingLabel(uint8_t i) { return filterStateUiLabel(static_cast<FilterState>(i)); }
-uint8_t getFilterSetting() { return static_cast<uint8_t>(currentFilterState); }
-void setFilterSetting(uint8_t i) {
-  currentFilterState = static_cast<FilterState>(i);
-  calStore.saveFilterState(currentFilterState);
-  calibrated = calibrationValidFor(currentFilterState);  // ein reiner Filterwechsel kann das sofort kippen
+// Gemeinsamer Abschluss fuer jede Einstellungsaenderung: persistieren +
+// calibrated neu bewerten (kann durch eine reine Einstellungsaenderung sofort
+// kippen, ganz ohne neue Messung).
+void commitCurrentSettings() {
+  calStore.saveSettings(currentSettings);
+  calibrated = calibrationValidFor(currentSettings);
+}
+
+const char* filterSettingLabel(uint32_t v) { return filterStateUiLabel(static_cast<FilterState>(v)); }
+uint32_t getFilterSetting() { return static_cast<uint32_t>(currentSettings.filterState); }
+void setFilterSetting(uint32_t v) {
+  currentSettings.filterState = static_cast<FilterState>(v);
+  commitCurrentSettings();
+}
+
+const char* gainSettingLabel(uint32_t v) { return (v < AS7341_GAIN_COUNT) ? GAIN_LABELS[v] : "?"; }
+uint32_t getGainSetting() { return static_cast<uint32_t>(currentSettings.gain); }
+void setGainSetting(uint32_t v) {
+  currentSettings.gain = static_cast<as7341_gain_t>(v);
+  sensorImpl.applySettings(currentSettings);
+  commitCurrentSettings();
+}
+
+uint32_t getATimeSetting() { return currentSettings.atime; }
+void setATimeSetting(uint32_t v) {
+  currentSettings.atime = static_cast<uint8_t>(v);
+  sensorImpl.applySettings(currentSettings);
+  commitCurrentSettings();
+}
+
+uint32_t getAStepSetting() { return currentSettings.astep; }
+void setAStepSetting(uint32_t v) {
+  currentSettings.astep = static_cast<uint16_t>(v);
+  sensorImpl.applySettings(currentSettings);
+  commitCurrentSettings();
 }
 
 const SettingDescriptor SETTINGS[] = {
-  { "Filter", static_cast<uint8_t>(FilterState::COUNT), filterSettingLabel, getFilterSetting, setFilterSetting },
+  { "Filter", 1, {3},           2,     filterSettingLabel, getFilterSetting, setFilterSetting },
+  { "Gain",   1, {AS7341_GAIN_COUNT}, AS7341_GAIN_COUNT - 1, gainSettingLabel, getGainSetting, setGainSetting },
+  // ATIME (uint8_t, max 255): 3 Dezimalstellen, fuehrende Ziffer 0-2.
+  { "ATIME",  3, {3, 10, 10},   255,   nullptr, getATimeSetting, setATimeSetting },
+  // ASTEP (uint16_t, max 65535): 5 Dezimalstellen, fuehrende Ziffer 0-6.
+  { "ASTEP",  5, {7, 10, 10, 10, 10}, 65535, nullptr, getAStepSetting, setAStepSetting },
 };
 const uint8_t SETTINGS_COUNT = sizeof(SETTINGS) / sizeof(SETTINGS[0]);
 uint8_t currentSettingIndex = 0;
+
+// Bearbeitungszustand: solange editingActive, hijacken Trigger/Mode ihre
+// sonstige Bedeutung (Messen/Moduswechsel) zugunsten der Ziffernbearbeitung
+// -- siehe loop().
+bool editingActive = false;
+DigitEditor editor;
 
 // ------------------------- Taster -------------------------
 DebouncedButton triggerBtn(TRIGGER_PIN, DEBOUNCE_MS, LONG_PRESS_MS);
@@ -175,16 +234,16 @@ const char* activeModeLabel() {
 // buildHistoryCsv() (voller Dump) und printCsvRow() (Live-Zeile), damit beide
 // garantiert dasselbe Format erzeugen.
 //
-// Kontext-Spalten (Temperatur/Laufzeit/Betriebszeit/Filter) fuer eine CSV-
-// Zeile -- siehe MeasurementRecord-Kommentar in HistoryStore.h. ctx==nullptr
+// Kontext-Spalten (Temperatur/Laufzeit/Betriebszeit/Einstellungen) fuer eine
+// CSV-Zeile -- siehe MeasurementRecord-Kommentar in HistoryStore.h. ctx==nullptr
 // fuer die "*_ref"-Zeilen weiter unten (die zeigen die AKTUELL geladene
 // Kalibrierung, nicht ein konkretes Messereignis -- fuer sie gibt es keinen
-// sinnvollen Zeitpunkt/Temperatur/Filter, die Spalten bleiben dort leer).
+// sinnvollen Zeitpunkt/Temperatur/Einstellungsstand, die Spalten bleiben dort leer).
 struct MeasurementContext {
   float tempC;
   uint32_t sessionMs;
   uint32_t uptimeS;
-  FilterState filterState;
+  AcquisitionSettings settings;
 };
 
 // "674/45nm" -- Center/FWHM, angelehnt an uebliche Bandpassfilter-Notation
@@ -215,9 +274,13 @@ void appendCsvRow(std::string& out, const char* label, const Measurement& measur
     snprintf(buf, sizeof(buf), ",%.1f", ctx->sessionMs / 1000.0f); out += buf;
     snprintf(buf, sizeof(buf), ",%lu", (unsigned long)ctx->uptimeS); out += buf;
     out += ',';
-    out += filterStateCsvLabel(ctx->filterState);
+    out += filterStateCsvLabel(ctx->settings.filterState);
+    out += ',';
+    out += gainCsvLabel(ctx->settings.gain);
+    snprintf(buf, sizeof(buf), ",%u", ctx->settings.atime); out += buf;
+    snprintf(buf, sizeof(buf), ",%u", ctx->settings.astep); out += buf;
   } else {
-    out += ",,,,";
+    out += ",,,,,,,";
   }
 
   if (computeSpectrum) {
@@ -262,8 +325,8 @@ struct BandCollectCtx {
 void collectBandsVisitor(const MeasurementRecord& rec, void* userData) {
   BandCollectCtx* c = reinterpret_cast<BandCollectCtx*>(userData);
   bool isRef = (rec.kind != SampleKind::Regular);
-  if (isRef || !calibrationValidFor(rec.filterState)) return;
-  Spectrum spec = spectrometer.getSpectrum(rec.measurement, whiteRef, darkRef, rec.filterState);
+  if (isRef || !calibrationValidFor(rec.settings)) return;
+  Spectrum spec = spectrometer.getSpectrum(rec.measurement, whiteRef, darkRef, rec.settings.filterState);
   for (const Band& b : spec.bands) {
     bool known = false;
     for (const Band& existing : *c->cols) {
@@ -287,9 +350,9 @@ struct CsvBuildCtx {
 void appendRecordToCsv(const MeasurementRecord& rec, void* userData) {
   CsvBuildCtx* ctx = reinterpret_cast<CsvBuildCtx*>(userData);
   bool isRef = (rec.kind != SampleKind::Regular);
-  bool computeSpectrum = !isRef && calibrationValidFor(rec.filterState);
-  MeasurementContext mctx{ rec.tempC, rec.sessionMs, rec.uptimeS, rec.filterState };
-  appendCsvRow(*ctx->out, rec.label, rec.measurement, rec.filterState, computeSpectrum,
+  bool computeSpectrum = !isRef && calibrationValidFor(rec.settings);
+  MeasurementContext mctx{ rec.tempC, rec.sessionMs, rec.uptimeS, rec.settings };
+  appendCsvRow(*ctx->out, rec.label, rec.measurement, rec.settings.filterState, computeSpectrum,
                ctx->includeRaw, *ctx->bandColumns, &mctx);
 }
 
@@ -314,7 +377,7 @@ std::string buildHistoryCsv(bool includeRaw) {
     return a.center_nm < b.center_nm;
   });
 
-  out += "label,temp_c,session_s,uptime_s,filter";
+  out += "label,temp_c,session_s,uptime_s,filter,gain,atime,astep";
   for (const Band& b : bandColumns) {
     out += ',';
     out += bandColumnName(b);
@@ -359,14 +422,14 @@ std::string buildHistoryCsv(bool includeRaw) {
 // Filter-Abhaengigkeit, kein Bug.
 void printCsvRow(const MeasurementRecord& rec) {
   bool isRef = (rec.kind != SampleKind::Regular);
-  bool computeSpectrum = !isRef && calibrationValidFor(rec.filterState);
+  bool computeSpectrum = !isRef && calibrationValidFor(rec.settings);
   std::vector<Band> bandColumns;
   if (computeSpectrum) {
-    bandColumns = spectrometer.getSpectrum(rec.measurement, whiteRef, darkRef, rec.filterState).bands;
+    bandColumns = spectrometer.getSpectrum(rec.measurement, whiteRef, darkRef, rec.settings.filterState).bands;
   }
   std::string row;
-  MeasurementContext ctx{ rec.tempC, rec.sessionMs, rec.uptimeS, rec.filterState };
-  appendCsvRow(row, rec.label, rec.measurement, rec.filterState, computeSpectrum,
+  MeasurementContext ctx{ rec.tempC, rec.sessionMs, rec.uptimeS, rec.settings };
+  appendCsvRow(row, rec.label, rec.measurement, rec.settings.filterState, computeSpectrum,
                /*includeRaw=*/true, bandColumns, &ctx);
   Serial.print(row.c_str());
 }
@@ -445,22 +508,20 @@ void renderReferenceStatus() {
   display.println(isWhite ? "Weiss-Referenz" : "Dunkel-Referenz");
 
   const Measurement& ref = isWhite ? whiteRef : darkRef;
-  FilterState refFilter = isWhite ? whiteRefFilterState : darkRefFilterState;
-  bool refValid = !ref.empty() && (refFilter == currentFilterState);
+  const AcquisitionSettings& refSettings = isWhite ? whiteRefSettings : darkRefSettings;
+  bool refValid = !ref.empty() && (refSettings == currentSettings);
 
   if (!refValid) {
     display.setCursor(0, 16);
     display.println("keine Messung");
     display.println("Trigger halten");
   } else {
-    char filterLine[24];
-    snprintf(filterLine, sizeof(filterLine), "Filter: %s", filterStateUiLabel(refFilter));
-    display.setCursor(0, 10);
-    display.println(filterLine);
-
+    // Bewusst OHNE Filter/Gain/ATIME/ASTEP-Zusammenfassung hier -- nahm zu viel
+    // Platz weg, bot fuer diesen Screen kaum Mehrwert (der Abgleich selbst
+    // passiert weiterhin unsichtbar ueber refValid oben).
     const char* const* labels = spectrometer.measurementLabels();
     char line[27];
-    int y = 24;
+    int y = 16;
     size_t i = 0;
     for (; i + 1 < ref.size(); i += 2) {
       snprintf(line, sizeof(line), "%-4.4s %5.0f %-4.4s %5.0f",
@@ -543,7 +604,9 @@ void renderExportClear() {
 
 // Statusbildschirm fuer den Settings-Modus: Name der aktuell per kurzem
 // Mode-Druck gewaehlten Einstellung (siehe SETTINGS-Registry weiter oben),
-// grosser Wertetext darunter.
+// grosser Wertetext darunter -- entweder im Browsing-Zustand (kein Cursor)
+// oder waehrend der Bearbeitung (aktive Ziffer/Option invertiert
+// dargestellt, siehe editingActive/editor).
 void renderSettingsStatus() {
   if (!displayOk) return;
   display.clearDisplay();
@@ -559,8 +622,47 @@ void renderSettingsStatus() {
   display.println(":");
 
   display.setTextSize(2);
-  display.setCursor(0, 34);
-  display.println(s.valueLabel(s.getValue()));
+
+  if (!editingActive) {
+    display.setCursor(0, 34);
+    if (s.valueLabel) {
+      display.println(s.valueLabel(s.getValue()));
+    } else {
+      char buf[8];
+      snprintf(buf, sizeof(buf), "%lu", (unsigned long)s.getValue());
+      display.println(buf);
+    }
+  } else if (s.digitCount == 1) {
+    // Enum-artig: die einzige "Ziffer" ist der ganze Optionswert -- als
+    // Ganzes invertiert darstellen (nur eine Position, immer aktiv).
+    const char* label = s.valueLabel(editor.digitAt(0));
+    int16_t x1, y1;
+    uint16_t w, h;
+    display.getTextBounds(label, 0, 34, &x1, &y1, &w, &h);
+    display.fillRect(0, 34, w + 4, h + 4, SSD1306_WHITE);
+    display.setTextColor(SSD1306_BLACK);
+    display.setCursor(2, 36);
+    display.println(label);
+    display.setTextColor(SSD1306_WHITE);
+  } else {
+    // Mehrstellig: jede Ziffer einzeln zeichnen, die am Cursor invertiert.
+    const int digitW = 14;
+    int x = 0;
+    for (uint8_t i = 0; i < editor.digitCount(); i++) {
+      char ch[2] = { (char)('0' + editor.digitAt(i)), '\0' };
+      if (i == editor.cursor()) {
+        display.fillRect(x, 34, digitW, 18, SSD1306_WHITE);
+        display.setTextColor(SSD1306_BLACK);
+        display.setCursor(x + 3, 36);
+        display.print(ch);
+        display.setTextColor(SSD1306_WHITE);
+      } else {
+        display.setCursor(x + 3, 36);
+        display.print(ch);
+      }
+      x += digitW;
+    }
+  }
 
   display.display();
 }
@@ -588,26 +690,26 @@ void renderCurrentView() {
     return;
   }
 
-  // Effektive Referenz gegen lastMeasurementFilterState (NICHT gegen
-  // currentFilterState!) -- ein Rohmesswert wurde physisch durch einen
-  // bestimmten Filter hindurch aufgenommen, ein spaeterer Wechsel der
-  // Settings-Einstellung macht ihn nicht nachtraeglich "durch einen anderen
-  // Filter gemessen". Solange aber noch GAR KEINE Messung vorliegt
-  // (lastMeasurement leer), gibt es nichts einzufrieren -- lastMeasurementFilterState
-  // stuende dann noch auf seinem Boot-Default (FilterState::None), was faelschlich
-  // als Mismatch gegen eine tatsaechlich gueltige Kalibrierung fuer einen ANDEREN
-  // Filter durchschlagen wuerde ("nicht kalibriert" direkt nach dem Start, obwohl
-  // eine passende Referenz gespeichert ist). In diesem Fall daher gegen
-  // currentFilterState pruefen (die eigentlich relevante Frage: "waere eine JETZT
-  // gestartete Messung gueltig kalibriert").
-  FilterState calCheckFilterState = lastMeasurement.empty() ? currentFilterState : lastMeasurementFilterState;
-  bool haveMatchingCal = calibrationValidFor(calCheckFilterState);
+  // Effektive Referenz gegen lastMeasurementSettings (NICHT gegen
+  // currentSettings!) -- ein Rohmesswert wurde physisch mit einem bestimmten
+  // Filter/Gain/ATIME/ASTEP aufgenommen, ein spaeterer Wechsel im Settings-
+  // Modus macht ihn nicht nachtraeglich "mit anderen Einstellungen gemessen".
+  // Solange aber noch GAR KEINE Messung vorliegt (lastMeasurement leer), gibt
+  // es nichts einzufrieren -- lastMeasurementSettings stuende dann noch auf
+  // seinen Boot-Defaults, was faelschlich als Mismatch gegen eine tatsaechlich
+  // gueltige Kalibrierung fuer ANDERE Einstellungen durchschlagen wuerde
+  // ("nicht kalibriert" direkt nach dem Start, obwohl eine passende Referenz
+  // gespeichert ist). In diesem Fall daher gegen currentSettings pruefen (die
+  // eigentlich relevante Frage: "waere eine JETZT gestartete Messung gueltig
+  // kalibriert").
+  const AcquisitionSettings& calCheckSettings = lastMeasurement.empty() ? currentSettings : lastMeasurementSettings;
+  bool haveMatchingCal = calibrationValidFor(calCheckSettings);
   static const Measurement emptyRef;
   const Measurement& effDark  = haveMatchingCal ? darkRef  : emptyRef;
   const Measurement& effWhite = haveMatchingCal ? whiteRef : emptyRef;
 
   ViewContext ctx{ spectrometer, lastMeasurement, effWhite, effDark, haveMatchingCal,
-                   displayModeLabel(currentDisplayMode), lastLabel, calCheckFilterState };
+                   displayModeLabel(currentDisplayMode), lastLabel, calCheckSettings.filterState };
   VIEW_RENDERERS[static_cast<uint8_t>(currentView)](display, ctx);
 }
 
@@ -708,7 +810,7 @@ void performMeasurement(Precision precision, SampleKind kind) {
     return;
   }
   lastMeasurement = measurement;
-  lastMeasurementFilterState = currentFilterState;
+  lastMeasurementSettings = currentSettings;
 
   // Vor der Beschriftung inkrementieren: die Sample-Nummer ist der neue,
   // lebenslange Zaehlerstand -- so laufen die Nummern ueber Reboots/Sessions
@@ -741,22 +843,22 @@ void performMeasurement(Precision precision, SampleKind kind) {
   rec.tempC = temperatureRead();
   rec.sessionMs = millis();
   rec.uptimeS = uptimeLogger.totalSeconds();
-  rec.filterState = currentFilterState;
+  rec.settings = currentSettings;
   if (!historyStore.append(rec)) {
     Serial.println("# history append failed (Flash voll?)");
   }
 
   if (kind == SampleKind::Dark) {
     darkRef = measurement;
-    darkRefFilterState = currentFilterState;  // Filter zum Aufnahmezeitpunkt einfrieren
-    calStore.saveDark(darkRef, darkRefFilterState);
+    darkRefSettings = currentSettings;  // Einstellungen zum Aufnahmezeitpunkt einfrieren
+    calStore.saveDark(darkRef, darkRefSettings);
   }
   if (kind == SampleKind::White) {
     whiteRef = measurement;
-    whiteRefFilterState = currentFilterState;
-    calStore.saveWhite(whiteRef, whiteRefFilterState);
+    whiteRefSettings = currentSettings;
+    calStore.saveWhite(whiteRef, whiteRefSettings);
   }
-  calibrated = calibrationValidFor(currentFilterState);
+  calibrated = calibrationValidFor(currentSettings);
 
   printCsvRow(rec);
 
@@ -842,6 +944,10 @@ void cycleMode() {
   DisplayMode previous = currentDisplayMode;
   uint8_t n = (static_cast<uint8_t>(currentDisplayMode) + 1) % static_cast<uint8_t>(DisplayMode::COUNT);
   currentDisplayMode = static_cast<DisplayMode>(n);
+  // Sicherheitsnetz: ein voller Moduswechsel sollte nie mitten in einer
+  // Settings-Bearbeitung passieren (loop() blockt cycleMode() waehrend
+  // editingActive bereits ab), aber ein sauberer Reset hier kostet nichts.
+  editingActive = false;
 
   if (previous == DisplayMode::Export && currentDisplayMode != DisplayMode::Export) {
     bleExporter.end();  // no-op, falls BLE in diesem Aufenthalt nie aktiviert wurde
@@ -915,10 +1021,10 @@ void setup() {
   modeBtn.begin();
 
   calStore.begin();
-  calStore.loadDark(darkRef, darkRefFilterState);
-  calStore.loadWhite(whiteRef, whiteRefFilterState);
-  calStore.loadFilterState(currentFilterState);
-  calibrated = calibrationValidFor(currentFilterState);
+  calStore.loadDark(darkRef, darkRefSettings);
+  calStore.loadWhite(whiteRef, whiteRefSettings);
+  calStore.loadSettings(currentSettings);
+  calibrated = calibrationValidFor(currentSettings);
 
   uptimeLogger.begin();
   historyStore.begin();  // nicht fatal bei Fehlschlag -- Kernfunktion laeuft ohne Historie weiter
@@ -941,6 +1047,7 @@ void setup() {
     Serial.println("# AS7341 not found");
     while (true) delay(1000);
   }
+  sensorImpl.applySettings(currentSettings);  // Hardware von Anfang an zum geladenen Zustand passend
 }
 
 void loop() {
@@ -982,12 +1089,37 @@ void loop() {
       performMeasurement(Precision::Precise, kind);  // Referenzmessungen immer Precise, wie bisher
     }
   } else if (currentDisplayMode == DisplayMode::Settings) {
-    // Kurzer Druck reicht -- eine Einstellung aendern ist jederzeit sichtbar
-    // und folgenlos korrigierbar, kein "versehentlich zerstoert"-Risiko wie
-    // bei Referenz-Ueberschreiben/Loeschen.
-    if (te == DebouncedButton::Event::Pressed) {
-      const SettingDescriptor& s = SETTINGS[currentSettingIndex];
-      s.setValue((s.getValue() + 1) % s.valueCount);
+    // Ausserhalb einer Bearbeitung startet nur ein LANGER Trigger-Druck die
+    // Bearbeitung der aktuell gewaehlten Einstellung (verhindert
+    // versehentliches Hineinrutschen) -- ein kurzer Druck tut dann nichts.
+    // Waehrend der Bearbeitung: kurz = aktuelle Ziffer +1, lang = naechste
+    // Ziffer (auf der letzten Ziffer: Bearbeitung abschliessen + speichern).
+    // Siehe DigitEditor.h / Kontext-Abschnitt im Plan fuer die volle
+    // Tasten-Zuordnung (Mode-Taste spiegelbildlich, siehe unten).
+    //
+    // WICHTIG: hier absichtlich ShortRelease statt Pressed fuer "+1" --
+    // Pressed feuert sofort beim Herunterdruecken, UNABHAENGIG davon, wie
+    // lange danach gehalten wird. Mit Pressed wuerde ein langer Druck also
+    // erst ein Pressed (faelschlich +1) UND anschliessend ein LongPress
+    // (naechste Ziffer) ausloesen -- genau der gemeldete Fehler. ShortRelease
+    // feuert dagegen nur beim Loslassen, und nur, wenn die Lang-Druck-
+    // Schwelle waehrend des Haltens NICHT ueberschritten wurde (siehe
+    // Buttons.h) -- exakt wie die Mode-Taste es bereits macht.
+    const SettingDescriptor& s = SETTINGS[currentSettingIndex];
+    if (!editingActive) {
+      if (te == DebouncedButton::Event::LongPress) {
+        editor.begin(s.digitCount, s.digitCycleLen, s.getValue());
+        editingActive = true;
+        renderCurrentView();
+      }
+    } else if (te == DebouncedButton::Event::ShortRelease) {
+      editor.incrementCurrentDigit();
+      renderCurrentView();
+    } else if (te == DebouncedButton::Event::LongPress) {
+      if (editor.advanceDigit()) {  // true = letzte Ziffer ueberschritten -> fertig
+        s.setValue(editor.assembledValue(s.maxValue));
+        editingActive = false;
+      }
       renderCurrentView();
     }
   } else if (currentDisplayMode != DisplayMode::Info) {
@@ -999,8 +1131,26 @@ void loop() {
     }
   }
 
+  // Waehrend einer Settings-Bearbeitung uebernimmt die Mode-Taste
+  // spiegelbildlich zur Trigger-Taste die Ziffern-Navigation (kurz = -1,
+  // lang = vorige Ziffer bzw. auf der ersten Ziffer: Bearbeitung
+  // abschliessen + speichern -- bewusst symmetrisch zum Trigger-Abschluss,
+  // kein separater Abbrechen-Pfad, siehe Plan) -- ihre sonstige Bedeutung
+  // (View/Modus wechseln) ist so lange blockiert.
   DebouncedButton::Event me = modeBtn.poll();
-  if (me == DebouncedButton::Event::ShortRelease) {
+  if (currentDisplayMode == DisplayMode::Settings && editingActive) {
+    const SettingDescriptor& s = SETTINGS[currentSettingIndex];
+    if (me == DebouncedButton::Event::ShortRelease) {
+      editor.decrementCurrentDigit();
+      renderCurrentView();
+    } else if (me == DebouncedButton::Event::LongPress) {
+      if (editor.retreatDigit()) {  // true = erste Ziffer unterschritten -> fertig
+        s.setValue(editor.assembledValue(s.maxValue));
+        editingActive = false;
+      }
+      renderCurrentView();
+    }
+  } else if (me == DebouncedButton::Event::ShortRelease) {
     cycleView();
   } else if (me == DebouncedButton::Event::LongPress) {
     cycleMode();

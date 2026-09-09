@@ -12,11 +12,13 @@ const char* const AS7341Spectrometer::MEASUREMENT_LABELS[AS7341Spectrometer::N_C
 };
 
 bool AS7341Spectrometer::begin() {
-  if (!as7341_.begin()) return false;
-  as7341_.setATIME(AS_ATIME);
-  as7341_.setASTEP(AS_ASTEP);
-  as7341_.setGain(AS_GAIN);
-  return true;
+  return as7341_.begin();
+}
+
+void AS7341Spectrometer::applySettings(const AcquisitionSettings& settings) {
+  as7341_.setATIME(settings.atime);
+  as7341_.setASTEP(settings.astep);
+  as7341_.setGain(settings.gain);
 }
 
 // Alle Konstanten hier sind ein bewusst einfacher Startpunkt, keine fertig

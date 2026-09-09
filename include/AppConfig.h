@@ -1,6 +1,7 @@
 #pragma once
 #include <Adafruit_AS7341.h>
 #include <cstdint>
+#include "Spectrometer.h"  // FilterState (Teil von AcquisitionSettings, siehe unten)
 
 // ------------------------- I2C / Bus -------------------------
 static const uint8_t  SDA_PIN = 6;
@@ -13,9 +14,10 @@ static const uint8_t OLED_HEIGHT = 64;
 static const uint8_t OLED_ADDR   = 0x3C;
 
 // ------------------------- AS7341 Timing -------------------------
-// EINGEFROREN: identisch fuer Dunkel, Weiss und alle Proben verwenden!
+// Nur noch Startwerte fuer den allerersten Boot (vorher fest verdrahtet) --
+// zur Laufzeit im Settings-Modus einstellbar, siehe AcquisitionSettings unten.
 static const uint8_t       AS_ATIME = 100;
-static const uint16_t      AS_ASTEP = 999;                 // ~281 ms Integration
+static const uint16_t      AS_ASTEP = 999;                 // ~281 ms Integration bei diesem Startwert
 static const as7341_gain_t AS_GAIN  = AS7341_GAIN_512X;    // Weiss bleibt unter Vollausschlag
 
 // ------------------------- Taster -------------------------
@@ -50,6 +52,26 @@ enum class DisplayMode : uint8_t { Fast = 0, Precise = 1, Calibration = 2, Expor
 // mitzubenutzen: welcher Bildschirm gerade aktiv ist und was ein Messwert
 // bedeutet sind zwei unabhaengige Fragen.
 enum class SampleKind : uint8_t { Regular = 0, Dark = 1, White = 2, COUNT = 3 };
+
+// Anzahl bekannter as7341_gain_t-Werte (0.5X..512X, siehe Adafruit_AS7341.h)
+// -- einzige Quelle fuer Bounds-Checks (HistoryStore::parseLine()) und die
+// Settings-Registry/Label-Tabelle (main.cpp).
+static const uint8_t AS7341_GAIN_COUNT = 11;
+
+// Buendel aller Sensor-/Aufnahme-Einstellungen, die eine Messung beeinflussen
+// -- als Ganzes verglichen (siehe main.cpp::calibrationValidFor()), pro
+// Messung mitgespeichert/exportiert und live im Settings-Modus editierbar.
+// AS_ATIME/AS_ASTEP/AS_GAIN dienen hier nur noch als Startwerte.
+struct AcquisitionSettings {
+  FilterState filterState = FilterState::None;
+  as7341_gain_t gain = AS_GAIN;
+  uint8_t atime = AS_ATIME;
+  uint16_t astep = AS_ASTEP;
+  bool operator==(const AcquisitionSettings& o) const {
+    return filterState == o.filterState && gain == o.gain && atime == o.atime && astep == o.astep;
+  }
+  bool operator!=(const AcquisitionSettings& o) const { return !(*this == o); }
+};
 
 // BLE-Export (Nordic UART Service) -- Geraetename ist app-weit relevant (main.cpp
 // startet/stoppt BleExporter damit); Chunk-Groesse/MTU/Delays bleiben rein interne

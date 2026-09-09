@@ -1,6 +1,7 @@
 #pragma once
 #include <Adafruit_AS7341.h>
 #include "Spectrometer.h"
+#include "AppConfig.h"
 
 class AS7341Spectrometer : public Spectrometer {
 public:
@@ -17,7 +18,14 @@ public:
 
   static const char* const MEASUREMENT_LABELS[N_CH];
 
-  bool begin();  // as7341_.begin() + setATIME/ASTEP/GAIN. Kein NVS-Zugriff.
+  bool begin();  // NUR as7341_.begin() (I2C-Inbetriebnahme). Kein NVS-Zugriff,
+                 // keine Annahme ueber Gain/ATIME/ASTEP -- siehe applySettings().
+
+  // Schreibt Gain/ATIME/ASTEP auf den Sensor -- beliebig oft wiederholbar,
+  // im Gegensatz zu begin() (das nur einmal beim Boot laeuft). Wird von der
+  // Orchestrierung (main.cpp) sowohl beim Start (geladene Einstellungen)
+  // als auch bei jeder Aenderung im Settings-Modus aufgerufen.
+  void applySettings(const AcquisitionSettings& settings);
 
   Measurement performMeasurement(Precision precision,
                                   ProgressCallback onProgress = nullptr,
