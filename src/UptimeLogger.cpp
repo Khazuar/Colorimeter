@@ -24,7 +24,7 @@ void UptimeLogger::loop() {
 }
 
 void UptimeLogger::recordMeasurement() {
-  // Kein Batching noetig: eine Messung dauert selbst im schnellsten Fall (Fast-Modus)
+  // Kein Batching noetig: eine Messung dauert selbst im schnellsten Fall (Single-Modus)
   // spuerbar laenger als eine Sekunde inkl. Anzeige/Entprellung, das begrenzt die
   // Schreibrate natuerlich auf weit unter 1/s -- selbst bei staendigem Dauerdruecken
   // waere das Zyklenlimit erst nach Tagen ununterbrochenen Spammens erreicht.

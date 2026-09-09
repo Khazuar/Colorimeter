@@ -1,6 +1,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <cmath>
 #include "AppConfig.h"
 #include "Spectrometer.h"
 
@@ -15,6 +16,14 @@ struct MeasurementRecord {
   uint32_t sessionMs = 0;     // millis() zum Messzeitpunkt (Laufzeit seit diesem Boot)
   uint32_t uptimeS = 0;       // UptimeLogger::totalSeconds() zum Messzeitpunkt (LED-Alter, lebenslang)
   AcquisitionSettings settings;  // Filter/Gain/ATIME/ASTEP zum Messzeitpunkt
+
+  // Messmodus + Praezisions-Telemetrie (siehe Spectrometer.h::MeasurementTelemetry).
+  // sampleCount ist bei Precision::Single immer 1. relSemWorst ist NAN, wenn
+  // kein relSEM berechnet wurde (Precision::Single, oder Precision::Precise
+  // ohne Kanal oberhalb der Rauschgrenze) -- bewusst NICHT 0.0.
+  Precision precision = Precision::Single;
+  uint8_t sampleCount = 1;
+  float relSemWorst = NAN;
 };
 
 // Persistiert die Messhistorie zeilenweise als CSV auf der (bisher

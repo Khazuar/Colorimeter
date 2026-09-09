@@ -4,12 +4,15 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <cmath>
 
 static const char* HISTORY_PATH = "/history.csv";
 
-// Zeilenformat: <label>,<kindNum>,<tempC>,<sessionMs>,<uptimeS>,<filterStateNum>,<gainNum>,<atime>,<astep>,<v0>,...,<vN-1>
-// Bounds-Check auf kindNum/filterStateNum/gainNum schuetzt vor einer durch
-// Stromausfall verstuemmelten Zeile, die zufaellig trotzdem mit '\n' endet.
+// Zeilenformat: <label>,<kindNum>,<tempC>,<sessionMs>,<uptimeS>,<filterStateNum>,<gainNum>,<atime>,<astep>,<precisionNum>,<sampleCount>,<relSemWorst|leer>,<v0>,...,<vN-1>
+// Bounds-Check auf kindNum/filterStateNum/gainNum/precisionNum schuetzt vor
+// einer durch Stromausfall verstuemmelten Zeile, die zufaellig trotzdem mit
+// '\n' endet. relSemWorst ist ein LEERES Feld (nicht "0"), wenn kein relSEM
+// berechnet wurde -- siehe MeasurementRecord-Kommentar in HistoryStore.h.
 static bool parseLine(const std::string& line, MeasurementRecord& rec) {
   size_t pos = 0;
   auto nextField = [&](std::string& out) -> bool {
@@ -54,6 +57,17 @@ static bool parseLine(const std::string& line, MeasurementRecord& rec) {
 
   if (!nextField(field)) return false;
   rec.settings.astep = static_cast<uint16_t>(strtoul(field.c_str(), nullptr, 10));
+
+  if (!nextField(field)) return false;
+  int precisionNum = atoi(field.c_str());
+  if (precisionNum < 0 || precisionNum >= static_cast<int>(Precision::COUNT)) return false;
+  rec.precision = static_cast<Precision>(precisionNum);
+
+  if (!nextField(field)) return false;
+  rec.sampleCount = static_cast<uint8_t>(strtoul(field.c_str(), nullptr, 10));
+
+  if (!nextField(field)) return false;
+  rec.relSemWorst = field.empty() ? NAN : strtof(field.c_str(), nullptr);
 
   rec.measurement.clear();
   while (nextField(field)) {
@@ -106,6 +120,12 @@ bool HistoryStore::append(const MeasurementRecord& rec) {
   f.print(rec.settings.atime);
   f.print(',');
   f.print(rec.settings.astep);
+  f.print(',');
+  f.print((int)rec.precision);
+  f.print(',');
+  f.print(rec.sampleCount);
+  f.print(',');
+  if (!isnan(rec.relSemWorst)) f.print(rec.relSemWorst, 5);  // leer lassen, wenn NAN -- siehe Header-Kommentar
   for (float v : rec.measurement) {
     f.print(',');
     f.print(v, 3);

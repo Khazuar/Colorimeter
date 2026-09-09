@@ -29,7 +29,7 @@ public:
 
   Measurement performMeasurement(Precision precision,
                                   ProgressCallback onProgress = nullptr,
-                                  MeasurementStatus* outStatus = nullptr) override;
+                                  MeasurementTelemetry* outTelemetry = nullptr) override;
   const char* const* measurementLabels() const override { return MEASUREMENT_LABELS; }
   Spectrum getSpectrum(const Measurement& measurement,
                         const Measurement& whiteReference,

@@ -24,7 +24,7 @@ void AS7341Spectrometer::applySettings(const AcquisitionSettings& settings) {
 // Alle Konstanten hier sind ein bewusst einfacher Startpunkt, keine fertig
 // getunte Loesung -- siehe Plan/Kontext: welche Stoppschwelle tatsaechlich
 // <1 DeltaE Messgenauigkeit liefert, muss noch empirisch getestet werden.
-static const uint8_t FAST_SAMPLES           = 1;
+static const uint8_t SINGLE_SAMPLES         = 1;
 // n=4 hatte ~41% relative Unsicherheit der SD-Schaetzung selbst
 // (1/sqrt(2*(n-1))) -- der allererste converged()-Check konnte dadurch rein
 // zufaellig zu frueh positiv ausfallen. n=8 (~27%) ist spuerbar robuster,
@@ -38,10 +38,14 @@ static const float   NOISE_FLOOR_COUNTS     = 50.0f;  // Kanaele darunter zaehle
 // Signal oberhalb NOISE_FLOOR_COUNTS (sonst dominiert das Rauschen sehr dunkler
 // Kanaele den relativen Fehler, ohne etwas ueber die Messqualitaet auszusagen).
 // anyChannelEvaluated meldet, ob ueberhaupt ein Kanal oberhalb der
-// Rauschgrenze lag -- der Rueckgabewert ist bedeutungslos, wenn nicht (worst
-// bleibt bei seinem Initialwert 0.0). performMeasurement() behandelt diesen
-// Fall (z.B. sehr dunkle Probe/Dunkelmessung) explizit separat, siehe dort.
-static bool converged(const uint16_t buf[][AS7341Spectrometer::N_CH], uint8_t taken, bool& anyChannelEvaluated) {
+// Rauschgrenze lag -- worstOut ist bedeutungslos, wenn nicht (bleibt bei
+// seinem Initialwert 0.0). performMeasurement() behandelt diesen Fall (z.B.
+// sehr dunkle Probe/Dunkelmessung) explizit separat, siehe dort. worstOut
+// wird zusaetzlich zum Rueckgabewert (dem Konvergenz-Ja/Nein) durchgereicht,
+// damit performMeasurement() den erreichten Wert als Telemetrie (relSemWorst)
+// mitgeben kann, statt ihn wie bisher nach der Ja/Nein-Entscheidung zu verwerfen.
+static bool converged(const uint16_t buf[][AS7341Spectrometer::N_CH], uint8_t taken,
+                       bool& anyChannelEvaluated, float& worstOut) {
   float worst = 0.0f;
   anyChannelEvaluated = false;
   for (uint8_t ch = 0; ch < AS7341Spectrometer::N_CH; ch++) {
@@ -57,13 +61,26 @@ static bool converged(const uint16_t buf[][AS7341Spectrometer::N_CH], uint8_t ta
     float relSEM = (stddev / mean) / sqrtf((float)taken);
     if (relSEM > worst) worst = relSEM;
   }
+  worstOut = worst;
   return worst <= PRECISE_TARGET_REL_SEM;
 }
 
+// Kleiner Helfer statt Aggregat-Initialisierung: MeasurementTelemetry hat
+// In-Class-Default-Initialisierer (fuer status/sampleCount/relSemWorst), was
+// den Typ unter dem hier verwendeten C++-Standard (vor C++14) zu keinem
+// Aggregat mehr macht -- "MeasurementTelemetry{a,b,c}" wuerde daher nicht
+// kompilieren (kein passender Konstruktor).
+static void setTelemetry(MeasurementTelemetry* out, MeasurementStatus status, uint8_t sampleCount, float relSemWorst) {
+  if (!out) return;
+  out->status = status;
+  out->sampleCount = sampleCount;
+  out->relSemWorst = relSemWorst;
+}
+
 Measurement AS7341Spectrometer::performMeasurement(Precision precision, ProgressCallback onProgress,
-                                                    MeasurementStatus* outStatus) {
-  uint8_t maxSamples = (precision == Precision::Fast) ? FAST_SAMPLES : PRECISE_MAX_SAMPLES;
-  uint8_t minSamples = (precision == Precision::Fast) ? FAST_SAMPLES : PRECISE_MIN_SAMPLES;
+                                                    MeasurementTelemetry* outTelemetry) {
+  uint8_t maxSamples = (precision == Precision::Single) ? SINGLE_SAMPLES : PRECISE_MAX_SAMPLES;
+  uint8_t minSamples = (precision == Precision::Single) ? SINGLE_SAMPLES : PRECISE_MIN_SAMPLES;
 
   // Loest die AS7341-Rohkanal-Reihenfolge auf. readAllChannels() macht intern
   // zwei Integrationszyklen mit unterschiedlicher SMUX-Konfiguration (siehe
@@ -79,6 +96,7 @@ Measurement AS7341Spectrometer::performMeasurement(Precision precision, Progress
   uint8_t taken = 0;
   uint8_t consecutiveConverged = 0;
   bool stoppedShortNoSignal = false;  // siehe "kein Kanal evaluiert"-Kurzschluss unten
+  float lastRelSemWorst = NAN;  // nur bei Precision::Precise UND mind. einem evaluierten Kanal gesetzt
 
   for (uint8_t n = 0; n < maxSamples; n++) {
     if (onProgress) onProgress(taken, maxSamples);
@@ -89,17 +107,20 @@ Measurement AS7341Spectrometer::performMeasurement(Precision precision, Progress
 
     if (precision == Precision::Precise && taken >= minSamples) {
       bool anyChannelEvaluated;
-      bool isConverged = converged(buf, taken, anyChannelEvaluated);
+      float relSemWorst;
+      bool isConverged = converged(buf, taken, anyChannelEvaluated, relSemWorst);
       if (!anyChannelEvaluated) {
         // Bewusste Kurzschluss-Entscheidung: kein Kanal hat Signal oberhalb
         // der Rauschgrenze (z.B. sehr dunkle Probe/Dunkelmessung) -- die
         // relative Praezisionsschwelle ist fuer Kanaele ohne Signal nicht
         // aussagekraeftig, mehr Samples aendern daran systematisch nichts.
         // Deshalb sofortiger Abbruch bei minSamples, ohne die sonst uebliche
-        // 2-von-2-Bestaetigung (siehe unten) abzuwarten.
+        // 2-von-2-Bestaetigung (siehe unten) abzuwarten. lastRelSemWorst
+        // bleibt bewusst NAN -- es wurde nie ein echter Wert berechnet.
         stoppedShortNoSignal = true;
         break;
       }
+      lastRelSemWorst = relSemWorst;
       if (isConverged) {
         // Zwei aufeinanderfolgende Treffer verlangt statt nur einem --
         // mildert "optional stopping"-Bias ab (ein einzelner zufaellig
@@ -118,7 +139,7 @@ Measurement AS7341Spectrometer::performMeasurement(Precision precision, Progress
 
   if (taken == 0) {
     // Sensor liefert ueberhaupt keine gueltigen Daten -- Hardware-Fehler.
-    if (outStatus) *outStatus = MeasurementStatus::SensorError;
+    setTelemetry(outTelemetry, MeasurementStatus::SensorError, 0, NAN);
     return Measurement();
   }
 
@@ -130,11 +151,15 @@ Measurement AS7341Spectrometer::performMeasurement(Precision precision, Progress
     // aufeinanderfolgende converged()-Treffer) bestaetigt wurde -- z.B. eine
     // andauernde Stoerung waehrend der Messung (Geraet wird bewegt). Explizit
     // vom Sensorfehler-Fall oben unterscheidbar, siehe MeasurementStatus.
-    if (outStatus) *outStatus = MeasurementStatus::NotConverged;
+    // sampleCount/relSemWorst werden trotzdem mitgegeben (Diagnosewert), auch
+    // wenn das Measurement selbst verworfen wird.
+    setTelemetry(outTelemetry, MeasurementStatus::NotConverged, taken, lastRelSemWorst);
     return Measurement();
   }
 
-  if (outStatus) *outStatus = MeasurementStatus::Ok;
+  // Precision::Single berechnet nie ein relSEM (der obige Konvergenz-Zweig
+  // laeuft dort gar nicht) -- lastRelSemWorst bleibt dann korrekt NAN.
+  setTelemetry(outTelemetry, MeasurementStatus::Ok, taken, lastRelSemWorst);
 
   // Schlichter Mittelwert ueber alle gesammelten Samples -- keine
   // Ausreisser-Trimmung mehr (siehe Kontext: die adaptive Stichprobenziehung
