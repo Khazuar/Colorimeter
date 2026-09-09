@@ -62,8 +62,45 @@ char lastLabel[16] = "";
 AcquisitionSettings lastMeasurementSettings;
 bool busy = false;  // waehrend true: keine weitere Messung/kein weiterer Export ausloesbar
 
-DisplayMode currentDisplayMode = DisplayMode::Fast;
+DisplayMode currentDisplayMode = DisplayMode::Measure;
 DisplayView currentView = DisplayView::ColorInfo;
+
+// Innerhalb des Measure-DisplayMode: Auswahl-Seite (Messmodus per kurzem
+// Mode-Druck waehlen, Trigger loest aus) vs. Ergebnis-Seite (wie bisher).
+// Siehe AppConfig.h::DisplayMode-Kommentar und MEASUREMENT_MODES unten.
+enum class MeasurePage : uint8_t { Select = 0, Result = 1 };
+MeasurePage measurePage = MeasurePage::Select;
+
+// Vorwaertsdeklaration: der eigentliche gemeinsame Messeinstiegspunkt ist erst
+// weiter unten definiert (Details zu Sensor-/Anzeige-Ablauf gehoeren dorthin),
+// wird aber schon hier von den MEASUREMENT_MODES-Trigger-Funktionen benoetigt.
+bool performMeasurement(Precision precision, SampleKind kind);
+
+// Ein Eintrag in der Measure-Auswahlliste. trigger() fuehrt die eigentliche
+// Messung aus und liefert true bei Erfolg (lastMeasurement aktualisiert) --
+// die Rueckgabe steuert in loop(), ob auf die Ergebnis-Seite gewechselt wird
+// oder man (nach einem Sensorfehler/einer Nicht-Konvergenz, siehe
+// renderMeasurementError()) auf der Auswahl-Seite fuer einen sofortigen
+// erneuten Versuch bleibt.
+struct MeasurementModeDescriptor {
+  const char* name;         // "Precise", "Single" -- Menue-Anzeige auf der Auswahl-Seite
+  const char* cornerLabel;  // "P", "S" -- Ecken-Anzeige im Ergebnis-Screen/waehrend der Messung
+  bool (*trigger)();
+};
+
+bool triggerPreciseMeasurement() { return performMeasurement(Precision::Precise, SampleKind::Regular); }
+bool triggerSingleMeasurement()  { return performMeasurement(Precision::Single,  SampleKind::Regular); }
+
+// Precise zuerst: meistgenutzter Modus, damit nach jedem frischen Eintritt in
+// Measure vorausgewaehlt (siehe cycleMode()). Ein kuenftiger weiterer
+// Messmodus (Serie, Rotation, ...) ist nur ein weiterer Eintrag hier -- die
+// Auswahl-/Ergebnis-Navigation selbst muss dafuer nicht angefasst werden.
+const MeasurementModeDescriptor MEASUREMENT_MODES[] = {
+  { "Precise", "P", triggerPreciseMeasurement },
+  { "Single",  "S", triggerSingleMeasurement },
+};
+const uint8_t MEASUREMENT_MODE_COUNT = sizeof(MEASUREMENT_MODES) / sizeof(MEASUREMENT_MODES[0]);
+uint8_t measurementModeIndex = 0;
 
 // Innerhalb des Calibration-DisplayMode per kurzem Mode-Druck gewaehlte
 // Referenz -- langer Trigger-Druck misst dann genau diese. Bewusst ein
@@ -129,6 +166,12 @@ static const char* const GAIN_LABELS[AS7341_GAIN_COUNT] = {
 const char* gainCsvLabel(as7341_gain_t g) {
   uint8_t i = static_cast<uint8_t>(g);
   return (i < AS7341_GAIN_COUNT) ? GAIN_LABELS[i] : "?";
+}
+
+// "single"/"precision" -- wortwoertlich wie vom Nutzer benannt, statt der
+// internen Enum-Namen Single/Precise.
+const char* precisionCsvLabel(Precision p) {
+  return (p == Precision::Precise) ? "precision" : "single";
 }
 
 struct SettingDescriptor {
@@ -207,12 +250,11 @@ uint32_t lastInfoRenderMs = 0;
 
 const char* displayModeLabel(DisplayMode m) {
   switch (m) {
-    case DisplayMode::Precise:     return "P";
     case DisplayMode::Calibration: return "K";  // in der Praxis nie direkt angezeigt, siehe activeModeLabel()
     case DisplayMode::Export:      return "E";
     case DisplayMode::Settings:    return "C";
     case DisplayMode::Info:        return "I";
-    default:                       return "S";  // Fast
+    default:                       return "M";  // Measure -- in der Praxis nie direkt angezeigt, siehe activeModeLabel()
   }
 }
 const char* calibrationTargetLabel(CalibrationTarget t) {
@@ -221,13 +263,14 @@ const char* calibrationTargetLabel(CalibrationTarget t) {
 
 // Liefert das fuer die aktuelle Anzeige (z.B. "MESSUNG"-Screen) passende
 // Modus-Kuerzel -- im Calibration-Modus das der aktuell gewaehlten Referenz
-// (White/Dark), sonst das des DisplayMode selbst. Noetig, weil
+// (White/Dark), im Measure-Modus das des aktuell gewaehlten Messmodus
+// (siehe MEASUREMENT_MODES), sonst das des DisplayMode selbst. Noetig, weil
 // showMeasuringScreen() als ProgressCallback eine feste Signatur hat und
 // daher nicht direkt wissen kann, welche Referenz calibrationTarget gerade meint.
 const char* activeModeLabel() {
-  return (currentDisplayMode == DisplayMode::Calibration)
-      ? calibrationTargetLabel(calibrationTarget)
-      : displayModeLabel(currentDisplayMode);
+  if (currentDisplayMode == DisplayMode::Calibration) return calibrationTargetLabel(calibrationTarget);
+  if (currentDisplayMode == DisplayMode::Measure) return MEASUREMENT_MODES[measurementModeIndex].cornerLabel;
+  return displayModeLabel(currentDisplayMode);
 }
 
 // Haengt eine einzelne CSV-Zeile an 'out' an. Gemeinsam genutzt von
@@ -244,6 +287,11 @@ struct MeasurementContext {
   uint32_t sessionMs;
   uint32_t uptimeS;
   AcquisitionSettings settings;
+  // Messmodus + Praezisions-Telemetrie -- siehe MeasurementRecord-Kommentar
+  // in HistoryStore.h. relSemWorst NAN = leer (kein relSEM berechnet), NICHT "0".
+  Precision precision;
+  uint8_t sampleCount;
+  float relSemWorst;
 };
 
 // "674/45nm" -- Center/FWHM, angelehnt an uebliche Bandpassfilter-Notation
@@ -279,8 +327,13 @@ void appendCsvRow(std::string& out, const char* label, const Measurement& measur
     out += gainCsvLabel(ctx->settings.gain);
     snprintf(buf, sizeof(buf), ",%u", ctx->settings.atime); out += buf;
     snprintf(buf, sizeof(buf), ",%u", ctx->settings.astep); out += buf;
+    out += ',';
+    out += precisionCsvLabel(ctx->precision);
+    snprintf(buf, sizeof(buf), ",%u", ctx->sampleCount); out += buf;
+    out += ',';
+    if (!isnan(ctx->relSemWorst)) { snprintf(buf, sizeof(buf), "%.5f", ctx->relSemWorst); out += buf; }
   } else {
-    out += ",,,,,,,";
+    out += ",,,,,,,,,,";
   }
 
   if (computeSpectrum) {
@@ -351,7 +404,8 @@ void appendRecordToCsv(const MeasurementRecord& rec, void* userData) {
   CsvBuildCtx* ctx = reinterpret_cast<CsvBuildCtx*>(userData);
   bool isRef = (rec.kind != SampleKind::Regular);
   bool computeSpectrum = !isRef && calibrationValidFor(rec.settings);
-  MeasurementContext mctx{ rec.tempC, rec.sessionMs, rec.uptimeS, rec.settings };
+  MeasurementContext mctx{ rec.tempC, rec.sessionMs, rec.uptimeS, rec.settings,
+                           rec.precision, rec.sampleCount, rec.relSemWorst };
   appendCsvRow(*ctx->out, rec.label, rec.measurement, rec.settings.filterState, computeSpectrum,
                ctx->includeRaw, *ctx->bandColumns, &mctx);
 }
@@ -377,7 +431,7 @@ std::string buildHistoryCsv(bool includeRaw) {
     return a.center_nm < b.center_nm;
   });
 
-  out += "label,temp_c,session_s,uptime_s,filter,gain,atime,astep";
+  out += "label,temp_c,session_s,uptime_s,filter,gain,atime,astep,measurement_mode,sample_count,rel_sem_worst";
   for (const Band& b : bandColumns) {
     out += ',';
     out += bandColumnName(b);
@@ -428,7 +482,8 @@ void printCsvRow(const MeasurementRecord& rec) {
     bandColumns = spectrometer.getSpectrum(rec.measurement, whiteRef, darkRef, rec.settings.filterState).bands;
   }
   std::string row;
-  MeasurementContext ctx{ rec.tempC, rec.sessionMs, rec.uptimeS, rec.settings };
+  MeasurementContext ctx{ rec.tempC, rec.sessionMs, rec.uptimeS, rec.settings,
+                          rec.precision, rec.sampleCount, rec.relSemWorst };
   appendCsvRow(row, rec.label, rec.measurement, rec.settings.filterState, computeSpectrum,
                /*includeRaw=*/true, bandColumns, &ctx);
   Serial.print(row.c_str());
@@ -667,8 +722,33 @@ void renderSettingsStatus() {
   display.display();
 }
 
+// Auswahl-Seite des Measure-DisplayMode: Liste aller MEASUREMENT_MODES mit
+// einem ">"-Cursor auf measurementModeIndex (per kurzem Mode-Druck bewegt,
+// siehe cycleView()). Ein Trigger-Druck loest den markierten Modus aus
+// (siehe loop()).
+void renderMeasureSelect() {
+  if (!displayOk) return;
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("Messmodus");
+  int y = 16;
+  for (uint8_t i = 0; i < MEASUREMENT_MODE_COUNT; i++) {
+    display.setCursor(0, y);
+    display.print(i == measurementModeIndex ? "> " : "  ");
+    display.println(MEASUREMENT_MODES[i].name);
+    y += 10;
+  }
+  display.display();
+}
+
 void renderCurrentView() {
   if (!displayOk) return;
+  if (currentDisplayMode == DisplayMode::Measure && measurePage == MeasurePage::Select) {
+    renderMeasureSelect();
+    return;
+  }
   if (currentDisplayMode == DisplayMode::Export) {
     if (exportPage == ExportPage::Clear) {
       renderExportClear();
@@ -708,8 +788,11 @@ void renderCurrentView() {
   const Measurement& effDark  = haveMatchingCal ? darkRef  : emptyRef;
   const Measurement& effWhite = haveMatchingCal ? whiteRef : emptyRef;
 
+  // Nur noch fuer Measure/Result erreicht (siehe Sonderfaelle oben) --
+  // das Ecken-Kuerzel ist daher immer das des aktuell gewaehlten Messmodus,
+  // nicht das generische DisplayMode-Kuerzel.
   ViewContext ctx{ spectrometer, lastMeasurement, effWhite, effDark, haveMatchingCal,
-                   displayModeLabel(currentDisplayMode), lastLabel, calCheckSettings.filterState };
+                   MEASUREMENT_MODES[measurementModeIndex].cornerLabel, lastLabel, calCheckSettings.filterState };
   VIEW_RENDERERS[static_cast<uint8_t>(currentView)](display, ctx);
 }
 
@@ -762,7 +845,7 @@ void flashBorder() {
 // Aktion (erneuter Trigger-/Mode-Druck) einen regulaeren Re-Render ausloest,
 // gleiches Muster wie z.B. das "gesendet"/"Kein Handy verbunden"-Feedback im
 // Export-Modus. Gilt fuer alle performMeasurement()-Aufrufer gleichermassen
-// (Fast/Precise/Calibration) -- die Ursache ist unabhaengig davon relevant.
+// (Measure/Calibration) -- die Ursache ist unabhaengig davon relevant.
 void renderMeasurementError(MeasurementStatus status) {
   if (!displayOk) return;
   display.clearDisplay();
@@ -789,25 +872,36 @@ void renderMeasurementError(MeasurementStatus status) {
 // Gemeinsamer Einstiegspunkt fuer den Trigger-Taster in allen Mess-Modi.
 // precision/kind werden vom Aufrufer (loop()) bestimmt, nicht hier -- diese
 // Funktion kennt keinen DisplayMode mehr, nur noch "wie genau messen" und
-// "was fuer ein Messwert ist das".
-void performMeasurement(Precision precision, SampleKind kind) {
-  if (busy) return;  // keine zweite Messung waehrend eine laeuft
+// "was fuer ein Messwert ist das". Rueckgabe: true bei Erfolg (lastMeasurement
+// aktualisiert) -- fuer den Measure-Modus relevant, siehe MEASUREMENT_MODES/
+// loop() (Calibration ignoriert die Rueckgabe weiterhin einfach).
+bool performMeasurement(Precision precision, SampleKind kind) {
+  if (busy) return false;  // keine zweite Messung waehrend eine laeuft
   busy = true;
 
   flashBorder();  // nur hier, also nur wenn tatsaechlich gestartet wird
   showMeasuringScreen(0, 1);
 
-  MeasurementStatus status = MeasurementStatus::Ok;
-  Measurement measurement = spectrometer.performMeasurement(precision, showMeasuringScreen, &status);
+  MeasurementTelemetry telemetry;
+  Measurement measurement = spectrometer.performMeasurement(precision, showMeasuringScreen, &telemetry);
   if (measurement.empty()) {
-    if (status == MeasurementStatus::NotConverged) {
-      Serial.println("# Messung nicht konvergiert -- Geraet ruhig halten und erneut versuchen");
+    if (telemetry.status == MeasurementStatus::NotConverged) {
+      // relSemWorst ist hier haeufig kein NAN (im Gegensatz zum Erfolgsfall
+      // bei sehr dunklen Proben) -- der letzte erreichte Wert vor Aufgabe des
+      // Sample-Budgets ist ein nuetzlicher Diagnosewert beim Justieren von
+      // PRECISE_TARGET_REL_SEM/PRECISE_MAX_SAMPLES.
+      if (!isnan(telemetry.relSemWorst)) {
+        Serial.printf("# Messung nicht konvergiert (%u Samples, letztes relSEM %.2f%%) -- Geraet ruhig halten und erneut versuchen\n",
+                      telemetry.sampleCount, telemetry.relSemWorst * 100.0f);
+      } else {
+        Serial.println("# Messung nicht konvergiert -- Geraet ruhig halten und erneut versuchen");
+      }
     } else {
       Serial.println("# Sensorfehler bei der Messung");
     }
     busy = false;
-    renderMeasurementError(status);
-    return;
+    renderMeasurementError(telemetry.status);
+    return false;
   }
   lastMeasurement = measurement;
   lastMeasurementSettings = currentSettings;
@@ -844,6 +938,9 @@ void performMeasurement(Precision precision, SampleKind kind) {
   rec.sessionMs = millis();
   rec.uptimeS = uptimeLogger.totalSeconds();
   rec.settings = currentSettings;
+  rec.precision = precision;
+  rec.sampleCount = telemetry.sampleCount;
+  rec.relSemWorst = telemetry.relSemWorst;
   if (!historyStore.append(rec)) {
     Serial.println("# history append failed (Flash voll?)");
   }
@@ -864,6 +961,7 @@ void performMeasurement(Precision precision, SampleKind kind) {
 
   busy = false;
   renderCurrentView();
+  return true;
 }
 
 // Sendet die komplette Messhistorie als CSV per BLE-Notify (Nordic UART
@@ -915,10 +1013,16 @@ void performExport() {
   renderExportStatus();
 }
 
-// Kurzer Mode-Druck: in Fast/Precise/Export-Modus View bzw. Export-Seite
+// Kurzer Mode-Druck: auf der Measure-Auswahl-Seite den Cursor bewegen, auf
+// der Measure-Ergebnis-Seite bzw. im Export-Modus die View/Export-Seite
 // wechseln, in Settings die zu editierende Einstellung wechseln, in
 // Calibration zwischen Weiss-/Dunkelreferenz wechseln.
 void cycleView() {
+  if (currentDisplayMode == DisplayMode::Measure && measurePage == MeasurePage::Select) {
+    measurementModeIndex = (measurementModeIndex + 1) % MEASUREMENT_MODE_COUNT;
+    renderCurrentView();
+    return;
+  }
   if (currentDisplayMode == DisplayMode::Export) {
     uint8_t n = (static_cast<uint8_t>(exportPage) + 1) % static_cast<uint8_t>(ExportPage::COUNT);
     exportPage = static_cast<ExportPage>(n);
@@ -941,6 +1045,17 @@ void cycleView() {
 }
 
 void cycleMode() {
+  // Innerhalb Measure fuehrt ein langer Mode-Druck auf der Ergebnis-Seite
+  // zurueck zur Auswahl-Seite, OHNE den Top-Level-DisplayMode zu wechseln --
+  // man "verlaesst" mit einer Messung nur kurzzeitig die Hauptnavigation.
+  if (currentDisplayMode == DisplayMode::Measure && measurePage == MeasurePage::Result) {
+    measurePage = MeasurePage::Select;
+    lastMeasurement.clear();
+    lastLabel[0] = '\0';
+    renderCurrentView();
+    return;
+  }
+
   DisplayMode previous = currentDisplayMode;
   uint8_t n = (static_cast<uint8_t>(currentDisplayMode) + 1) % static_cast<uint8_t>(DisplayMode::COUNT);
   currentDisplayMode = static_cast<DisplayMode>(n);
@@ -969,6 +1084,13 @@ void cycleMode() {
   if (currentDisplayMode == DisplayMode::Calibration && previous != DisplayMode::Calibration) {
     // Gleiche Ueberlegung -- nicht unbemerkt auf "Dark" landen.
     calibrationTarget = CalibrationTarget::White;
+  }
+  if (currentDisplayMode == DisplayMode::Measure && previous != DisplayMode::Measure) {
+    // Gleiche Ueberlegung: frisch in Measure immer auf der Auswahl-Seite
+    // starten, mit Precise (meistgenutzt) vorausgewaehlt -- unabhaengig davon,
+    // was beim letzten Aufenthalt gewaehlt war.
+    measurePage = MeasurePage::Select;
+    measurementModeIndex = 0;
   }
 
   // Die zuletzt gezeigte Messung gehoert zum vorherigen Modus -- nach einem
@@ -1029,15 +1151,7 @@ void setup() {
   uptimeLogger.begin();
   historyStore.begin();  // nicht fatal bei Fehlschlag -- Kernfunktion laeuft ohne Historie weiter
 
-  if (displayOk) {
-    // Ersetzt den "startet ..."-Text von oben, sobald Kalibrierstatus etc.
-    // tatsaechlich bekannt sind.
-    display.clearDisplay();
-    display.setCursor(0, 0);
-    display.println("Colorimeter");
-    display.println(calibrated ? "ready" : "need cal: d/w");
-    display.display();
-  } else {
+  if (!displayOk) {
     // Reine Boot-Diagnose auf einem Fehlerpfad -- vermischt sich nie mit dem
     // eigentlichen CSV-Export (der erst spaeter/live in loop() beginnt).
     Serial.println("# SSD1306 nicht gefunden/initialisiert (Adresse 0x3C) - Display bleibt inaktiv");
@@ -1048,6 +1162,12 @@ void setup() {
     while (true) delay(1000);
   }
   sensorImpl.applySettings(currentSettings);  // Hardware von Anfang an zum geladenen Zustand passend
+
+  // Ersetzt den "startet ..."-Text von oben, sobald alles initialisiert ist --
+  // currentDisplayMode/measurePage stehen bereits auf ihren Defaults
+  // (Measure/Select), das zeigt also direkt die Messmodus-Auswahl statt eines
+  // separaten "ready"-Zwischenbildschirms.
+  renderCurrentView();
 }
 
 void loop() {
@@ -1069,9 +1189,10 @@ void loop() {
   // White/Dark (ueberschreibt die Kalibrierreferenz) und die Export-
   // Clear-Seite (loescht die Historie) verlangen einen LANGEN statt kurzen
   // Trigger-Druck -- gleiche "haltbewusst statt versehentlich"-Absicherung
-  // wie der bestehende lange Mode-Druck fuer den Moduswechsel. Fast/Precise
-  // und das Ausloesen des BLE-Sendens bleiben bei sofortigem, kurzem Druck,
-  // da sie haeufig und unkritisch sind.
+  // wie der bestehende lange Mode-Druck fuer den Moduswechsel. Das Ausloesen
+  // einer Messung auf der Measure-Auswahl-Seite und das Ausloesen des
+  // BLE-Sendens bleiben bei sofortigem, kurzem Druck, da sie haeufig und
+  // unkritisch sind.
   DebouncedButton::Event te = triggerBtn.poll();
   if (currentDisplayMode == DisplayMode::Export) {
     if (exportPage == ExportPage::Clear) {
@@ -1122,14 +1243,26 @@ void loop() {
       }
       renderCurrentView();
     }
-  } else if (currentDisplayMode != DisplayMode::Info) {
-    // Fast oder Precise. Info ist ein reiner Statusbildschirm -- Trigger
-    // loest dort bewusst keine (sinnlose) Messung aus.
+  } else if (currentDisplayMode == DisplayMode::Measure && measurePage == MeasurePage::Select) {
     if (te == DebouncedButton::Event::Pressed) {
-      Precision prec = (currentDisplayMode == DisplayMode::Fast) ? Precision::Fast : Precision::Precise;
-      performMeasurement(prec, SampleKind::Regular);
+      // Optimistisch VOR der Messung auf Result setzen: performMeasurement()
+      // ruft bei Erfolg selbst renderCurrentView() auf -- so zeigt dieser
+      // interne Aufruf schon den richtigen Ergebnis-Screen, statt kurz die
+      // alte Auswahl-Seite aufblitzen zu lassen. Bei Fehlschlag (Sensorfehler/
+      // Nicht-Konvergenz) hat performMeasurement() bereits
+      // renderMeasurementError() gezeigt -- dann zurueck auf Select, fuer
+      // einen sofortigen erneuten Versuch ohne Umweg ueber einen langen
+      // Mode-Druck.
+      measurePage = MeasurePage::Result;
+      if (!MEASUREMENT_MODES[measurementModeIndex].trigger()) {
+        measurePage = MeasurePage::Select;
+      }
     }
+    // measurePage == Result: Trigger tut hier nichts (kurz/lang belegt schon
+    // die Mode-Taste, siehe cycleView()/cycleMode()).
   }
+  // Measure/Result und Info: Trigger loest hier bewusst nichts aus -- Info ist
+  // ein reiner Statusbildschirm, Measure/Result belegt Mode-Taste bereits.
 
   // Waehrend einer Settings-Bearbeitung uebernimmt die Mode-Taste
   // spiegelbildlich zur Trigger-Taste die Ziffern-Navigation (kurz = -1,

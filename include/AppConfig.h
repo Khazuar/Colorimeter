@@ -27,12 +27,22 @@ static const uint32_t DEBOUNCE_MS   = 40;
 static const uint32_t LONG_PRESS_MS = 600;
 
 // Welcher Top-Level-Bildschirm gerade aktiv ist (per Mode-Taste lang
-// durchgeschaltet: Fast -> Precise -> Calibration -> Export -> Settings -> Info -> Fast ...).
+// durchgeschaltet: Measure -> Calibration -> Export -> Settings -> Info -> Measure ...).
 // Reines UI-/Orchestrierungs-Konzept -- hat NICHTS mit der Sensor-Messqualitaet
 // zu tun (das ist Spectrometer::Precision) und NICHTS mit der Art eines
-// gespeicherten Messwerts (das ist SampleKind, siehe unten). Fast/Precise
-// zeigen dieselbe Live-Ansicht (siehe DisplayViews.h), messen aber mit
-// unterschiedlicher Precision (siehe main.cpp, Trigger-Dispatch in loop()).
+// gespeicherten Messwerts (das ist SampleKind, siehe unten).
+//
+// Measure fasst ALLE physischen Messmodi (aktuell: Precise, Single) in einem
+// Top-Level-Eintrag zusammen, um die Hauptnavigation nicht mit jedem neuen,
+// selten genutzten Messmodus weiter wachsen zu lassen. Measure hat dafuer eine
+// eigene, zweistufige Sub-Navigation (main.cpp::MeasurePage): eine
+// Auswahl-Seite (Cursor per kurzem Mode-Druck ueber main.cpp::MEASUREMENT_MODES
+// bewegt, Trigger loest die gewaehlte Messung aus) und eine Ergebnis-Seite
+// (identisch zur bisherigen Fast/Precise-Ansicht, siehe DisplayViews.h; kurzer
+// Mode-Druck wechselt dort wie bisher die Ergebnis-Ansicht, langer Mode-Druck
+// kehrt zur Auswahl-Seite zurueck OHNE den Top-Level-DisplayMode zu wechseln --
+// siehe main.cpp::cycleMode()).
+//
 // Calibration fasst Weiss- und Dunkelreferenz in einem Bildschirm zusammen
 // (kurzer Mode-Druck wechselt in main.cpp zwischen main.cpp::CalibrationTarget
 // White/Dark, langer Trigger-Druck misst die jeweils gewaehlte Referenz immer
@@ -42,15 +52,15 @@ static const uint32_t LONG_PRESS_MS = 600;
 // (kurz) wechselt, WELCHE Einstellung editiert wird. Info misst ueberhaupt
 // nicht (Trigger ist dort ein No-Op): reiner Statusbildschirm fuer
 // Betriebszeit/Messzaehler aus UptimeLogger.
-enum class DisplayMode : uint8_t { Fast = 0, Precise = 1, Calibration = 2, Export = 3, Settings = 4, Info = 5, COUNT = 6 };
+enum class DisplayMode : uint8_t { Measure = 0, Calibration = 1, Export = 2, Settings = 3, Info = 4, COUNT = 5 };
 
 // Was ein gespeicherter/exportierter Messwert repraesentiert
 // (HistoryStore::MeasurementRecord) -- unabhaengig davon, mit welchem
 // DisplayMode/welcher Precision er aufgenommen wurde. Regular = normale
-// Fast/Precise-Probe; Dark/White = Referenzaufnahmen aus dem
-// Calibration-DisplayMode. Bewusst ein eigenes Enum statt DisplayMode
-// mitzubenutzen: welcher Bildschirm gerade aktiv ist und was ein Messwert
-// bedeutet sind zwei unabhaengige Fragen.
+// Precise/Single-Probe (aus dem Measure-DisplayMode); Dark/White =
+// Referenzaufnahmen aus dem Calibration-DisplayMode. Bewusst ein eigenes Enum
+// statt DisplayMode mitzubenutzen: welcher Bildschirm gerade aktiv ist und was
+// ein Messwert bedeutet sind zwei unabhaengige Fragen.
 enum class SampleKind : uint8_t { Regular = 0, Dark = 1, White = 2, COUNT = 3 };
 
 // Anzahl bekannter as7341_gain_t-Werte (0.5X..512X, siehe Adafruit_AS7341.h)
