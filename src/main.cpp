@@ -1190,9 +1190,9 @@ void loop() {
   // Clear-Seite (loescht die Historie) verlangen einen LANGEN statt kurzen
   // Trigger-Druck -- gleiche "haltbewusst statt versehentlich"-Absicherung
   // wie der bestehende lange Mode-Druck fuer den Moduswechsel. Das Ausloesen
-  // einer Messung auf der Measure-Auswahl-Seite und das Ausloesen des
-  // BLE-Sendens bleiben bei sofortigem, kurzem Druck, da sie haeufig und
-  // unkritisch sind.
+  // einer Messung im Measure-Modus (Auswahl- UND Ergebnis-Seite) und das
+  // Ausloesen des BLE-Sendens bleiben bei sofortigem, kurzem Druck, da sie
+  // haeufig und unkritisch sind.
   DebouncedButton::Event te = triggerBtn.poll();
   if (currentDisplayMode == DisplayMode::Export) {
     if (exportPage == ExportPage::Clear) {
@@ -1243,12 +1243,19 @@ void loop() {
       }
       renderCurrentView();
     }
-  } else if (currentDisplayMode == DisplayMode::Measure && measurePage == MeasurePage::Select) {
+  } else if (currentDisplayMode == DisplayMode::Measure) {
     if (te == DebouncedButton::Event::Pressed) {
+      // Trigger loest den aktuell gewaehlten Messmodus aus -- sowohl auf der
+      // Auswahl- als auch auf der Ergebnis-Seite. Auf der Ergebnis-Seite ist
+      // das eine weitere Messung DESSELBEN Modus, ohne erst ueber die
+      // Auswahl-Seite gehen zu muessen -- wichtig, um zuegig viele Proben
+      // nacheinander zu erfassen (genau wie vor der Zusammenlegung von
+      // Fast/Precise zu Measure).
+      //
       // Optimistisch VOR der Messung auf Result setzen: performMeasurement()
       // ruft bei Erfolg selbst renderCurrentView() auf -- so zeigt dieser
       // interne Aufruf schon den richtigen Ergebnis-Screen, statt kurz die
-      // alte Auswahl-Seite aufblitzen zu lassen. Bei Fehlschlag (Sensorfehler/
+      // alte Seite aufblitzen zu lassen. Bei Fehlschlag (Sensorfehler/
       // Nicht-Konvergenz) hat performMeasurement() bereits
       // renderMeasurementError() gezeigt -- dann zurueck auf Select, fuer
       // einen sofortigen erneuten Versuch ohne Umweg ueber einen langen
@@ -1258,11 +1265,8 @@ void loop() {
         measurePage = MeasurePage::Select;
       }
     }
-    // measurePage == Result: Trigger tut hier nichts (kurz/lang belegt schon
-    // die Mode-Taste, siehe cycleView()/cycleMode()).
   }
-  // Measure/Result und Info: Trigger loest hier bewusst nichts aus -- Info ist
-  // ein reiner Statusbildschirm, Measure/Result belegt Mode-Taste bereits.
+  // Info: Trigger loest hier bewusst nichts aus -- reiner Statusbildschirm.
 
   // Waehrend einer Settings-Bearbeitung uebernimmt die Mode-Taste
   // spiegelbildlich zur Trigger-Taste die Ziffern-Navigation (kurz = -1,
