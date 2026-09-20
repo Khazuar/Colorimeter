@@ -102,14 +102,46 @@ const MeasurementModeDescriptor MEASUREMENT_MODES[] = {
 const uint8_t MEASUREMENT_MODE_COUNT = sizeof(MEASUREMENT_MODES) / sizeof(MEASUREMENT_MODES[0]);
 uint8_t measurementModeIndex = 0;
 
-// Innerhalb des Calibration-DisplayMode per kurzem Mode-Druck gewaehlte
-// Referenz -- langer Trigger-Druck misst dann genau diese. Bewusst ein
-// eigenes, main.cpp-lokales Enum statt SampleKind mitzubenutzen: das eine ist
-// fluechtiger UI-Zustand ("welche Seite sehe ich gerade"), das andere ein
-// Datenmodell-Konzept ("was ist das fuer ein gespeicherter Messwert") --
-// obwohl beide White/Dark kennen, sind es unterschiedliche Fragen.
-enum class CalibrationTarget : uint8_t { White = 0, Dark = 1 };
-CalibrationTarget calibrationTarget = CalibrationTarget::White;
+// Der Calibration-DisplayMode hat drei per kurzem Mode-Druck durchschaltbare
+// Seiten: den Belichtungs-Assistenten (Default beim Betreten) sowie die beiden
+// bestehenden Referenz-Seiten. Bewusst ein eigenes, main.cpp-lokales Enum statt
+// SampleKind mitzubenutzen: das eine ist fluechtiger UI-Zustand ("welche Seite
+// sehe ich gerade"), das andere ein Datenmodell-Konzept.
+enum class CalibrationPage : uint8_t { Exposure = 0, White = 1, Dark = 2, COUNT = 3 };
+CalibrationPage calibrationPage = CalibrationPage::Exposure;
+
+// Unterzustand NUR fuer CalibrationPage::Exposure (analog MeasurePage). Select
+// ist die Helligkeitsklassen-Auswahl; White-/DarkPrompt fordern zum Auflegen +
+// langem Trigger-Druck auf; Done/Failed sind Endbildschirme. Die Belichtungs-
+// Schleife und die Referenzmessungen laufen blockierend im Trigger-Handler
+// (wie performMeasurement()), es gibt dafuer keinen eigenen Idle-Zustand.
+enum class ExposureStage : uint8_t { Select, WhitePrompt, DarkPrompt, Done, Failed };
+ExposureStage exposureStage = ExposureStage::Select;
+
+// Ziel-Helligkeitsklasse -> A_NFC (siehe A_NFC_TARGET). Cursor startet auf Mittel.
+enum class BrightnessClass : uint8_t { Bright = 0, Medium = 1, Dark = 2, COUNT = 3 };
+uint8_t exposureClassIndex = static_cast<uint8_t>(BrightnessClass::Medium);
+
+// A_NFC je Klasse: der dunkelste fuer den aktuellen Filter relevante Weiss-Kanal
+// soll >= A_NFC * NOISE_FLOOR_COUNTS Counts haben. Eine Probe ist immer dunkler
+// als Weiss -- helle Proben brauchen wenig Reserve, dunkle viel. Bewusst
+// einfacher Startpunkt -- TODO tunen (Nutzer nannte ~1.5-2 hell, ~4-5 dunkel).
+static const float A_NFC_TARGET[3] = { 2.0f, 3.0f, 5.0f };
+static const char* const BRIGHTNESS_LABELS[3] = { "Helle Proben", "Mittlere Proben", "Dunkle Proben" };
+
+// Ergebnis des zuletzt gelaufenen Assistenten -- fuer die Done-/Failed-Screens.
+AcquisitionSettings exposureResult;
+uint8_t exposureIters = 0;
+const char* exposureFailReason = nullptr;
+
+// Parameter der Belichtungs-Schleife (TODO tunen).
+static const uint8_t  EXPOSURE_MAX_ITERS      = 5;
+static const float    EXPOSURE_SAT_LIMIT_FRAC = 0.80f;  // darueber gilt ein Kanal als (fast) geklippt
+static const float    EXPOSURE_SAT_AIM_FRAC   = 0.70f;  // Zielpegel des hellsten Kanals beim Herunterregeln
+static const float    EXPOSURE_MIN_HEADROOM   = 1.30f;  // Ziel etwas ueber die Rauschgrenze (Stabilitaet)
+static const float    AINT_RATIO_LO = 0.2f, AINT_RATIO_HI = 5.0f;  // max. Sprung je Durchlauf
+static const uint32_t AINT_MIN = 100;                   // absurd kurze Integration verhindern
+static const uint32_t ADC_FULL_SCALE_CAP = 65535;       // 16-bit ADC-Datenregister
 
 // ------------------------- Messhistorie (persistiert, siehe HistoryStore) -------------------------
 // Jede Messung wird hier zusammen mit ihrem Modus gesammelt -- Grundlage fuer
@@ -257,18 +289,25 @@ const char* displayModeLabel(DisplayMode m) {
     default:                       return "M";  // Measure -- in der Praxis nie direkt angezeigt, siehe activeModeLabel()
   }
 }
-const char* calibrationTargetLabel(CalibrationTarget t) {
-  return (t == CalibrationTarget::White) ? "W" : "D";
+// Ecken-Kuerzel fuer den Calibration-Modus: auf den Referenz-Seiten "W"/"D",
+// auf der Assistenten-Seite waehrend einer Weiss-/Dunkel-Untermessung ebenfalls
+// "W"/"D" (das ist es ja gerade), sonst "A".
+const char* calibrationPageLabel() {
+  if (calibrationPage == CalibrationPage::White) return "W";
+  if (calibrationPage == CalibrationPage::Dark) return "D";
+  if (exposureStage == ExposureStage::WhitePrompt) return "W";
+  if (exposureStage == ExposureStage::DarkPrompt) return "D";
+  return "A";
 }
 
 // Liefert das fuer die aktuelle Anzeige (z.B. "MESSUNG"-Screen) passende
-// Modus-Kuerzel -- im Calibration-Modus das der aktuell gewaehlten Referenz
-// (White/Dark), im Measure-Modus das des aktuell gewaehlten Messmodus
-// (siehe MEASUREMENT_MODES), sonst das des DisplayMode selbst. Noetig, weil
-// showMeasuringScreen() als ProgressCallback eine feste Signatur hat und
-// daher nicht direkt wissen kann, welche Referenz calibrationTarget gerade meint.
+// Modus-Kuerzel -- im Calibration-Modus das der aktuell gewaehlten Seite/Referenz
+// (siehe calibrationPageLabel()), im Measure-Modus das des aktuell gewaehlten
+// Messmodus (siehe MEASUREMENT_MODES), sonst das des DisplayMode selbst. Noetig,
+// weil showMeasuringScreen() als ProgressCallback eine feste Signatur hat und
+// daher nicht direkt wissen kann, was gerade gemessen wird.
 const char* activeModeLabel() {
-  if (currentDisplayMode == DisplayMode::Calibration) return calibrationTargetLabel(calibrationTarget);
+  if (currentDisplayMode == DisplayMode::Calibration) return calibrationPageLabel();
   if (currentDisplayMode == DisplayMode::Measure) return MEASUREMENT_MODES[measurementModeIndex].cornerLabel;
   return displayModeLabel(currentDisplayMode);
 }
@@ -540,8 +579,8 @@ void renderExportStatus() {
   display.display();
 }
 
-// Gemeinsamer Screen fuer den Calibration-Modus (Weiss- ODER Dunkelreferenz,
-// je nach calibrationTarget -- kurzer Mode-Druck wechselt dazwischen): zeigt
+// Screen fuer die Weiss-/Dunkel-Referenz-Seiten des Calibration-Modus (je nach
+// calibrationPage -- kurzer Mode-Druck wechselt zwischen den Seiten): zeigt
 // die gewaehlte Referenz als rohes Measurement (ueber measurementLabels()
 // beschriftet) statt sie als kalibrierte Reflexion darzustellen -- seit
 // getSpectrum() explizite Referenzen statt einer gespeicherten Kalibrierung
@@ -558,7 +597,7 @@ void renderReferenceStatus() {
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(1);
 
-  bool isWhite = (calibrationTarget == CalibrationTarget::White);
+  bool isWhite = (calibrationPage == CalibrationPage::White);
   display.setCursor(0, 0);
   display.println(isWhite ? "Weiss-Referenz" : "Dunkel-Referenz");
 
@@ -592,6 +631,101 @@ void renderReferenceStatus() {
     }
   }
 
+  display.display();
+}
+
+// ------------------------- Belichtungs-Assistent (siehe Plan/Kontext) -------------------------
+// Erste Seite des Calibration-Modus. Ermittelt gefuehrt einen Arbeitspunkt fuer
+// GAIN/ATIME/ASTEP (in dieser Version wird nur ATIME/ASTEP geregelt, GAIN bleibt
+// wie manuell eingestellt) und nimmt im selben Ablauf Weiss- und Dunkelreferenz
+// mit. exposureStage steuert, welcher der folgenden Screens erscheint.
+
+void renderExposureSelect() {
+  if (!displayOk) return;
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("Belicht.-Assistent");
+  int y = 16;
+  for (uint8_t i = 0; i < 3; i++) {
+    display.setCursor(0, y);
+    display.print(i == exposureClassIndex ? "> " : "  ");
+    display.println(BRIGHTNESS_LABELS[i]);
+    y += 10;
+  }
+  display.setCursor(0, y + 2);
+  display.print("Trigger lang: Start");
+  display.display();
+}
+
+void renderExposurePrompt(bool white) {
+  if (!displayOk) return;
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println(white ? "Weissreferenz" : "Dunkelreferenz");
+  display.setCursor(0, 20);
+  display.println(white ? "auflegen" : "auflegen/abdecken");
+  display.setCursor(0, 40);
+  display.println("Trigger lang");
+  display.println("druecken");
+  display.display();
+}
+
+void renderExposureProgress(uint8_t iter) {
+  if (!displayOk) return;
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("Belichtung");
+  display.setCursor(0, 16);
+  display.println("anpassen ...");
+  display.setCursor(0, 36);
+  char line[22];
+  snprintf(line, sizeof(line), "Durchlauf %u/%u", iter, EXPOSURE_MAX_ITERS);
+  display.println(line);
+  display.display();
+}
+
+void renderExposureDone() {
+  if (!displayOk) return;
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("Kalibrierung fertig");
+  char line[22];
+  display.setCursor(0, 16);
+  snprintf(line, sizeof(line), "GAIN  %s", gainCsvLabel(exposureResult.gain));
+  display.println(line);
+  display.setCursor(0, 26);
+  snprintf(line, sizeof(line), "ATIME %u", exposureResult.atime);
+  display.println(line);
+  display.setCursor(0, 36);
+  snprintf(line, sizeof(line), "ASTEP %u", exposureResult.astep);
+  display.println(line);
+  display.setCursor(0, 50);
+  snprintf(line, sizeof(line), "Durchlaeufe: %u", exposureIters);
+  display.println(line);
+  display.display();
+}
+
+void renderExposureFailed() {
+  if (!displayOk) return;
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("Assistent");
+  display.println("fehlgeschlagen");
+  display.setCursor(0, 24);
+  if (exposureFailReason) display.println(exposureFailReason);
+  display.setCursor(0, 44);
+  display.println("Weiss aufgelegt?");
+  display.println("ggf. GAIN aendern");
   display.display();
 }
 
@@ -758,7 +892,17 @@ void renderCurrentView() {
     return;
   }
   if (currentDisplayMode == DisplayMode::Calibration) {
-    renderReferenceStatus();
+    if (calibrationPage == CalibrationPage::Exposure) {
+      switch (exposureStage) {
+        case ExposureStage::Select:      renderExposureSelect();      break;
+        case ExposureStage::WhitePrompt: renderExposurePrompt(true);  break;
+        case ExposureStage::DarkPrompt:  renderExposurePrompt(false); break;
+        case ExposureStage::Done:        renderExposureDone();        break;
+        case ExposureStage::Failed:      renderExposureFailed();      break;
+      }
+    } else {
+      renderReferenceStatus();
+    }
     return;
   }
   if (currentDisplayMode == DisplayMode::Settings) {
@@ -964,6 +1108,136 @@ bool performMeasurement(Precision precision, SampleKind kind) {
   return true;
 }
 
+// ------------------------- Belichtungs-Assistent: Ablauf -------------------------
+
+// Skaliert currentSettings.atime/astep so, dass A_int = (atime+1)*(astep+1)
+// etwa mit 'ratio' multipliziert wird. ATIME wird nach Moeglichkeit festgehalten
+// (feine ASTEP-Aufloesung reicht fast immer), nur wenn ASTEP sonst ueber 65535
+// liefe, wird ATIME angehoben. Schreibt die neuen Werte direkt auf den Sensor.
+void applyAintRatio(float ratio) {
+  if (ratio < AINT_RATIO_LO) ratio = AINT_RATIO_LO;
+  if (ratio > AINT_RATIO_HI) ratio = AINT_RATIO_HI;
+
+  double curAint = (double)(currentSettings.atime + 1) * (double)(currentSettings.astep + 1);
+  double target  = curAint * ratio;
+  const double maxAint = 256.0 * 65536.0;
+  if (target < (double)AINT_MIN) target = (double)AINT_MIN;
+  if (target > maxAint) target = maxAint;
+
+  uint32_t atime = currentSettings.atime;
+  double astepF = target / (double)(atime + 1) - 1.0;
+  if (astepF > 65535.0) {
+    double a = ceil(target / 65536.0) - 1.0;
+    atime = (a > 255.0) ? 255 : (uint32_t)a;
+    astepF = target / (double)(atime + 1) - 1.0;
+  }
+  long astep = lround(astepF);
+  if (astep < 0) astep = 0;
+  if (astep > 65535) astep = 65535;
+
+  currentSettings.atime = (uint8_t)atime;
+  currentSettings.astep = (uint16_t)astep;
+  sensorImpl.applySettings(currentSettings);
+}
+
+// Trigger lang auf ExposureStage::WhitePrompt: iterative Belichtungssuche auf
+// der aufgelegten Weissreferenz, danach eine hochwertige (Precise) Weissmessung
+// als eigentliche Referenz. Setzt exposureStage auf DarkPrompt (Erfolg) oder
+// Failed und rendert selbst.
+void runExposureWhiteLoop() {
+  if (busy) return;
+  busy = true;
+
+  const float aNfc = A_NFC_TARGET[exposureClassIndex];
+  uint8_t relIdx[AS7341Spectrometer::N_CH];
+  uint8_t relCount = sensorImpl.relevantChannels(currentSettings.filterState, relIdx);
+
+  const AcquisitionSettings pre = currentSettings;
+  bool ok = false;
+  const char* failReason = nullptr;
+  uint8_t iter = 0;
+
+  for (; iter < EXPOSURE_MAX_ITERS; iter++) {
+    renderExposureProgress(iter + 1);
+    sensorImpl.applySettings(currentSettings);  // sicherstellen, dass der Sensor mitzieht
+
+    MeasurementTelemetry tel;
+    Measurement w = sensorImpl.performMeasurement(Precision::Single, showMeasuringScreen, &tel);
+    if (w.empty()) { failReason = "Sensorfehler"; break; }
+
+    // ADC-Vollausschlag = (ATIME+1)*(ASTEP+1)*1024, gedeckelt auf die 16 Bit des
+    // Datenregisters. Sobald (ATIME+1)*(ASTEP+1) >= 64 ist, greift ohnehin der
+    // 65535-Deckel -- diesen Fall separat behandeln, damit die *1024-Rechnung
+    // nicht ueber uint32_t laeuft (bei grossen ATIME/ASTEP moeglich).
+    uint32_t aintRaw = (uint32_t)(currentSettings.atime + 1) * (uint32_t)(currentSettings.astep + 1);
+    uint32_t fullScale = (aintRaw >= 64) ? ADC_FULL_SCALE_CAP : (aintRaw * 1024u);
+    if (fullScale == 0) fullScale = ADC_FULL_SCALE_CAP;
+    float satLimit = EXPOSURE_SAT_LIMIT_FRAC * (float)fullScale;
+
+    float maxAll = 0.0f;
+    for (uint8_t c = 0; c < AS7341Spectrometer::N_CH; c++) {
+      if (w[c] > maxAll) maxAll = w[c];
+    }
+    float minRel = (float)fullScale;
+    for (uint8_t k = 0; k < relCount; k++) {
+      if (w[relIdx[k]] < minRel) minRel = w[relIdx[k]];
+    }
+    float targetMin = aNfc * AS7341Spectrometer::NOISE_FLOOR_COUNTS;
+
+    if (maxAll > satLimit) {
+      applyAintRatio((EXPOSURE_SAT_AIM_FRAC * (float)fullScale) / maxAll);
+      continue;
+    }
+    if (minRel < targetMin) {
+      float ratio = (EXPOSURE_MIN_HEADROOM * targetMin) / (minRel > 1.0f ? minRel : 1.0f);
+      if (maxAll * ratio > satLimit) { failReason = "Dynamik zu gross"; break; }
+      applyAintRatio(ratio);
+      continue;
+    }
+    ok = true;
+    break;
+  }
+
+  if (!ok) {
+    currentSettings = pre;
+    sensorImpl.applySettings(currentSettings);
+    calibrated = calibrationValidFor(currentSettings);
+    exposureFailReason = failReason ? failReason : "nicht konvergiert";
+    exposureIters = iter;
+    exposureStage = ExposureStage::Failed;
+    busy = false;
+    renderCurrentView();
+    return;
+  }
+
+  // Belichtung gefunden -> Einstellungen uebernehmen/persistieren, dann die
+  // eigentliche Weissreferenz mit Precise messen (ueber die bestehende
+  // performMeasurement(), die History/CSV/whiteRef/saveWhite erledigt).
+  commitCurrentSettings();
+  exposureResult = currentSettings;  // fuer den Done-Screen, bevor irgendetwas ihn rendert
+  exposureIters = iter + 1;
+  busy = false;
+
+  exposureStage = ExposureStage::DarkPrompt;  // optimistisch, performMeasurement() rendert dann DarkPrompt
+  if (!performMeasurement(Precision::Precise, SampleKind::White)) {
+    // Precise-Weiss bewegt/fehlgeschlagen: performMeasurement() hat bereits
+    // seinen (haftenden) Fehler-Screen gezeigt -- NICHT ueberzeichnen. Stage
+    // zurueck auf WhitePrompt, damit ein erneuter langer Trigger-Druck es
+    // sofort noch einmal versucht (die Schleife laeuft dann von den schon
+    // guten Settings aus in einem Durchlauf durch).
+    exposureStage = ExposureStage::WhitePrompt;
+  }
+}
+
+// Trigger lang auf ExposureStage::DarkPrompt: Dunkelreferenz mit Precise messen.
+void runExposureDark() {
+  exposureStage = ExposureStage::Done;  // optimistisch, performMeasurement() rendert dann Done
+  if (!performMeasurement(Precision::Precise, SampleKind::Dark)) {
+    // wie oben: haftenden Fehler-Screen stehen lassen, nur Stage zuruecksetzen.
+    exposureStage = ExposureStage::DarkPrompt;
+  }
+}
+
 // Sendet die komplette Messhistorie als CSV per BLE-Notify (Nordic UART
 // Service) an ein verbundenes Handy. Nutzt denselben busy-Guard wie
 // performMeasurement(), da beide Vorgaenge blockierend sind und sich nicht
@@ -1035,7 +1309,16 @@ void cycleView() {
     return;
   }
   if (currentDisplayMode == DisplayMode::Calibration) {
-    calibrationTarget = (calibrationTarget == CalibrationTarget::White) ? CalibrationTarget::Dark : CalibrationTarget::White;
+    // Waehrend eines "gefangenen" Assistenten-Zwischenschritts (Prompt) macht
+    // ein kurzer Mode-Druck nichts -- man verlaesst den laufenden Assistenten
+    // nur ueber einen LANGEN Mode-Druck (siehe cycleMode()).
+    if (calibrationPage == CalibrationPage::Exposure &&
+        (exposureStage == ExposureStage::WhitePrompt || exposureStage == ExposureStage::DarkPrompt)) {
+      return;
+    }
+    uint8_t n = (static_cast<uint8_t>(calibrationPage) + 1) % static_cast<uint8_t>(CalibrationPage::COUNT);
+    calibrationPage = static_cast<CalibrationPage>(n);
+    if (calibrationPage == CalibrationPage::Exposure) exposureStage = ExposureStage::Select;
     renderCurrentView();
     return;
   }
@@ -1052,6 +1335,20 @@ void cycleMode() {
     measurePage = MeasurePage::Select;
     lastMeasurement.clear();
     lastLabel[0] = '\0';
+    renderCurrentView();
+    return;
+  }
+
+  // Analog: ein langer Mode-Druck waehrend eines Assistenten-Zwischenschritts
+  // (Prompt) bricht den Assistenten ab und kehrt zu seiner Auswahl zurueck,
+  // OHNE den DisplayMode zu wechseln. Bei WhitePrompt ist noch nichts
+  // veraendert; bei DarkPrompt sind Belichtung + Weissreferenz bereits
+  // uebernommen/gespeichert -- die werden bewusst behalten, nur die
+  // Dunkelmessung entfaellt (gilt bis zur Neumessung als fehlend).
+  if (currentDisplayMode == DisplayMode::Calibration &&
+      calibrationPage == CalibrationPage::Exposure &&
+      (exposureStage == ExposureStage::WhitePrompt || exposureStage == ExposureStage::DarkPrompt)) {
+    exposureStage = ExposureStage::Select;
     renderCurrentView();
     return;
   }
@@ -1082,8 +1379,11 @@ void cycleMode() {
     currentSettingIndex = 0;
   }
   if (currentDisplayMode == DisplayMode::Calibration && previous != DisplayMode::Calibration) {
-    // Gleiche Ueberlegung -- nicht unbemerkt auf "Dark" landen.
-    calibrationTarget = CalibrationTarget::White;
+    // Gleiche Ueberlegung -- frisch im Calibration-Modus immer auf der ersten
+    // Seite (Belichtungs-Assistent) in seiner Auswahl starten, Cursor auf Mittel.
+    calibrationPage = CalibrationPage::Exposure;
+    exposureStage = ExposureStage::Select;
+    exposureClassIndex = static_cast<uint8_t>(BrightnessClass::Medium);
   }
   if (currentDisplayMode == DisplayMode::Measure && previous != DisplayMode::Measure) {
     // Gleiche Ueberlegung: frisch in Measure immer auf der Auswahl-Seite
@@ -1205,8 +1505,27 @@ void loop() {
       performExport();
     }
   } else if (currentDisplayMode == DisplayMode::Calibration) {
-    if (te == DebouncedButton::Event::LongPress) {
-      SampleKind kind = (calibrationTarget == CalibrationTarget::White) ? SampleKind::White : SampleKind::Dark;
+    if (calibrationPage == CalibrationPage::Exposure) {
+      // Belichtungs-Assistent: auf der Auswahl kurz = Klasse wechseln, lang =
+      // starten (kurz/lang muessen hier unterschieden werden -> ShortRelease
+      // statt Pressed, gleiche Begruendung wie im Settings-Modus). In den
+      // Prompt-Schritten loest ein LANGER Druck den jeweiligen Ablauf aus.
+      if (exposureStage == ExposureStage::Select) {
+        if (te == DebouncedButton::Event::ShortRelease) {
+          exposureClassIndex = (exposureClassIndex + 1) % 3;
+          renderCurrentView();
+        } else if (te == DebouncedButton::Event::LongPress) {
+          exposureStage = ExposureStage::WhitePrompt;
+          renderCurrentView();
+        }
+      } else if (exposureStage == ExposureStage::WhitePrompt) {
+        if (te == DebouncedButton::Event::LongPress) runExposureWhiteLoop();
+      } else if (exposureStage == ExposureStage::DarkPrompt) {
+        if (te == DebouncedButton::Event::LongPress) runExposureDark();
+      }
+      // Done/Failed: Trigger ohne Wirkung.
+    } else if (te == DebouncedButton::Event::LongPress) {
+      SampleKind kind = (calibrationPage == CalibrationPage::White) ? SampleKind::White : SampleKind::Dark;
       performMeasurement(Precision::Precise, kind);  // Referenzmessungen immer Precise, wie bisher
     }
   } else if (currentDisplayMode == DisplayMode::Settings) {

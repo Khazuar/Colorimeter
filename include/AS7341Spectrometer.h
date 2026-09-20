@@ -16,6 +16,11 @@ public:
   // nicht zur Interpretation durch generischen Code).
   static const uint8_t N_CH  = 10;  // Laenge jedes Measurement dieses Sensors
 
+  // Rohkanaele mit einem Mittelwert darunter liefern keinen verlaesslichen
+  // relSEM (siehe converged() in der .cpp). Oeffentlich, weil der Belichtungs-
+  // Assistent (main.cpp) seinen Ziel-Signalpegel als Vielfaches davon festlegt.
+  static constexpr float NOISE_FLOOR_COUNTS = 50.0f;
+
   static const char* const MEASUREMENT_LABELS[N_CH];
 
   bool begin();  // NUR as7341_.begin() (I2C-Inbetriebnahme). Kein NVS-Zugriff,
@@ -26,6 +31,15 @@ public:
   // Orchestrierung (main.cpp) sowohl beim Start (geladene Einstellungen)
   // als auch bei jeder Aenderung im Settings-Modus aufgerufen.
   void applySettings(const AcquisitionSettings& settings);
+
+  // Fuellt outIdx mit den Rohkanal-Indizes, die fuer den gegebenen Filter
+  // tatsaechlich als VIS-Band ins Spektrum eingehen (siehe die BANDS_*-Tabellen
+  // in der .cpp), und liefert deren Anzahl zurueck. BEWUSST ohne NIR/Clear:
+  // NIR waere unter einem IR-Cut-Filter (650/700 nm) strukturell dunkel und
+  // liesse sich durch keine Belichtungserhoehung ueber die Rauschgrenze heben.
+  // Fuer den Belichtungs-Assistenten (main.cpp), der nur diese Kanaele auf
+  // Rauschabstand prueft.
+  uint8_t relevantChannels(FilterState fs, uint8_t outIdx[N_CH]) const;
 
   Measurement performMeasurement(Precision precision,
                                   ProgressCallback onProgress = nullptr,

@@ -33,11 +33,14 @@ static const uint8_t SINGLE_SAMPLES         = 1;
 static const uint8_t PRECISE_MIN_SAMPLES    = 8;
 static const uint8_t PRECISE_MAX_SAMPLES    = 32;    // Cap, ersetzt frueheres festes N_AVG=16
 static const float   PRECISE_TARGET_REL_SEM = 0.01f; // 1% rel. Standardfehler d. Mittelwerts -- TODO tunen
-static const float   NOISE_FLOOR_COUNTS     = 50.0f;  // Kanaele darunter zaehlen nicht zur Konvergenzpruefung,
-                                                        // werden aber ueber anyChannelUnmeasurable an
-                                                        // performMeasurement() gemeldet, damit ein nicht
-                                                        // messbarer Kanal nicht stillschweigend zu einer
-                                                        // beschoenigten Praezisionsangabe fuehrt (siehe unten).
+
+// Kanaele mit einem Mittelwert darunter zaehlen nicht zur Konvergenzpruefung,
+// werden aber ueber anyChannelUnmeasurable an performMeasurement() gemeldet,
+// damit ein nicht messbarer Kanal nicht stillschweigend zu einer beschoenigten
+// Praezisionsangabe fuehrt (siehe unten). Die Konstante selbst wohnt jetzt im
+// Header (AS7341Spectrometer::NOISE_FLOOR_COUNTS), weil auch der Belichtungs-
+// Assistent in main.cpp denselben Wert braucht -- hier nur ein kurzer Alias.
+static constexpr float NOISE_FLOOR_COUNTS = AS7341Spectrometer::NOISE_FLOOR_COUNTS;
 
 // Schlechtester relativer Standardfehler des Mittelwerts ueber alle Kanaele mit
 // Signal oberhalb NOISE_FLOOR_COUNTS (sonst dominiert das Rauschen sehr dunkler
@@ -287,6 +290,15 @@ static void bandsForFilterState(FilterState fs, const VisBandDef*& defs, size_t&
       count = sizeof(BANDS_NONE) / sizeof(BANDS_NONE[0]);
       break;
   }
+}
+
+uint8_t AS7341Spectrometer::relevantChannels(FilterState fs, uint8_t outIdx[N_CH]) const {
+  const VisBandDef* defs;
+  size_t n;
+  bandsForFilterState(fs, defs, n);
+  uint8_t count = 0;
+  for (size_t i = 0; i < n && count < N_CH; i++) outIdx[count++] = defs[i].channelIndex;
+  return count;
 }
 
 void AS7341Spectrometer::computeReflectance(const Measurement& measurement,
