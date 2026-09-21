@@ -341,6 +341,23 @@ void deleteTip(size_t index) {
   calStore.saveTips(tipCatalog);
 }
 
+// Haengt einen neuen "Fingerabdruck" (normalisierte Weissreferenz-Rohmessung)
+// an eine Spitze an -- FIFO, aeltester faellt raus sobald die Liste
+// MAX_WHITE_FINGERPRINTS_PER_TIP erreicht haette (siehe TipCatalog.h). Nutzt
+// AUSSCHLIESSLICH das Spectrometer-Interface (spectrometer.normalize()), nie
+// die konkrete AS7341Spectrometer -- vorbereitet fuer einen kuenftigen
+// zweiten Sensor (siehe Spectrometer.h).
+void addWhiteFingerprint(MeasurementTip& tip, const Measurement& raw, const OpticalSettings& settings) {
+  WhiteFingerprint fp;
+  fp.uptimeS = uptimeLogger.totalSeconds();
+  fp.sensor = settings.sensor;
+  fp.normalized = spectrometer.normalize(raw, settings.sensor);
+  if (tip.whiteFingerprints.size() >= MAX_WHITE_FINGERPRINTS_PER_TIP) {
+    tip.whiteFingerprints.erase(tip.whiteFingerprints.begin());  // aeltester zuerst raus
+  }
+  tip.whiteFingerprints.push_back(fp);
+}
+
 // Bearbeitungszustand: solange editingActive, hijacken Trigger/Mode ihre
 // sonstige Bedeutung (Messen/Moduswechsel) zugunsten der Ziffernbearbeitung
 // -- siehe loop().
@@ -1118,6 +1135,42 @@ void renderMeasurementError(MeasurementStatus status) {
   display.display();
 }
 
+// Sticky-Screen (wie renderMeasurementError()) fuer eine Weissmessung, die
+// spectrometer.checkValidity() nicht besteht -- zeigt die rohen Kanalwerte
+// (gleiches Layout wie renderReferenceStatus()) plus den Grund. whiteRef/
+// Historie/Spitzenkatalog werden dafuer NICHT angefasst (siehe
+// performMeasurement()).
+void renderWhiteValidityWarning(const Measurement& raw, const MeasurementValidity& v) {
+  if (!displayOk) return;
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("Weiss ungueltig");
+  display.setCursor(0, 9);
+  if (v.anyClipping && v.anyBelowNoiseFloor) display.println("klippt + zu dunkel");
+  else if (v.anyClipping) display.println("Kanal klippt");
+  else display.println("Kanal zu dunkel");
+
+  const char* const* labels = spectrometer.measurementLabels();
+  char line[27];
+  int y = 20;
+  size_t i = 0;
+  for (; i + 1 < raw.size(); i += 2) {
+    snprintf(line, sizeof(line), "%-4.4s %5.0f %-4.4s %5.0f",
+             labels[i], raw[i], labels[i + 1], raw[i + 1]);
+    display.setCursor(0, y);
+    display.print(line);
+    y += 8;
+  }
+  if (i < raw.size()) {
+    snprintf(line, sizeof(line), "%-4.4s %5.0f", labels[i], raw[i]);
+    display.setCursor(0, y);
+    display.print(line);
+  }
+  display.display();
+}
+
 // Gemeinsamer Einstiegspunkt fuer den Trigger-Taster in allen Mess-Modi.
 // precision/kind werden vom Aufrufer (loop()) bestimmt, nicht hier -- diese
 // Funktion kennt keinen DisplayMode mehr, nur noch "wie genau messen" und
@@ -1152,6 +1205,22 @@ bool performMeasurement(Precision precision, SampleKind kind) {
     renderMeasurementError(telemetry.status);
     return false;
   }
+  // Eine Weissreferenz, die in irgendeinem Kanal klippt oder unter der
+  // Rauschgrenze liegt, taugt weder als Referenz noch als Fingerabdruck --
+  // wird deshalb komplett verworfen (nicht als whiteRef uebernommen, nicht in
+  // der Historie, kein Fingerabdruck), aber dem Nutzer trotzdem mit den
+  // Rohwerten UND dem Grund angezeigt (siehe renderWhiteValidityWarning()).
+  // lastMeasurement/lastMeasurementSettings bleiben dabei unveraendert, wie
+  // beim Sensorfehler-/Nicht-Konvergenz-Fall oben.
+  if (kind == SampleKind::White) {
+    MeasurementValidity validity = spectrometer.checkValidity(measurement, currentSettings.optical);
+    if (!validity.ok) {
+      busy = false;
+      renderWhiteValidityWarning(measurement, validity);
+      return false;
+    }
+  }
+
   lastMeasurement = measurement;
   lastMeasurementSettings = currentSettings.optical;
 
@@ -1203,6 +1272,12 @@ bool performMeasurement(Precision precision, SampleKind kind) {
     whiteRef = measurement;
     whiteRefSettings = currentSettings.optical;
     calStore.saveWhite(whiteRef, whiteRefSettings);
+
+    MeasurementTip* active = tipCatalog.activeTip();
+    if (active) {
+      addWhiteFingerprint(*active, measurement, currentSettings.optical);
+      calStore.saveTips(tipCatalog);
+    }
   }
   calibrated = calibrationValidFor(currentSettings.optical);
 

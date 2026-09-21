@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "TipCatalog",
-  "$comment": "Beschreibt TipCatalog (include/TipCatalog.h, main.cpp::tipCatalog) -- den Katalog bekannter Messspitzen samt der aktiven Spitze, EIN atomar persistiertes Dokument, bewusst getrennt von settings.schema.json/RootSettings (die aktive Spitze ist eine Eigenschaft DES KATALOGS, keine RootSettings-Einstellung). 'optical' hat dieselbe Form wie dort (keine gemeinsame $ref -- beide Dateien sind unabhaengig lesbare Dokumentation). Wird auf dem Geraet selbst nicht genutzt, keine automatische Generierung/Pruefung.",
+  "$comment": "Beschreibt TipCatalog (include/TipCatalog.h, main.cpp::tipCatalog) -- den Katalog bekannter Messspitzen samt der aktiven Spitze, EIN atomar persistiertes Dokument, bewusst getrennt von settings.schema.json/RootSettings (die aktive Spitze ist eine Eigenschaft DES KATALOGS, keine RootSettings-Einstellung). 'optical' hat dieselbe Form wie dort (keine gemeinsame $ref -- beide Dateien sind unabhaengig lesbare Dokumentation). whiteFingerprints sind normalisierte Weissreferenz-Rohkanalwerte (VIS+NIR+Clear, siehe Spectrometer::normalize()), noch ohne NIR-Korrektur/Dunkelabzug, samt der zum Messzeitpunkt aktiven Sensor-Einstellungen (fuer spaetere Ausreisser-Diagnose) -- optional, aeltere Kataloge/Eintraege haben ggf. keine. Wird auf dem Geraet selbst nicht genutzt, keine automatische Generierung/Pruefung.",
   "type": "object",
   "properties": {
     "active": { "type": "string" },
@@ -46,6 +46,46 @@
             },
             "required": ["filter", "sensor"],
             "additionalProperties": false
+          },
+          "whiteFingerprints": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "title": "WhiteFingerprint",
+              "properties": {
+                "uptimeS": { "type": "integer", "minimum": 0 },
+                "sensor": {
+                  "type": "object",
+                  "title": "SensorSettings",
+                  "properties": {
+                    "gain": {
+                      "type": "string",
+                      "enum": ["0.5X", "1X", "2X", "4X", "8X", "16X", "32X", "64X", "128X", "256X", "512X"]
+                    },
+                    "atime": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 255
+                    },
+                    "astep": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 65535
+                    }
+                  },
+                  "required": ["gain", "atime", "astep"],
+                  "additionalProperties": false
+                },
+                "values": {
+                  "type": "array",
+                  "minItems": 10,
+                  "maxItems": 10,
+                  "items": { "type": "number" }
+                }
+              },
+              "required": ["uptimeS", "sensor", "values"],
+              "additionalProperties": false
+            }
           }
         },
         "required": ["name", "optical"],

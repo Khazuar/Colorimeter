@@ -18,6 +18,14 @@ public:
 
   static const char* const MEASUREMENT_LABELS[N_CH];
 
+  // Rohkanaele mit einem Mittelwert darunter liefern keinen verlaesslichen
+  // relSEM (siehe converged() in der .cpp) und gelten in checkValidity() als
+  // "zu dunkel". Oeffentlich, weil main.cpp/Aufrufer diesen Wert konzeptuell
+  // kennen koennen muessen (z.B. fuer Fehlermeldungen) -- der Zugriff darauf
+  // sollte trotzdem nur ueber das Spectrometer-Interface (checkValidity())
+  // erfolgen, nicht direkt.
+  static constexpr float NOISE_FLOOR_COUNTS = 50.0f;
+
   bool begin();  // NUR as7341_.begin() (I2C-Inbetriebnahme). Kein NVS-Zugriff,
                  // keine Annahme ueber Gain/ATIME/ASTEP -- siehe applySettings().
 
@@ -36,7 +44,18 @@ public:
                         const Measurement& darkReference,
                         FilterState filterState) const override;
 
+  MeasurementValidity checkValidity(const Measurement& raw, const OpticalSettings& settings) const override;
+  Measurement normalize(const Measurement& raw, const SensorSettings& sensor) const override;
+
 private:
+  // Rohkanal-Indizes, die fuer den gegebenen Filter tatsaechlich als VIS-Band
+  // ins Spektrum eingehen (siehe BANDS_*-Tabellen) -- NUR fuer checkValidity(),
+  // deshalb privat (kein Interface-Bestandteil, siehe Spectrometer.h-Kommentar).
+  // BEWUSST ohne NIR/Clear: NIR waere unter einem IR-Cut-Filter strukturell
+  // dunkel und liesse sich durch nichts ueber die Rauschgrenze heben; Clear
+  // wird durch die VIS-Kanaele bereits indirekt abgedeckt.
+  uint8_t relevantChannels(FilterState fs, uint8_t outIdx[N_CH]) const;
+
   // Berechnet die kalibrierte Reflexion der je nach FilterState nutzbaren
   // VIS-Kanaele (siehe die BANDS_*-Tabellen in der .cpp) direkt in 'out'.
   // Intern wird dabei auch die NIR-Reflexion bestimmt (gleiche Formel), um

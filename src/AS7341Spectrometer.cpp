@@ -33,11 +33,26 @@ static const uint8_t SINGLE_SAMPLES         = 1;
 static const uint8_t PRECISE_MIN_SAMPLES    = 8;
 static const uint8_t PRECISE_MAX_SAMPLES    = 32;    // Cap, ersetzt frueheres festes N_AVG=16
 static const float   PRECISE_TARGET_REL_SEM = 0.01f; // 1% rel. Standardfehler d. Mittelwerts -- TODO tunen
-static const float   NOISE_FLOOR_COUNTS     = 50.0f;  // Kanaele darunter zaehlen nicht zur Konvergenzpruefung,
-                                                        // werden aber ueber anyChannelUnmeasurable an
-                                                        // performMeasurement() gemeldet, damit ein nicht
-                                                        // messbarer Kanal nicht stillschweigend zu einer
-                                                        // beschoenigten Praezisionsangabe fuehrt (siehe unten).
+
+// Fuer checkValidity()/normalize() (siehe dort). ADC-Vollausschlag =
+// (ATIME+1)*(ASTEP+1)*1024, gedeckelt auf die 16 Bit des Datenregisters.
+// SATURATION_LIMIT_FRAC exakt wie beim frueheren Belichtungs-Assistenten-
+// Entwurf. ASTEP_TIME_MS laut Datenblatt/Adafruit_AS7341::toBasicCounts().
+static const uint32_t ADC_FULL_SCALE_CAP    = 65535;
+static const float    SATURATION_LIMIT_FRAC = 0.80f;
+static const float    ASTEP_TIME_MS         = 0.00278f;
+// Reihenfolge == as7341_gain_t (siehe Adafruit_AS7341.h), wie GAIN_LABELS in
+// SettingsCodec.cpp.
+static const float GAIN_MULTIPLIERS[AS7341_GAIN_COUNT] = {
+  0.5f, 1.0f, 2.0f, 4.0f, 8.0f, 16.0f, 32.0f, 64.0f, 128.0f, 256.0f, 512.0f
+};
+// Kanaele mit einem Mittelwert darunter zaehlen nicht zur Konvergenzpruefung,
+// werden aber ueber anyChannelUnmeasurable an performMeasurement() gemeldet,
+// damit ein nicht messbarer Kanal nicht stillschweigend zu einer beschoenigten
+// Praezisionsangabe fuehrt (siehe unten). Die Konstante selbst ist jetzt im
+// Header oeffentlich (AS7341Spectrometer::NOISE_FLOOR_COUNTS), weil auch
+// checkValidity() sie braucht -- hier nur ein kurzer Alias.
+static constexpr float NOISE_FLOOR_COUNTS = AS7341Spectrometer::NOISE_FLOOR_COUNTS;
 
 // Schlechtester relativer Standardfehler des Mittelwerts ueber alle Kanaele mit
 // Signal oberhalb NOISE_FLOOR_COUNTS (sonst dominiert das Rauschen sehr dunkler
@@ -287,6 +302,47 @@ static void bandsForFilterState(FilterState fs, const VisBandDef*& defs, size_t&
       count = sizeof(BANDS_NONE) / sizeof(BANDS_NONE[0]);
       break;
   }
+}
+
+uint8_t AS7341Spectrometer::relevantChannels(FilterState fs, uint8_t outIdx[N_CH]) const {
+  const VisBandDef* defs;
+  size_t n;
+  bandsForFilterState(fs, defs, n);
+  uint8_t count = 0;
+  for (size_t i = 0; i < n && count < N_CH; i++) outIdx[count++] = defs[i].channelIndex;
+  return count;
+}
+
+MeasurementValidity AS7341Spectrometer::checkValidity(const Measurement& raw,
+                                                       const OpticalSettings& settings) const {
+  MeasurementValidity result;
+  if (raw.size() != N_CH) return result;  // ok bleibt false
+
+  uint32_t aintRaw = (uint32_t)(settings.sensor.atime + 1) * (uint32_t)(settings.sensor.astep + 1);
+  uint32_t fullScale = (aintRaw >= 64) ? ADC_FULL_SCALE_CAP : (aintRaw * 1024u);
+  float satLimit = SATURATION_LIMIT_FRAC * (float)fullScale;
+  for (uint8_t c = 0; c < N_CH; c++) {
+    if (raw[c] > satLimit) result.anyClipping = true;
+  }
+
+  uint8_t relIdx[N_CH];
+  uint8_t relCount = relevantChannels(settings.filterState, relIdx);
+  for (uint8_t i = 0; i < relCount; i++) {
+    if (raw[relIdx[i]] < NOISE_FLOOR_COUNTS) result.anyBelowNoiseFloor = true;
+  }
+
+  result.ok = !result.anyClipping && !result.anyBelowNoiseFloor;
+  return result;
+}
+
+Measurement AS7341Spectrometer::normalize(const Measurement& raw, const SensorSettings& sensor) const {
+  uint8_t gainIdx = static_cast<uint8_t>(sensor.gain);
+  float gainMul = (gainIdx < AS7341_GAIN_COUNT) ? GAIN_MULTIPLIERS[gainIdx] : 1.0f;
+  float integrationMs = (sensor.atime + 1) * (sensor.astep + 1) * ASTEP_TIME_MS;
+  float divisor = gainMul * integrationMs;
+  Measurement out(raw.size());
+  for (size_t i = 0; i < raw.size(); i++) out[i] = (divisor > 0.0f) ? (raw[i] / divisor) : 0.0f;
+  return out;
 }
 
 void AS7341Spectrometer::computeReflectance(const Measurement& measurement,

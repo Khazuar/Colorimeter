@@ -95,6 +95,24 @@ struct MeasurementTelemetry {
   float relSemWorst = NAN;
 };
 
+// Fwd-Deklarationen statt #include "AppConfig.h" -- vermeidet einen
+// zirkulaeren Include (AppConfig.h inkludiert bereits dieses Header fuer
+// FilterState). Referenzen auf einen unvollstaendigen Typ reichen fuer eine
+// reine Methoden-Deklaration; jede Implementierung (z.B. AS7341Spectrometer.cpp)
+// sieht die vollen Definitionen ueber ihr eigenes #include "AppConfig.h".
+struct OpticalSettings;
+struct SensorSettings;
+
+// Ergebnis von Spectrometer::checkValidity() -- ob eine Rohmessung
+// verlaesslich genug ist, um z.B. als Weissreferenz/Fingerabdruck uebernommen
+// zu werden. Sensor-unabhaengig; WELCHE internen Kanaele/Schwellen dafuer
+// herangezogen werden, entscheidet jede Implementierung selbst.
+struct MeasurementValidity {
+  bool ok = false;
+  bool anyBelowNoiseFloor = false;
+  bool anyClipping = false;
+};
+
 class Spectrometer {
 public:
   virtual ~Spectrometer() = default;
@@ -125,4 +143,20 @@ public:
                                 const Measurement& whiteReference,
                                 const Measurement& darkReference,
                                 FilterState filterState) const = 0;
+
+  // Prueft eine ROHE Messung (z.B. eine Weissreferenz) auf Verlaesslichkeit
+  // -- z.B. Kanaele, die klippen oder unter der Rauschgrenze liegen. WELCHE
+  // Kanaele/Schwellen das im Detail sind, ist Sache der jeweiligen
+  // Implementierung. Aufrufer (main.cpp) nutzen NUR dieses Interface, nie
+  // sensorspezifische Details -- vorbereitet fuer einen kuenftigen zweiten
+  // Spectrometer (z.B. AS7343).
+  virtual MeasurementValidity checkValidity(const Measurement& raw,
+                                             const OpticalSettings& settings) const = 0;
+
+  // Rohwert normalisiert auf Verstaerkung/Integrationszeit (sensorspezifische
+  // Bedeutung von "Verstaerkung"/"Integrationszeit") -- macht Messungen unter
+  // verschiedenen Sensor-Einstellungen direkt vergleichbar (z.B. fuer
+  // Messspitzen-Fingerabdruecke, siehe TipCatalog.h).
+  virtual Measurement normalize(const Measurement& raw,
+                                 const SensorSettings& sensor) const = 0;
 };

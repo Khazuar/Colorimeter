@@ -15,7 +15,7 @@
 // Orchestrierung muss also keine sensorspezifische Kanalanzahl kennen.
 class CalibrationStore {
 public:
-  void begin();  // prefs_.begin("colorim", false)
+  void begin();  // prefs_.begin("colorim", false) + LittleFS.begin() (fuer loadTips/saveTips, siehe dort)
 
   // false, falls nie gespeichert ODER JSON nicht lesbar (out/optical fallen
   // dann auf ihre Defaults zurueck).

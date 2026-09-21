@@ -1,9 +1,22 @@
 #include "CalibrationStore.h"
 #include "SettingsCodec.h"
 #include <ArduinoJson.h>
+#include <LittleFS.h>
+
+// Der Messspitzen-Katalog (siehe unten) liegt bewusst auf LittleFS statt in
+// den NVS-"Preferences" wie die uebrigen Werte: die "nvs"-Partition ist laut
+// partitions.csv nur 20 KB gross und wird bereits von live/dark/white_settings
+// geteilt -- mit Fingerabdruecken (siehe TipCatalog.h::WhiteFingerprint,
+// bis zu MAX_WHITE_FINGERPRINTS_PER_TIP je Spitze) waechst der Katalog leicht
+// auf mehrere KB pro Spitze. LittleFS (die "spiffs"-Partition, 1.4 MB) traegt
+// bereits die mindestens ebenso wichtige Messhistorie (HistoryStore) und ist
+// genauso stromausfall-sicher -- kein neues Risiko, nur eine passendere
+// Partition fuer wachsende Daten.
+static const char* TIPS_PATH = "/tips.json";
 
 void CalibrationStore::begin() {
   prefs_.begin("colorim", false);
+  LittleFS.begin(/*formatOnFail=*/true);  // idempotent, siehe HistoryStore::begin()
 }
 
 bool CalibrationStore::load(const char* key, Measurement& out) {
@@ -20,24 +33,37 @@ void CalibrationStore::save(const char* key, const Measurement& v) {
   prefs_.putBytes(key, v.data(), v.size() * sizeof(float));
 }
 
-// Gemeinsames Lese-/Schreibpaar fuer die Felder von OpticalSettings (siehe
-// AppConfig.h) -- genutzt sowohl fuer das "optical"-Unterobjekt von
-// RootSettings als auch fuer ein eigenstaendiges OpticalSettings-Dokument
-// (Dark-/Weiss-Referenzen) als auch fuer je ein "optical"-Unterobjekt pro
-// Messspitzen-Katalog-Eintrag -- damit die JSON-Form nicht mehrfach gepflegt
-// werden muss. Generisch auf JsonVariant/JsonVariantConst, damit sowohl ein
-// ganzes JsonDocument als auch ein einzelnes JsonObject (Array-Element,
-// Unterobjekt) als Ziel/Quelle dienen koennen. Enum-Werte werden als Strings
-// kodiert (siehe SettingsCodec.h), damit eine kuenftige Umsortierung/
-// Erweiterung des Enums nicht stillschweigend die Bedeutung eines bereits
-// gespeicherten Werts veraendert. Siehe schema/settings.schema.json fuer die
+// Gemeinsames Lese-/Schreibpaar fuer die drei Felder von SensorSettings --
+// genutzt vom "sensor"-Unterobjekt in writeOpticalFields()/readOpticalFields()
+// UND direkt fuer die eingefrorenen SensorSettings in einem WhiteFingerprint
+// (siehe TipCatalog.h), damit die JSON-Form nicht mehrfach gepflegt werden
+// muss. Generisch auf JsonVariant/JsonVariantConst, damit sowohl ein ganzes
+// JsonDocument als auch ein einzelnes JsonObject (Array-Element, Unterobjekt)
+// als Ziel/Quelle dienen koennen. Enum-Werte werden als Strings kodiert
+// (siehe SettingsCodec.h), damit eine kuenftige Umsortierung/Erweiterung des
+// Enums nicht stillschweigend die Bedeutung eines bereits gespeicherten
+// Werts veraendert.
+static void writeSensorFields(JsonVariant target, const SensorSettings& sensor) {
+  target["gain"]  = gainCsvLabel(sensor.gain);
+  target["atime"] = sensor.atime;
+  target["astep"] = sensor.astep;
+}
+
+static bool readSensorFields(JsonVariantConst source, SensorSettings& sensor) {
+  bool ok = gainFromCsvLabel(source["gain"] | "", sensor.gain);
+  if (ok && source["atime"].is<uint8_t>())  sensor.atime = source["atime"].as<uint8_t>();   else ok = false;
+  if (ok && source["astep"].is<uint16_t>()) sensor.astep = source["astep"].as<uint16_t>();  else ok = false;
+  return ok;
+}
+
+// Analog fuer OpticalSettings (Filter + Sensor zusammen) -- genutzt fuer das
+// "optical"-Unterobjekt von RootSettings, ein eigenstaendiges OpticalSettings-
+// Dokument (Dark-/Weiss-Referenzen) UND je ein "optical"-Unterobjekt pro
+// Messspitzen-Katalog-Eintrag. Siehe schema/settings.schema.json fuer die
 // dokumentierte Form.
 static void writeOpticalFields(JsonVariant target, FilterState fs, const SensorSettings& sensor) {
   target["filter"] = filterStateCsvLabel(fs);
-  JsonObject sensorObj = target["sensor"].to<JsonObject>();
-  sensorObj["gain"]  = gainCsvLabel(sensor.gain);
-  sensorObj["atime"] = sensor.atime;
-  sensorObj["astep"] = sensor.astep;
+  writeSensorFields(target["sensor"].to<JsonObject>(), sensor);
 }
 
 // Feldweise robust: jedes fehlende/unbekannte Feld schlaegt fehl -- der
@@ -46,11 +72,7 @@ static void writeOpticalFields(JsonVariant target, FilterState fs, const SensorS
 // binaere Groessen-Pruefung, jetzt nur feldweise statt "ganz oder gar nicht".
 static bool readOpticalFields(JsonVariantConst source, FilterState& fs, SensorSettings& sensor) {
   bool ok = filterStateFromCsvLabel(source["filter"] | "", fs);
-  JsonObjectConst sensorObj = source["sensor"];
-  ok = ok && gainFromCsvLabel(sensorObj["gain"] | "", sensor.gain);
-  if (ok && sensorObj["atime"].is<uint8_t>())  sensor.atime = sensorObj["atime"].as<uint8_t>();   else ok = false;
-  if (ok && sensorObj["astep"].is<uint16_t>()) sensor.astep = sensorObj["astep"].as<uint16_t>();  else ok = false;
-  return ok;
+  return ok && readSensorFields(source["sensor"], sensor);
 }
 
 static String serializeRootSettings(const RootSettings& s) {
@@ -88,7 +110,11 @@ static bool deserializeOpticalSettings(const String& json, OpticalSettings& out)
   return ok;
 }
 
-static String serializeTipCatalog(const TipCatalog& c) {
+// Schreibt direkt in den gegebenen Stream (kein Zwischen-String) -- der
+// Katalog kann mit vollen Fingerabdruck-Listen mehrere KB gross werden,
+// direktes Streamen in die Datei spart den Umweg ueber eine grosse String-
+// Kopie im RAM.
+static void serializeTipCatalog(const TipCatalog& c, Print& out) {
   JsonDocument doc;
   doc["active"] = c.active.c_str();
   JsonArray arr = doc["tips"].to<JsonArray>();
@@ -96,20 +122,26 @@ static String serializeTipCatalog(const TipCatalog& c) {
     JsonObject o = arr.add<JsonObject>();
     o["name"] = t.name.c_str();
     writeOpticalFields(o["optical"].to<JsonObject>(), t.optical.filterState, t.optical.sensor);
+    JsonArray fps = o["whiteFingerprints"].to<JsonArray>();
+    for (const WhiteFingerprint& fp : t.whiteFingerprints) {
+      JsonObject fpObj = fps.add<JsonObject>();
+      fpObj["uptimeS"] = fp.uptimeS;
+      writeSensorFields(fpObj["sensor"].to<JsonObject>(), fp.sensor);
+      JsonArray vals = fpObj["values"].to<JsonArray>();
+      for (float v : fp.normalized) vals.add(v);
+    }
   }
-  String out;
   serializeJson(doc, out);
-  return out;
 }
 
 // Ungueltig (-> false, Aufrufer faellt auf einen leeren Katalog zurueck), wenn
 // JSON kaputt ist, ODER die resultierende Liste leer waere, ODER 'active'
 // keinen der geladenen Eintraege trifft -- die Invariante "immer >=1 Spitze,
 // 'active' immer gueltig" wird hier durchgesetzt, nicht erst beim Zugriff.
-static bool deserializeTipCatalog(const String& json, TipCatalog& out) {
+static bool deserializeTipCatalog(Stream& in, TipCatalog& out) {
   TipCatalog result;
   JsonDocument doc;
-  bool ok = (deserializeJson(doc, json) == DeserializationError::Ok);
+  bool ok = (deserializeJson(doc, in) == DeserializationError::Ok);
   if (ok) {
     result.active = (const char*)(doc["active"] | "");
     for (JsonObject o : doc["tips"].as<JsonArray>()) {
@@ -118,6 +150,21 @@ static bool deserializeTipCatalog(const String& json, TipCatalog& out) {
       if (t.name.empty() || !readOpticalFields(o["optical"], t.optical.filterState, t.optical.sensor)) {
         ok = false;
         break;
+      }
+      // whiteFingerprints ist OPTIONAL (aeltere/neu angelegte Kataloge haben
+      // noch keine) -- fehlt der Schluessel, bleibt die Liste einfach leer,
+      // das ist KEIN Ladefehler. Ein einzelner kaputter Fingerabdruck-Eintrag
+      // wird uebersprungen statt den ganzen Katalog zu verwerfen (reine
+      // Zusatzdaten).
+      if (o["whiteFingerprints"].is<JsonArray>()) {
+        for (JsonObject fpObj : o["whiteFingerprints"].as<JsonArray>()) {
+          if (!fpObj["values"].is<JsonArray>()) continue;
+          WhiteFingerprint fp;
+          fp.uptimeS = fpObj["uptimeS"] | 0;
+          if (!readSensorFields(fpObj["sensor"], fp.sensor)) continue;
+          for (JsonVariant v : fpObj["values"].as<JsonArray>()) fp.normalized.push_back(v.as<float>());
+          t.whiteFingerprints.push_back(fp);
+        }
       }
       result.tips.push_back(t);
     }
@@ -171,12 +218,19 @@ void CalibrationStore::saveSettings(const RootSettings& v) {
   prefs_.putString("live_settings_json", serializeRootSettings(v));
 }
 
+// Auf LittleFS statt NVS/Preferences -- siehe Kommentar an TIPS_PATH oben.
 bool CalibrationStore::loadTips(TipCatalog& out) {
-  String json = prefs_.getString("tips_json", "");
-  if (json.isEmpty()) { out = TipCatalog(); return false; }
-  return deserializeTipCatalog(json, out);
+  if (!LittleFS.exists(TIPS_PATH)) { out = TipCatalog(); return false; }
+  File f = LittleFS.open(TIPS_PATH, FILE_READ);
+  if (!f) { out = TipCatalog(); return false; }
+  bool ok = deserializeTipCatalog(f, out);
+  f.close();
+  return ok;
 }
 
 void CalibrationStore::saveTips(const TipCatalog& v) {
-  prefs_.putString("tips_json", serializeTipCatalog(v));
+  File f = LittleFS.open(TIPS_PATH, FILE_WRITE, true);  // "w" trunkiert automatisch
+  if (!f) return;
+  serializeTipCatalog(v, f);
+  f.close();
 }
