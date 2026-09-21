@@ -12,6 +12,7 @@
 #include "AS7341Spectrometer.h"
 #include "SettingsCodec.h"
 #include "CalibrationStore.h"
+#include "TipCatalog.h"
 #include "Buttons.h"
 #include "DisplayViews.h"
 #include "BleExporter.h"
@@ -31,22 +32,22 @@ Spectrometer& spectrometer = sensorImpl;
 // ------------------------- Kalibrierung: Sache der Orchestrierung -------------------------
 CalibrationStore calStore;
 Measurement darkRef, whiteRef;
-AcquisitionParameters darkRefSettings;   // eingefroren MIT darkRef, siehe CalibrationStore
-AcquisitionParameters whiteRefSettings;  // eingefroren MIT whiteRef
+OpticalSettings darkRefSettings;   // eingefroren MIT darkRef, siehe CalibrationStore
+OpticalSettings whiteRefSettings;  // eingefroren MIT whiteRef
 bool calibrated = false;  // "Referenz passt zu den AKTUELL gewaehlten Einstellungen" -- siehe calibrationValidFor()
 
 // Aktuell im Settings-Baum gewaehlte Einstellungs-Hierarchie (siehe
-// DisplayMode::Settings sowie RootSettings/AcquisitionParameters in AppConfig.h).
+// DisplayMode::Settings sowie RootSettings/OpticalSettings in AppConfig.h).
 RootSettings currentSettings;
 
 // Liefert true, wenn sowohl Dark- als auch White-Referenz vorhanden sind UND
-// beide unter GENAU dem angegebenen Parameter-Buendel (Filter+Gain+ATIME+
+// beide unter GENAU dem angegebenen OpticalSettings (Filter+Gain+ATIME+
 // ASTEP) aufgenommen wurden. Zentrale Stelle fuer die Regel "weicht auch nur
 // eine Einstellung ab, gilt die Referenz als nicht vorhanden" -- wird fuer die
 // Live-Anzeige (gegen lastMeasurementSettings), den globalen "ready/need cal"-
-// Status (gegen currentSettings.toAcquisitionParameters()) UND den CSV-Export
-// (gegen rec.settings jeder Zeile) gleichermassen benutzt.
-bool calibrationValidFor(const AcquisitionParameters& s) {
+// Status (gegen currentSettings.optical) UND den CSV-Export (gegen
+// rec.settings jeder Zeile) gleichermassen benutzt.
+bool calibrationValidFor(const OpticalSettings& s) {
   return !darkRef.empty() && !whiteRef.empty()
       && darkRefSettings == s && whiteRefSettings == s;
 }
@@ -61,7 +62,7 @@ char lastLabel[16] = "";
 // waren -- eingefroren, NICHT die live im Settings-Modus editierbaren
 // currentSettings (siehe renderCurrentView() fuer die Begruendung dieser
 // Asymmetrie).
-AcquisitionParameters lastMeasurementSettings;
+OpticalSettings lastMeasurementSettings;
 bool busy = false;  // waehrend true: keine weitere Messung/kein weiterer Export ausloesbar
 
 DisplayMode currentDisplayMode = DisplayMode::Measure;
@@ -166,13 +167,17 @@ const char* precisionCsvLabel(Precision p) {
 
 // Settings sind eine beliebig tief verschachtelbare Baumstruktur (siehe Plan)
 // statt einer flachen Liste -- deren Form folgt RootSettings/AppConfig.h.
-// Ein Knoten ist entweder ein Blatt (editierbarer Wert, wie bisher
-// SettingDescriptor), ein Navigationsknoten (fuehrt per langem Trigger-Druck
-// eine Ebene tiefer) oder der fiktive "<Zurueck>"-Eintrag (fuehrt eine Ebene
-// hoeher). Ein Knoten traegt IMMER alle Felder, auch wenn nur ein Teil je
-// nach 'kind' benutzt wird -- gleiche Pragmatik wie zuvor bei
-// SettingDescriptor (dort war z.B. valueLabel nur bei digitCount==1 belegt).
-enum class SettingsNodeKind : uint8_t { Leaf, Branch, Back };
+// Ein Knoten ist ein Blatt (editierbarer Wert, wie bisher SettingDescriptor),
+// ein Navigationsknoten (fuehrt per langem Trigger-Druck eine Ebene tiefer),
+// der fiktive "<Zurueck>"-Eintrag (fuehrt eine Ebene hoeher) ODER TipList --
+// ein main.cpp-lokaler Sonderfall, der statt in den generischen Baum-Stack in
+// einen eigenen, main.cpp-lokalen Unterfluss abzweigt (siehe TipMenuStage/
+// tipCatalog weiter unten), weil der Messspitzen-Katalog dynamisch ist (keine
+// zur Compile-Zeit feste Kinderliste). Ein Knoten traegt IMMER alle Felder,
+// auch wenn nur ein Teil je nach 'kind' benutzt wird -- gleiche Pragmatik wie
+// zuvor bei SettingDescriptor (dort war z.B. valueLabel nur bei
+// digitCount==1 belegt).
+enum class SettingsNodeKind : uint8_t { Leaf, Branch, Back, TipList };
 
 struct SettingsNode {
   const char* name;
@@ -189,40 +194,52 @@ struct SettingsNode {
   uint8_t childCount;
 };
 
+// ------------------------- Messspitzen-Katalog -------------------------
+// Siehe TipCatalog.h fuer die Invariante (nie leer, 'active' immer gueltig)
+// und main.cpp::setup() fuer deren Herstellung beim allerersten Boot.
+TipCatalog tipCatalog;
+
 // Gemeinsamer Abschluss fuer jede Einstellungsaenderung: persistieren +
 // calibrated neu bewerten (kann durch eine reine Einstellungsaenderung sofort
-// kippen, ganz ohne neue Messung).
+// kippen, ganz ohne neue Messung) + die aktive Messspitze mit dem neuen Stand
+// synchronisieren (siehe Kontext/Plan: "zuletzt eingestellte Werte je Spitze").
 void commitCurrentSettings() {
   calStore.saveSettings(currentSettings);
-  calibrated = calibrationValidFor(currentSettings.toAcquisitionParameters());
+  calibrated = calibrationValidFor(currentSettings.optical);
+
+  MeasurementTip* active = tipCatalog.activeTip();
+  if (active) {
+    active->optical = currentSettings.optical;
+    calStore.saveTips(tipCatalog);
+  }
 }
 
 const char* filterSettingLabel(uint32_t v) { return filterStateUiLabel(static_cast<FilterState>(v)); }
-uint32_t getFilterSetting() { return static_cast<uint32_t>(currentSettings.filterState); }
+uint32_t getFilterSetting() { return static_cast<uint32_t>(currentSettings.optical.filterState); }
 void setFilterSetting(uint32_t v) {
-  currentSettings.filterState = static_cast<FilterState>(v);
+  currentSettings.optical.filterState = static_cast<FilterState>(v);
   commitCurrentSettings();
 }
 
 const char* gainSettingLabel(uint32_t v) { return gainCsvLabel(static_cast<as7341_gain_t>(v)); }
-uint32_t getGainSetting() { return static_cast<uint32_t>(currentSettings.sensor.gain); }
+uint32_t getGainSetting() { return static_cast<uint32_t>(currentSettings.optical.sensor.gain); }
 void setGainSetting(uint32_t v) {
-  currentSettings.sensor.gain = static_cast<as7341_gain_t>(v);
-  sensorImpl.applySettings(currentSettings.toAcquisitionParameters());
+  currentSettings.optical.sensor.gain = static_cast<as7341_gain_t>(v);
+  sensorImpl.applySettings(currentSettings.optical);
   commitCurrentSettings();
 }
 
-uint32_t getATimeSetting() { return currentSettings.sensor.atime; }
+uint32_t getATimeSetting() { return currentSettings.optical.sensor.atime; }
 void setATimeSetting(uint32_t v) {
-  currentSettings.sensor.atime = static_cast<uint8_t>(v);
-  sensorImpl.applySettings(currentSettings.toAcquisitionParameters());
+  currentSettings.optical.sensor.atime = static_cast<uint8_t>(v);
+  sensorImpl.applySettings(currentSettings.optical);
   commitCurrentSettings();
 }
 
-uint32_t getAStepSetting() { return currentSettings.sensor.astep; }
+uint32_t getAStepSetting() { return currentSettings.optical.sensor.astep; }
 void setAStepSetting(uint32_t v) {
-  currentSettings.sensor.astep = static_cast<uint16_t>(v);
-  sensorImpl.applySettings(currentSettings.toAcquisitionParameters());
+  currentSettings.optical.sensor.astep = static_cast<uint16_t>(v);
+  sensorImpl.applySettings(currentSettings.optical);
   commitCurrentSettings();
 }
 
@@ -238,13 +255,24 @@ const SettingsNode SETTINGS_SENSOR[] = {
   { "ASTEP", SettingsNodeKind::Leaf, 5, {7, 10, 10, 10, 10}, 65535,                nullptr,          getAStepSetting, setAStepSetting },
 };
 
-// Wurzel des Settings-Baums. Filter bleibt als eigenstaendiges Blatt an der
-// Wurzel (siehe RootSettings-Kommentar in AppConfig.h); Gain/ATIME/ASTEP
-// haengen als SensorSettings-Block darunter.
-const SettingsNode SETTINGS_ROOT[] = {
+// Kinder von "Optical-Einst." -- Filter, Sensor-Einst. UND Messspitzen (die
+// Spitzenwahl wirkt sich ausschliesslich auf optical aus, gehoert deshalb
+// hier hinein statt an die Wurzel -- siehe Plan/Kontext: das haelt Baum- und
+// JSON-Struktur deckungsgleich).
+const SettingsNode SETTINGS_OPTICAL[] = {
+  { "<Zurueck>",     SettingsNodeKind::Back },
+  { "Messspitzen",   SettingsNodeKind::TipList, 0, {}, 0, nullptr, nullptr, nullptr, nullptr, 0 },
   { "Filter",        SettingsNodeKind::Leaf,   1, {3}, 2, filterSettingLabel, getFilterSetting, setFilterSetting },
   { "Sensor-Einst.", SettingsNodeKind::Branch, 0, {},  0, nullptr, nullptr, nullptr,
     SETTINGS_SENSOR, sizeof(SETTINGS_SENSOR) / sizeof(SETTINGS_SENSOR[0]) },
+};
+
+// Wurzel des Settings-Baums. Aktuell nur EIN Eintrag -- bewusst in Kauf
+// genommen (siehe Plan/Kontext), lieber als eine UI-Ebene, die dem JSON-
+// Schema nicht entspricht.
+const SettingsNode SETTINGS_ROOT[] = {
+  { "Optical-Einst.", SettingsNodeKind::Branch, 0, {}, 0, nullptr, nullptr, nullptr,
+    SETTINGS_OPTICAL, sizeof(SETTINGS_OPTICAL) / sizeof(SETTINGS_OPTICAL[0]) },
 };
 
 // Navigations-Zustand im Settings-Baum: ein kleiner, fest dimensionierter
@@ -262,6 +290,55 @@ uint8_t settingsDepth = 0;  // 0 == Wurzel -- kein "<Zurueck>" dort (siehe Plan/
 const SettingsNode& currentSettingsNode() {
   const SettingsLevel& lvl = settingsStack[settingsDepth];
   return lvl.nodes[lvl.index];
+}
+
+// ------------------------- Messspitzen-Unterfluss -------------------------
+// Eigener kleiner Zustand statt Teil des generischen Baum-Stacks (siehe
+// SettingsNodeKind::TipList-Kommentar oben) -- nur 2 Ebenen, kein eigener
+// Stack noetig. Closed = wir sind NICHT im Messspitzen-Menuepunkt (der
+// generische Baum wird dann normal gezeigt/bedient).
+enum class TipMenuStage : uint8_t { Closed, List, Detail };
+TipMenuStage tipMenuStage = TipMenuStage::Closed;
+uint8_t tipListIndex = 0;    // 0 = <Zurueck>, 1 = "Neue Spitze anlegen", 2.. = tips[index-2]
+size_t  tipDetailIndex = 0;  // welcher Tip (Index in tipCatalog.tips) wird im Detail-Screen gezeigt
+uint8_t tipActionIndex = 0;  // Cursor in der Aktionsliste des Detail-Screens (siehe renderTipDetail())
+
+std::string nextTipName() {
+  for (uint32_t n = 1; ; n++) {
+    char buf[24];
+    snprintf(buf, sizeof(buf), "Messspitze %lu", (unsigned long)n);
+    if (!tipCatalog.find(buf)) return buf;
+  }
+}
+
+// Registriert eine NEUE Spitze mit dem AKTUELL live eingestellten
+// OpticalSettings (keine freie Texteingabe -- "was gerade eingestellt ist"
+// ist die einzig sinnvolle Quelle fuer eine frisch benannte Spitze) und
+// macht sie zur aktiven.
+void createTipFromCurrentSettings() {
+  MeasurementTip t;
+  t.name = nextTipName();
+  t.optical = currentSettings.optical;
+  tipCatalog.tips.push_back(t);
+  tipCatalog.active = t.name;
+  commitCurrentSettings();  // persistiert Katalog (und harmlos RootSettings erneut, siehe dort)
+}
+
+// Wendet die gespeicherten Filter-/Sensor-Werte einer Spitze an (Hardware +
+// RootSettings) und macht sie zur aktiven.
+void activateTip(const MeasurementTip& tip) {
+  currentSettings.optical = tip.optical;
+  sensorImpl.applySettings(currentSettings.optical);
+  tipCatalog.active = tip.name;
+  commitCurrentSettings();
+}
+
+// Nur fuer NICHT-aktive Spitzen erreichbar (siehe renderTipDetail()/loop()) --
+// kein Sonderfall fuer "letzte Spitze" noetig: die aktive Spitze kann gar
+// nicht geloescht werden, der Katalog wird dadurch nie leer (siehe Plan/Kontext).
+void deleteTip(size_t index) {
+  tipCatalog.tips.erase(tipCatalog.tips.begin() + index);
+  calStore.saveTips(tipCatalog);
 }
 
 // Bearbeitungszustand: solange editingActive, hijacken Trigger/Mode ihre
@@ -318,7 +395,7 @@ struct MeasurementContext {
   float tempC;
   uint32_t sessionMs;
   uint32_t uptimeS;
-  AcquisitionParameters settings;
+  OpticalSettings settings;
   // Messmodus + Praezisions-Telemetrie -- siehe MeasurementRecord-Kommentar
   // in HistoryStore.h. relSemWorst NAN = leer (kein relSEM berechnet), NICHT "0".
   Precision precision;
@@ -595,8 +672,8 @@ void renderReferenceStatus() {
   display.println(isWhite ? "Weiss-Referenz" : "Dunkel-Referenz");
 
   const Measurement& ref = isWhite ? whiteRef : darkRef;
-  const AcquisitionParameters& refSettings = isWhite ? whiteRefSettings : darkRefSettings;
-  bool refValid = !ref.empty() && (refSettings == currentSettings.toAcquisitionParameters());
+  const OpticalSettings& refSettings = isWhite ? whiteRefSettings : darkRefSettings;
+  bool refValid = !ref.empty() && (refSettings == currentSettings.optical);
 
   if (!refValid) {
     display.setCursor(0, 16);
@@ -694,11 +771,32 @@ void renderExportClear() {
 // grosser Wertetext darunter -- entweder im Browsing-Zustand (kein Cursor)
 // oder waehrend der Bearbeitung (aktive Ziffer/Option invertiert
 // dargestellt, siehe editingActive/editor).
+// Start-Index eines Scroll-Fensters von 'visible' Zeilen, das 'selected'
+// innerhalb von [0, count) moeglichst mittig zeigt (klemmt an den Raendern
+// der Liste). Gemeinsam genutzt von renderSettingsStatus() (Baum-Navigation)
+// und renderTipList() (Messspitzen-Liste).
+uint8_t computeScrollStart(uint8_t selected, uint8_t count, uint8_t visible) {
+  if (count <= visible) return 0;
+  int start = (int)selected - visible / 2;
+  if (start < 0) start = 0;
+  if (start > (int)count - visible) start = (int)count - visible;
+  return (uint8_t)start;
+}
+
+// Vorwaertsdeklarationen: unten definiert (nach renderSettingsStatus(), naeher
+// an ihrem main.cpp-lokalen Messspitzen-Zustand), werden aber schon hier
+// gebraucht.
+void renderTipList();
+void renderTipDetail();
+
 void renderSettingsStatus() {
   if (!displayOk) return;
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(1);
+
+  if (tipMenuStage == TipMenuStage::List)   { renderTipList();   return; }
+  if (tipMenuStage == TipMenuStage::Detail) { renderTipDetail(); return; }
 
   if (editingActive) {
     // Ziffern-/Options-Bearbeitung eines Blatts -- UNVERAENDERT gegenueber
@@ -763,13 +861,7 @@ void renderSettingsStatus() {
   }
 
   const uint8_t VISIBLE_ROWS = 4;
-  uint8_t start = 0;
-  if (lvl.count > VISIBLE_ROWS) {
-    int centered = (int)lvl.index - VISIBLE_ROWS / 2;
-    if (centered < 0) centered = 0;
-    if (centered > (int)lvl.count - VISIBLE_ROWS) centered = (int)lvl.count - VISIBLE_ROWS;
-    start = (uint8_t)centered;
-  }
+  uint8_t start = computeScrollStart(lvl.index, lvl.count, VISIBLE_ROWS);
 
   int y = 16;
   for (uint8_t i = start; i < start + VISIBLE_ROWS && i < lvl.count; i++) {
@@ -781,7 +873,10 @@ void renderSettingsStatus() {
       else snprintf(val, sizeof(val), "%lu", (unsigned long)n.getValue());
       val[sizeof(val) - 1] = '\0';
       snprintf(line, sizeof(line), "%-10.10s%s", n.name, val);
-    } else if (n.kind == SettingsNodeKind::Branch) {
+    } else if (n.kind == SettingsNodeKind::Branch || n.kind == SettingsNodeKind::TipList) {
+      // Beide fuehren per langem Trigger-Druck eine Ebene tiefer (TipList in
+      // den Messspitzen-Unterfluss statt in den generischen Baum) -- optisch
+      // ununterscheidbar, ">" zeigt "fuehrt weiter".
       snprintf(line, sizeof(line), "%-10.10s>", n.name);
     } else {
       snprintf(line, sizeof(line), "%s", n.name);
@@ -803,6 +898,76 @@ void renderSettingsStatus() {
     display.print("v");
   }
 
+  display.display();
+}
+
+// Liste des Messspitzen-Menuepunkts: "<Zurueck>", "Neue Spitze anlegen",
+// dann alle Spitzen (aktive mit " AKTIV"-Suffix). Gleiches Scroll-Fenster wie
+// die generische Baum-Ansicht (siehe computeScrollStart()).
+void renderTipList() {
+  display.setCursor(0, 0);
+  display.println("Messspitzen");
+
+  uint8_t total = (uint8_t)(2 + tipCatalog.tips.size());
+  uint8_t start = computeScrollStart(tipListIndex, total, 4);
+
+  int y = 16;
+  for (uint8_t i = start; i < start + 4 && i < total; i++) {
+    char line[22];
+    if (i == 0) {
+      snprintf(line, sizeof(line), "<Zurueck>");
+    } else if (i == 1) {
+      snprintf(line, sizeof(line), "Neue Spitze anlegen");
+    } else {
+      const MeasurementTip& t = tipCatalog.tips[i - 2];
+      snprintf(line, sizeof(line), "%s%s", t.name.c_str(),
+               (t.name == tipCatalog.active) ? " AKTIV" : "");
+    }
+    display.setCursor(0, y);
+    display.print(i == tipListIndex ? "> " : "  ");
+    display.println(line);
+    y += 10;
+  }
+  if (start > 0) {
+    display.setCursor(122, 0);
+    display.print("^");
+  }
+  if (start + 4 < total) {
+    display.setCursor(122, 56);
+    display.print("v");
+  }
+
+  display.display();
+}
+
+// Detail-Menue einer einzelnen Spitze: Name (+ "AKTIV"-Hinweis), darunter die
+// verfuegbaren Aktionen -- "Aktivieren"/"Loeschen" nur fuer NICHT-aktive
+// Spitzen (siehe Plan/Kontext: die aktive Spitze kann nicht geloescht werden,
+// "Aktivieren" waere fuer sie ohnehin ein No-Op). Nie mehr als 3 Zeilen, kein
+// Scroll-Fenster noetig.
+void renderTipDetail() {
+  const MeasurementTip& tip = tipCatalog.tips[tipDetailIndex];
+  bool isActive = (tip.name == tipCatalog.active);
+
+  display.setCursor(0, 0);
+  display.println(tip.name.c_str());
+  if (isActive) {
+    display.setCursor(0, 10);
+    display.println("AKTIV");
+  }
+
+  static const char* const ACTIVE_ACTIONS[]   = { "<Zurueck>" };
+  static const char* const INACTIVE_ACTIONS[] = { "<Zurueck>", "Aktivieren", "Loeschen" };
+  const char* const* actions = isActive ? ACTIVE_ACTIONS : INACTIVE_ACTIONS;
+  uint8_t count = isActive ? 1 : 3;
+
+  int y = 24;
+  for (uint8_t i = 0; i < count; i++) {
+    display.setCursor(0, y);
+    display.print(i == tipActionIndex ? "> " : "  ");
+    display.println(actions[i]);
+    y += 10;
+  }
   display.display();
 }
 
@@ -866,7 +1031,7 @@ void renderCurrentView() {
   // gespeichert ist). In diesem Fall daher gegen currentSettings pruefen (die
   // eigentlich relevante Frage: "waere eine JETZT gestartete Messung gueltig
   // kalibriert").
-  const AcquisitionParameters calCheckSettings = lastMeasurement.empty() ? currentSettings.toAcquisitionParameters() : lastMeasurementSettings;
+  const OpticalSettings calCheckSettings = lastMeasurement.empty() ? currentSettings.optical : lastMeasurementSettings;
   bool haveMatchingCal = calibrationValidFor(calCheckSettings);
   static const Measurement emptyRef;
   const Measurement& effDark  = haveMatchingCal ? darkRef  : emptyRef;
@@ -988,7 +1153,7 @@ bool performMeasurement(Precision precision, SampleKind kind) {
     return false;
   }
   lastMeasurement = measurement;
-  lastMeasurementSettings = currentSettings.toAcquisitionParameters();
+  lastMeasurementSettings = currentSettings.optical;
 
   // Vor der Beschriftung inkrementieren: die Sample-Nummer ist der neue,
   // lebenslange Zaehlerstand -- so laufen die Nummern ueber Reboots/Sessions
@@ -1021,7 +1186,7 @@ bool performMeasurement(Precision precision, SampleKind kind) {
   rec.tempC = temperatureRead();
   rec.sessionMs = millis();
   rec.uptimeS = uptimeLogger.totalSeconds();
-  rec.settings = currentSettings.toAcquisitionParameters();
+  rec.settings = currentSettings.optical;
   rec.precision = precision;
   rec.sampleCount = telemetry.sampleCount;
   rec.relSemWorst = telemetry.relSemWorst;
@@ -1031,15 +1196,15 @@ bool performMeasurement(Precision precision, SampleKind kind) {
 
   if (kind == SampleKind::Dark) {
     darkRef = measurement;
-    darkRefSettings = currentSettings.toAcquisitionParameters();  // Einstellungen zum Aufnahmezeitpunkt einfrieren
+    darkRefSettings = currentSettings.optical;  // Einstellungen zum Aufnahmezeitpunkt einfrieren
     calStore.saveDark(darkRef, darkRefSettings);
   }
   if (kind == SampleKind::White) {
     whiteRef = measurement;
-    whiteRefSettings = currentSettings.toAcquisitionParameters();
+    whiteRefSettings = currentSettings.optical;
     calStore.saveWhite(whiteRef, whiteRefSettings);
   }
-  calibrated = calibrationValidFor(currentSettings.toAcquisitionParameters());
+  calibrated = calibrationValidFor(currentSettings.optical);
 
   printCsvRow(rec);
 
@@ -1114,6 +1279,19 @@ void cycleView() {
     return;
   }
   if (currentDisplayMode == DisplayMode::Settings) {
+    if (tipMenuStage == TipMenuStage::List) {
+      uint8_t total = (uint8_t)(2 + tipCatalog.tips.size());
+      tipListIndex = (tipListIndex + 1) % total;
+      renderCurrentView();
+      return;
+    }
+    if (tipMenuStage == TipMenuStage::Detail) {
+      bool isActive = (tipCatalog.tips[tipDetailIndex].name == tipCatalog.active);
+      uint8_t total = isActive ? 1 : 3;  // aktiv: nur <Zurueck>; sonst: <Zurueck>/Aktivieren/Loeschen
+      tipActionIndex = (tipActionIndex + 1) % total;
+      renderCurrentView();
+      return;
+    }
     SettingsLevel& lvl = settingsStack[settingsDepth];
     lvl.index = (lvl.index + 1) % lvl.count;
     renderCurrentView();
@@ -1168,6 +1346,7 @@ void cycleMode() {
     // man steigt beim naechsten Eintritt also immer wieder neu ein.
     settingsDepth = 0;
     settingsStack[0] = { SETTINGS_ROOT, sizeof(SETTINGS_ROOT) / sizeof(SETTINGS_ROOT[0]), 0 };
+    tipMenuStage = TipMenuStage::Closed;
   }
   if (currentDisplayMode == DisplayMode::Calibration && previous != DisplayMode::Calibration) {
     // Gleiche Ueberlegung -- nicht unbemerkt auf "Dark" landen.
@@ -1234,7 +1413,14 @@ void setup() {
   calStore.loadDark(darkRef, darkRefSettings);
   calStore.loadWhite(whiteRef, whiteRefSettings);
   calStore.loadSettings(currentSettings);
-  calibrated = calibrationValidFor(currentSettings.toAcquisitionParameters());
+  calibrated = calibrationValidFor(currentSettings.optical);
+
+  // Katalog nie leer, siehe TipCatalog.h -- beim allerersten Boot (oder falls
+  // das gespeicherte JSON ungueltig ist) gibt es noch keine Spitze: legt
+  // "Messspitze 1" mit den gerade geladenen/Default-Einstellungen an.
+  if (!calStore.loadTips(tipCatalog)) {
+    createTipFromCurrentSettings();
+  }
 
   uptimeLogger.begin();
   historyStore.begin();  // nicht fatal bei Fehlschlag -- Kernfunktion laeuft ohne Historie weiter
@@ -1249,7 +1435,7 @@ void setup() {
     Serial.println("# AS7341 not found");
     while (true) delay(1000);
   }
-  sensorImpl.applySettings(currentSettings.toAcquisitionParameters());  // Hardware von Anfang an zum geladenen Zustand passend
+  sensorImpl.applySettings(currentSettings.optical);  // Hardware von Anfang an zum geladenen Zustand passend
 
   // Ersetzt den "startet ..."-Text von oben, sobald alles initialisiert ist --
   // currentDisplayMode/measurePage stehen bereits auf ihren Defaults
@@ -1314,11 +1500,45 @@ void loop() {
     // feuert dagegen nur beim Loslassen, und nur, wenn die Lang-Druck-
     // Schwelle waehrend des Haltens NICHT ueberschritten wurde (siehe
     // Buttons.h) -- exakt wie die Mode-Taste es bereits macht.
-    if (!editingActive) {
+    if (tipMenuStage == TipMenuStage::List) {
+      // "<Zurueck>" verlaesst den Messspitzen-Menuepunkt (zurueck in den
+      // generischen Baum, auf "Messspitzen" stehend); "Neue Spitze anlegen"
+      // registriert+aktiviert sofort; jeder andere Eintrag oeffnet das
+      // Detail-Menue der gewaehlten Spitze.
+      if (te == DebouncedButton::Event::LongPress) {
+        if (tipListIndex == 0) {
+          tipMenuStage = TipMenuStage::Closed;
+        } else if (tipListIndex == 1) {
+          createTipFromCurrentSettings();
+          tipListIndex = (uint8_t)(2 + tipCatalog.tips.size() - 1);  // Cursor auf die neue Spitze
+        } else {
+          tipDetailIndex = tipListIndex - 2;
+          tipActionIndex = 0;
+          tipMenuStage = TipMenuStage::Detail;
+        }
+        renderCurrentView();
+      }
+    } else if (tipMenuStage == TipMenuStage::Detail) {
+      if (te == DebouncedButton::Event::LongPress) {
+        const MeasurementTip& tip = tipCatalog.tips[tipDetailIndex];
+        bool isActive = (tip.name == tipCatalog.active);
+        if (tipActionIndex == 0) {
+          tipMenuStage = TipMenuStage::List;
+        } else if (!isActive && tipActionIndex == 1) {
+          activateTip(tip);
+          tipMenuStage = TipMenuStage::List;
+        } else if (!isActive && tipActionIndex == 2) {
+          deleteTip(tipDetailIndex);
+          tipListIndex = 0;
+          tipMenuStage = TipMenuStage::List;
+        }
+        renderCurrentView();
+      }
+    } else if (!editingActive) {
       // Ausserhalb einer Bearbeitung wirkt ein langer Trigger-Druck je nach
       // Knotenart unterschiedlich: "<Zurueck>" steigt eine Ebene auf,
       // ein Navigationsknoten eine Ebene ab, ein Blatt startet die Bearbeitung
-      // (wie zuvor).
+      // (wie zuvor), TipList oeffnet den Messspitzen-Menuepunkt.
       if (te == DebouncedButton::Event::LongPress) {
         const SettingsNode& s = currentSettingsNode();
         switch (s.kind) {
@@ -1336,6 +1556,11 @@ void loop() {
           case SettingsNodeKind::Leaf:
             editor.begin(s.digitCount, s.digitCycleLen, s.getValue());
             editingActive = true;
+            renderCurrentView();
+            break;
+          case SettingsNodeKind::TipList:
+            tipMenuStage = TipMenuStage::List;
+            tipListIndex = 0;
             renderCurrentView();
             break;
         }

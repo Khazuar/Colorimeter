@@ -20,16 +20,21 @@ void CalibrationStore::save(const char* key, const Measurement& v) {
   prefs_.putBytes(key, v.data(), v.size() * sizeof(float));
 }
 
-// Gemeinsames Lese-/Schreibpaar fuer die Felder, die sowohl RootSettings als
-// auch AcquisitionParameters heute haben (siehe AppConfig.h) -- damit die
-// JSON-Form nicht zweimal gepflegt werden muss. Enum-Werte werden als Strings
+// Gemeinsames Lese-/Schreibpaar fuer die Felder von OpticalSettings (siehe
+// AppConfig.h) -- genutzt sowohl fuer das "optical"-Unterobjekt von
+// RootSettings als auch fuer ein eigenstaendiges OpticalSettings-Dokument
+// (Dark-/Weiss-Referenzen) als auch fuer je ein "optical"-Unterobjekt pro
+// Messspitzen-Katalog-Eintrag -- damit die JSON-Form nicht mehrfach gepflegt
+// werden muss. Generisch auf JsonVariant/JsonVariantConst, damit sowohl ein
+// ganzes JsonDocument als auch ein einzelnes JsonObject (Array-Element,
+// Unterobjekt) als Ziel/Quelle dienen koennen. Enum-Werte werden als Strings
 // kodiert (siehe SettingsCodec.h), damit eine kuenftige Umsortierung/
 // Erweiterung des Enums nicht stillschweigend die Bedeutung eines bereits
 // gespeicherten Werts veraendert. Siehe schema/settings.schema.json fuer die
 // dokumentierte Form.
-static void writeAcquisitionFields(JsonDocument& doc, FilterState fs, const SensorSettings& sensor) {
-  doc["filter"] = filterStateCsvLabel(fs);
-  JsonObject sensorObj = doc["sensor"].to<JsonObject>();
+static void writeOpticalFields(JsonVariant target, FilterState fs, const SensorSettings& sensor) {
+  target["filter"] = filterStateCsvLabel(fs);
+  JsonObject sensorObj = target["sensor"].to<JsonObject>();
   sensorObj["gain"]  = gainCsvLabel(sensor.gain);
   sensorObj["atime"] = sensor.atime;
   sensorObj["astep"] = sensor.astep;
@@ -39,9 +44,9 @@ static void writeAcquisitionFields(JsonDocument& doc, FilterState fs, const Sens
 // Aufrufer faellt dann komplett auf den jeweiligen Struct-Default zurueck
 // (kein Mischzustand aus altem/neuem Wert), gleiche Philosophie wie zuvor die
 // binaere Groessen-Pruefung, jetzt nur feldweise statt "ganz oder gar nicht".
-static bool readAcquisitionFields(JsonDocument& doc, FilterState& fs, SensorSettings& sensor) {
-  bool ok = filterStateFromCsvLabel(doc["filter"] | "", fs);
-  JsonObjectConst sensorObj = doc["sensor"];
+static bool readOpticalFields(JsonVariantConst source, FilterState& fs, SensorSettings& sensor) {
+  bool ok = filterStateFromCsvLabel(source["filter"] | "", fs);
+  JsonObjectConst sensorObj = source["sensor"];
   ok = ok && gainFromCsvLabel(sensorObj["gain"] | "", sensor.gain);
   if (ok && sensorObj["atime"].is<uint8_t>())  sensor.atime = sensorObj["atime"].as<uint8_t>();   else ok = false;
   if (ok && sensorObj["astep"].is<uint16_t>()) sensor.astep = sensorObj["astep"].as<uint16_t>();  else ok = false;
@@ -50,8 +55,8 @@ static bool readAcquisitionFields(JsonDocument& doc, FilterState& fs, SensorSett
 
 static String serializeRootSettings(const RootSettings& s) {
   JsonDocument doc;
-  writeAcquisitionFields(doc, s.filterState, s.sensor);
-  // kuenftig: weitere RootSettings-Felder hier ergaenzen
+  writeOpticalFields(doc["optical"].to<JsonObject>(), s.optical.filterState, s.optical.sensor);
+  // kuenftig: weitere RootSettings-Gruppen hier als weitere Top-Level-Keys ergaenzen
   String out;
   serializeJson(doc, out);
   return out;
@@ -61,25 +66,64 @@ static bool deserializeRootSettings(const String& json, RootSettings& out) {
   RootSettings result;
   JsonDocument doc;
   bool ok = (deserializeJson(doc, json) == DeserializationError::Ok);
-  if (ok) ok = readAcquisitionFields(doc, result.filterState, result.sensor);
+  if (ok) ok = readOpticalFields(doc["optical"], result.optical.filterState, result.optical.sensor);
   out = ok ? result : RootSettings();
   return ok;
 }
 
-static String serializeAcquisitionParameters(const AcquisitionParameters& p) {
+static String serializeOpticalSettings(const OpticalSettings& s) {
   JsonDocument doc;
-  writeAcquisitionFields(doc, p.filterState, p.sensor);
+  writeOpticalFields(doc.to<JsonObject>(), s.filterState, s.sensor);
   String out;
   serializeJson(doc, out);
   return out;
 }
 
-static bool deserializeAcquisitionParameters(const String& json, AcquisitionParameters& out) {
-  AcquisitionParameters result;
+static bool deserializeOpticalSettings(const String& json, OpticalSettings& out) {
+  OpticalSettings result;
   JsonDocument doc;
   bool ok = (deserializeJson(doc, json) == DeserializationError::Ok);
-  if (ok) ok = readAcquisitionFields(doc, result.filterState, result.sensor);
-  out = ok ? result : AcquisitionParameters();
+  if (ok) ok = readOpticalFields(doc.as<JsonVariantConst>(), result.filterState, result.sensor);
+  out = ok ? result : OpticalSettings();
+  return ok;
+}
+
+static String serializeTipCatalog(const TipCatalog& c) {
+  JsonDocument doc;
+  doc["active"] = c.active.c_str();
+  JsonArray arr = doc["tips"].to<JsonArray>();
+  for (const MeasurementTip& t : c.tips) {
+    JsonObject o = arr.add<JsonObject>();
+    o["name"] = t.name.c_str();
+    writeOpticalFields(o["optical"].to<JsonObject>(), t.optical.filterState, t.optical.sensor);
+  }
+  String out;
+  serializeJson(doc, out);
+  return out;
+}
+
+// Ungueltig (-> false, Aufrufer faellt auf einen leeren Katalog zurueck), wenn
+// JSON kaputt ist, ODER die resultierende Liste leer waere, ODER 'active'
+// keinen der geladenen Eintraege trifft -- die Invariante "immer >=1 Spitze,
+// 'active' immer gueltig" wird hier durchgesetzt, nicht erst beim Zugriff.
+static bool deserializeTipCatalog(const String& json, TipCatalog& out) {
+  TipCatalog result;
+  JsonDocument doc;
+  bool ok = (deserializeJson(doc, json) == DeserializationError::Ok);
+  if (ok) {
+    result.active = (const char*)(doc["active"] | "");
+    for (JsonObject o : doc["tips"].as<JsonArray>()) {
+      MeasurementTip t;
+      t.name = (const char*)(o["name"] | "");
+      if (t.name.empty() || !readOpticalFields(o["optical"], t.optical.filterState, t.optical.sensor)) {
+        ok = false;
+        break;
+      }
+      result.tips.push_back(t);
+    }
+  }
+  ok = ok && !result.tips.empty() && result.find(result.active) != nullptr;
+  out = ok ? result : TipCatalog();
   return ok;
 }
 
@@ -89,32 +133,32 @@ static bool deserializeAcquisitionParameters(const String& json, AcquisitionPara
 // missinterpretiert zu werden. Keine Migration: nach dem Flashen dieser
 // Aenderung springen Einstellungen/Referenzen einmalig auf ihre Defaults
 // zurueck, genau wie bei einem Erstboot.
-bool CalibrationStore::loadDark(Measurement& out, AcquisitionParameters& params) {
+bool CalibrationStore::loadDark(Measurement& out, OpticalSettings& optical) {
   bool ok = load("dark_raw", out);
   if (ok) {
     String json = prefs_.getString("dark_settings_json", "");
-    if (json.isEmpty() || !deserializeAcquisitionParameters(json, params)) params = AcquisitionParameters();
+    if (json.isEmpty() || !deserializeOpticalSettings(json, optical)) optical = OpticalSettings();
   }
   return ok;
 }
 
-bool CalibrationStore::loadWhite(Measurement& out, AcquisitionParameters& params) {
+bool CalibrationStore::loadWhite(Measurement& out, OpticalSettings& optical) {
   bool ok = load("white_raw", out);
   if (ok) {
     String json = prefs_.getString("white_settings_json", "");
-    if (json.isEmpty() || !deserializeAcquisitionParameters(json, params)) params = AcquisitionParameters();
+    if (json.isEmpty() || !deserializeOpticalSettings(json, optical)) optical = OpticalSettings();
   }
   return ok;
 }
 
-void CalibrationStore::saveDark(const Measurement& v, const AcquisitionParameters& params) {
+void CalibrationStore::saveDark(const Measurement& v, const OpticalSettings& optical) {
   save("dark_raw", v);
-  prefs_.putString("dark_settings_json", serializeAcquisitionParameters(params));
+  prefs_.putString("dark_settings_json", serializeOpticalSettings(optical));
 }
 
-void CalibrationStore::saveWhite(const Measurement& v, const AcquisitionParameters& params) {
+void CalibrationStore::saveWhite(const Measurement& v, const OpticalSettings& optical) {
   save("white_raw", v);
-  prefs_.putString("white_settings_json", serializeAcquisitionParameters(params));
+  prefs_.putString("white_settings_json", serializeOpticalSettings(optical));
 }
 
 bool CalibrationStore::loadSettings(RootSettings& out) {
@@ -125,4 +169,14 @@ bool CalibrationStore::loadSettings(RootSettings& out) {
 
 void CalibrationStore::saveSettings(const RootSettings& v) {
   prefs_.putString("live_settings_json", serializeRootSettings(v));
+}
+
+bool CalibrationStore::loadTips(TipCatalog& out) {
+  String json = prefs_.getString("tips_json", "");
+  if (json.isEmpty()) { out = TipCatalog(); return false; }
+  return deserializeTipCatalog(json, out);
+}
+
+void CalibrationStore::saveTips(const TipCatalog& v) {
+  prefs_.putString("tips_json", serializeTipCatalog(v));
 }

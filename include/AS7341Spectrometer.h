@@ -25,7 +25,7 @@ public:
   // im Gegensatz zu begin() (das nur einmal beim Boot laeuft). Wird von der
   // Orchestrierung (main.cpp) sowohl beim Start (geladene Einstellungen)
   // als auch bei jeder Aenderung im Settings-Modus aufgerufen.
-  void applySettings(const AcquisitionParameters& settings);
+  void applySettings(const OpticalSettings& settings);
 
   Measurement performMeasurement(Precision precision,
                                   ProgressCallback onProgress = nullptr,

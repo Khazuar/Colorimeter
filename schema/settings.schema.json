@@ -1,36 +1,44 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Settings",
-  "$comment": "Beschreibt RootSettings (include/AppConfig.h, main.cpp::currentSettings) -- die persistierte 'live'-Konfiguration und die Wurzel des Settings-Baums in der Geraete-UI. Wird auf dem Geraet selbst nicht genutzt (reine Dokumentation/Vorbereitung fuer einen spaeteren Host-seitigen Import/Export). Struct und diese Datei muessen von Hand zusammen gepflegt werden, es gibt keine automatische Generierung/Pruefung. Die Dark-/Weiss-Referenz-Snapshots (AcquisitionParameters, main.cpp darkRefSettings/whiteRefSettings) serialisieren zufaellig zur selben Form, sind aber ein eigenstaendiger Typ ohne eigenes Schema -- siehe Kommentar an AcquisitionParameters in AppConfig.h.",
+  "$comment": "Beschreibt RootSettings (include/AppConfig.h, main.cpp::currentSettings) -- die persistierte 'live'-Konfiguration und die Wurzel des Settings-Baums in der Geraete-UI. Gruppiert aktuell 'optical' (OpticalSettings) als einzige thematische Gruppe; kuenftige, andersartige Einstellungen (z.B. Sprache, Bluetooth-Name) kommen als weitere Top-Level-Properties dazu, nicht in 'optical' hinein. Wird auf dem Geraet selbst nicht genutzt (reine Dokumentation/Vorbereitung fuer einen spaeteren Host-seitigen Import/Export). Struct und diese Datei muessen von Hand zusammen gepflegt werden, es gibt keine automatische Generierung/Pruefung. Siehe schema/tips.schema.json fuer den (separaten) Messspitzen-Katalog, dessen Eintraege dieselbe OpticalSettings-Form unter 'optical' tragen.",
   "type": "object",
   "properties": {
-    "filter": {
-      "type": "string",
-      "enum": ["none", "650nm", "700nm"]
-    },
-    "sensor": {
+    "optical": {
       "type": "object",
-      "title": "SensorSettings",
+      "title": "OpticalSettings",
       "properties": {
-        "gain": {
+        "filter": {
           "type": "string",
-          "enum": ["0.5X", "1X", "2X", "4X", "8X", "16X", "32X", "64X", "128X", "256X", "512X"]
+          "enum": ["none", "650nm", "700nm"]
         },
-        "atime": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 255
-        },
-        "astep": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 65535
+        "sensor": {
+          "type": "object",
+          "title": "SensorSettings",
+          "properties": {
+            "gain": {
+              "type": "string",
+              "enum": ["0.5X", "1X", "2X", "4X", "8X", "16X", "32X", "64X", "128X", "256X", "512X"]
+            },
+            "atime": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 255
+            },
+            "astep": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 65535
+            }
+          },
+          "required": ["gain", "atime", "astep"],
+          "additionalProperties": false
         }
       },
-      "required": ["gain", "atime", "astep"],
+      "required": ["filter", "sensor"],
       "additionalProperties": false
     }
   },
-  "required": ["filter", "sensor"],
+  "required": ["optical"],
   "additionalProperties": false
 }

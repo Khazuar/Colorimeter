@@ -1,7 +1,7 @@
 #pragma once
 #include <Adafruit_AS7341.h>
 #include <cstdint>
-#include "Spectrometer.h"  // FilterState (Teil von RootSettings/AcquisitionParameters, siehe unten)
+#include "Spectrometer.h"  // FilterState (Teil von OpticalSettings, siehe unten)
 
 // ------------------------- I2C / Bus -------------------------
 static const uint8_t  SDA_PIN = 6;
@@ -69,9 +69,9 @@ enum class SampleKind : uint8_t { Regular = 0, Dark = 1, White = 2, COUNT = 3 };
 static const uint8_t AS7341_GAIN_COUNT = 11;
 
 // Gain/ATIME/ASTEP als Block -- siehe schema/settings.schema.json ("sensor").
-// Wird UNVERAENDERT als Ganzes sowohl in RootSettings als auch in
-// AcquisitionParameters verwendet (siehe deren Kommentare unten). AS_ATIME/
-// AS_ASTEP/AS_GAIN dienen hier nur noch als Startwerte fuer den allerersten Boot.
+// Wird UNVERAENDERT als Ganzes als Teil von OpticalSettings verwendet (siehe
+// dort). AS_ATIME/AS_ASTEP/AS_GAIN dienen hier nur noch als Startwerte fuer
+// den allerersten Boot.
 struct SensorSettings {
   as7341_gain_t gain = AS_GAIN;
   uint8_t atime = AS_ATIME;
@@ -82,56 +82,39 @@ struct SensorSettings {
   bool operator!=(const SensorSettings& o) const { return !(*this == o); }
 };
 
-struct AcquisitionParameters;  // fwd, siehe unten
+// Alle Einstellungen, die den optischen Pfad des Geraets betreffen (Filter +
+// Sensor-Tuning) -- eine ECHTE thematische Gruppe (nicht nur zufaellig gleich
+// geformt wie RootSettings::optical, siehe dort). Wird UNVERAENDERT als
+// Ganzes an AS7341Spectrometer::applySettings()/main.cpp::calibrationValidFor()
+// uebergeben, pro Messung/Referenz eingefroren (siehe
+// HistoryStore::MeasurementRecord::settings, main.cpp darkRefSettings/
+// whiteRefSettings -- das sind Snapshots "womit wurde das gemessen") UND ist
+// genau das, was jede Messspitze im Katalog speichert (main.cpp/TipCatalog.h)
+// -- eine Spitze ist im Kern "ein benannter OpticalSettings-Stand". Selbst
+// KEIN Einstellungs-Knoten -- wird nie selbst editiert oder im Settings-Baum
+// navigiert, siehe RootSettings unten dafuer. Siehe schema/settings.schema.json
+// ("optical").
+struct OpticalSettings {
+  FilterState filterState = FilterState::None;
+  SensorSettings sensor;
+  bool operator==(const OpticalSettings& o) const {
+    return filterState == o.filterState && sensor == o.sensor;
+  }
+  bool operator!=(const OpticalSettings& o) const { return !(*this == o); }
+};
 
 // Die tatsaechliche Einstellungs-Hierarchie: UI-Baum-Wurzel UND das, was als
 // EIN JSON-Dokument persistiert wird (CalibrationStore::save/loadSettings()).
 // Siehe schema/settings.schema.json ("Settings") -- BEIDE (dieses Struct und
-// die Schema-Datei) bei Aenderungen zusammen pflegen. filterState bleibt
-// bewusst ein eigenstaendiges Geschwisterfeld statt Teil von SensorSettings
-// (fuer Filter gibt es eigene Plaene). Kuenftige, nicht Aufnahme-bezogene
-// Einstellungen werden hier als weitere Geschwisterfelder ergaenzt -- NICHT in
-// AcquisitionParameters (das ist kein Einstellungs-Knoten, siehe dort).
+// die Schema-Datei) bei Aenderungen zusammen pflegen. Gruppiert aktuell genau
+// eine thematische Gruppe (optical); kuenftige, andersartige Einstellungen
+// (z.B. Sprache, Bluetooth-Name) werden hier als weitere, EIGENE
+// Geschwisterfelder ergaenzt -- NICHT in optical hineingemischt.
 struct RootSettings {
-  FilterState filterState = FilterState::None;
-  SensorSettings sensor;
-  bool operator==(const RootSettings& o) const {
-    return filterState == o.filterState && sensor == o.sensor;
-  }
+  OpticalSettings optical;
+  bool operator==(const RootSettings& o) const { return optical == o.optical; }
   bool operator!=(const RootSettings& o) const { return !(*this == o); }
-
-  // Bewusst eine kleine Kopiermethode statt Cast/Vererbung -- macht explizit,
-  // dass hier ein purpose-cut Parameter-Buendel aus dem aktuellen
-  // Einstellungsstand HERAUSKOPIERT wird, kein struktureller Zusammenhang.
-  AcquisitionParameters toAcquisitionParameters() const;
 };
-
-// KEIN Einstellungs-Knoten -- ein reines Parameter-Buendel fuer
-// AS7341Spectrometer::applySettings()/main.cpp::calibrationValidFor(), das
-// lange, sich wiederholende Parameterlisten vermeidet. Wird nie selbst
-// editiert oder im Settings-Baum navigiert, sondern aus
-// RootSettings::toAcquisitionParameters() heraus zusammenkopiert bzw. pro
-// Messung/Referenz eingefroren (siehe HistoryStore::MeasurementRecord::settings,
-// main.cpp darkRefSettings/whiteRefSettings) -- das sind Snapshots "womit wurde
-// das gemessen", keine Einstellungen im Sinne der Baum-Hierarchie. Hat
-// zufaellig heute dieselben Felder wie RootSettings (weil aktuell
-// ausschliesslich Aufnahme-relevante Einstellungen existieren) -- das ist
-// keine strukturelle Garantie.
-struct AcquisitionParameters {
-  FilterState filterState = FilterState::None;
-  SensorSettings sensor;
-  bool operator==(const AcquisitionParameters& o) const {
-    return filterState == o.filterState && sensor == o.sensor;
-  }
-  bool operator!=(const AcquisitionParameters& o) const { return !(*this == o); }
-};
-
-inline AcquisitionParameters RootSettings::toAcquisitionParameters() const {
-  AcquisitionParameters p;
-  p.filterState = filterState;
-  p.sensor = sensor;
-  return p;
-}
 
 // BLE-Export (Nordic UART Service) -- Geraetename ist app-weit relevant (main.cpp
 // startet/stoppt BleExporter damit); Chunk-Groesse/MTU/Delays bleiben rein interne

@@ -16,7 +16,7 @@ bool AS7341Spectrometer::begin() {
   return as7341_.begin();
 }
 
-void AS7341Spectrometer::applySettings(const AcquisitionParameters& settings) {
+void AS7341Spectrometer::applySettings(const OpticalSettings& settings) {
   as7341_.setATIME(settings.sensor.atime);
   as7341_.setASTEP(settings.sensor.astep);
   as7341_.setGain(settings.sensor.gain);
