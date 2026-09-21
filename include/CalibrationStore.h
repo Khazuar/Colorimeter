@@ -4,8 +4,11 @@
 #include "AppConfig.h"
 
 // Duenner NVS-Wrapper fuer die Dunkel-/Weiss-Kalibrierung UND die
-// Aufnahme-Einstellungen (Filter/Gain/ATIME/ASTEP). Gehoert der
-// Orchestrierung (main.cpp) -- der Spectrometer selbst fasst kein Flash an.
+// Einstellungs-Hierarchie (RootSettings). Gehoert der Orchestrierung
+// (main.cpp) -- der Spectrometer selbst fasst kein Flash an. Persistiert
+// jeweils als JSON-String (siehe CalibrationStore.cpp und
+// schema/settings.schema.json) statt als Binaer-Blob -- robust gegenueber
+// hinzukommenden/fehlenden Feldern, Enum-Werte als Strings statt Zahlen-Index.
 // Groesse der Rohwerte wird aus dem gespeicherten Blob selbst ermittelt
 // (getBytesLength), die Orchestrierung muss also keine sensorspezifische
 // Kanalanzahl kennen.
@@ -13,21 +16,23 @@ class CalibrationStore {
 public:
   void begin();  // prefs_.begin("colorim", false)
 
-  // false, falls nie gespeichert (out bleibt dann leer, settings unveraendert)
-  bool loadDark(Measurement& out, AcquisitionSettings& settings);
-  bool loadWhite(Measurement& out, AcquisitionSettings& settings);
+  // false, falls nie gespeichert ODER JSON nicht lesbar (out/params fallen
+  // dann auf ihre Defaults zurueck).
+  bool loadDark(Measurement& out, AcquisitionParameters& params);
+  bool loadWhite(Measurement& out, AcquisitionParameters& params);
 
-  // settings wird zusammen mit den Rohwerten gespeichert -- Referenz und ihre
-  // Aufnahme-Einstellungen gehoeren untrennbar zusammen (siehe
+  // params wird zusammen mit den Rohwerten gespeichert -- Referenz und die
+  // bei ihrer Aufnahme aktiven Parameter gehoeren untrennbar zusammen (siehe
   // main.cpp::calibrationValidFor()).
-  void saveDark(const Measurement& v, const AcquisitionSettings& settings);
-  void saveWhite(const Measurement& v, const AcquisitionSettings& settings);
+  void saveDark(const Measurement& v, const AcquisitionParameters& params);
+  void saveWhite(const Measurement& v, const AcquisitionParameters& params);
 
-  // Die aktuell im Settings-Modus gewaehlten Einstellungen -- unabhaengig
-  // davon, was gerade als Dark/White-Referenz kalibriert ist. false, falls
-  // nie gespeichert (out faellt dann auf die AcquisitionSettings-Defaults zurueck).
-  bool loadSettings(AcquisitionSettings& out);
-  void saveSettings(const AcquisitionSettings& v);
+  // Die vollstaendige, aktuell im Settings-Baum gewaehlte Konfiguration --
+  // unabhaengig davon, was gerade als Dark/White-Referenz kalibriert ist.
+  // false, falls nie gespeichert ODER JSON nicht lesbar (out faellt dann auf
+  // die RootSettings-Defaults zurueck).
+  bool loadSettings(RootSettings& out);
+  void saveSettings(const RootSettings& v);
 
 private:
   bool load(const char* key, Measurement& out);

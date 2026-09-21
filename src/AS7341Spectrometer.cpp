@@ -16,10 +16,10 @@ bool AS7341Spectrometer::begin() {
   return as7341_.begin();
 }
 
-void AS7341Spectrometer::applySettings(const AcquisitionSettings& settings) {
-  as7341_.setATIME(settings.atime);
-  as7341_.setASTEP(settings.astep);
-  as7341_.setGain(settings.gain);
+void AS7341Spectrometer::applySettings(const AcquisitionParameters& settings) {
+  as7341_.setATIME(settings.sensor.atime);
+  as7341_.setASTEP(settings.sensor.astep);
+  as7341_.setGain(settings.sensor.gain);
 }
 
 // Alle Konstanten hier sind ein bewusst einfacher Startpunkt, keine fertig

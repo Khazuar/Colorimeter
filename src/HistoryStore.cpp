@@ -50,13 +50,13 @@ static bool parseLine(const std::string& line, MeasurementRecord& rec) {
   if (!nextField(field)) return false;
   int gainNum = atoi(field.c_str());
   if (gainNum < 0 || gainNum >= static_cast<int>(AS7341_GAIN_COUNT)) return false;
-  rec.settings.gain = static_cast<as7341_gain_t>(gainNum);
+  rec.settings.sensor.gain = static_cast<as7341_gain_t>(gainNum);
 
   if (!nextField(field)) return false;
-  rec.settings.atime = static_cast<uint8_t>(strtoul(field.c_str(), nullptr, 10));
+  rec.settings.sensor.atime = static_cast<uint8_t>(strtoul(field.c_str(), nullptr, 10));
 
   if (!nextField(field)) return false;
-  rec.settings.astep = static_cast<uint16_t>(strtoul(field.c_str(), nullptr, 10));
+  rec.settings.sensor.astep = static_cast<uint16_t>(strtoul(field.c_str(), nullptr, 10));
 
   if (!nextField(field)) return false;
   int precisionNum = atoi(field.c_str());
@@ -115,11 +115,11 @@ bool HistoryStore::append(const MeasurementRecord& rec) {
   f.print(',');
   f.print((int)rec.settings.filterState);
   f.print(',');
-  f.print((int)rec.settings.gain);
+  f.print((int)rec.settings.sensor.gain);
   f.print(',');
-  f.print(rec.settings.atime);
+  f.print(rec.settings.sensor.atime);
   f.print(',');
-  f.print(rec.settings.astep);
+  f.print(rec.settings.sensor.astep);
   f.print(',');
   f.print((int)rec.precision);
   f.print(',');

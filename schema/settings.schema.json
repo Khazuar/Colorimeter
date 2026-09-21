@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Settings",
+  "$comment": "Beschreibt RootSettings (include/AppConfig.h, main.cpp::currentSettings) -- die persistierte 'live'-Konfiguration und die Wurzel des Settings-Baums in der Geraete-UI. Wird auf dem Geraet selbst nicht genutzt (reine Dokumentation/Vorbereitung fuer einen spaeteren Host-seitigen Import/Export). Struct und diese Datei muessen von Hand zusammen gepflegt werden, es gibt keine automatische Generierung/Pruefung. Die Dark-/Weiss-Referenz-Snapshots (AcquisitionParameters, main.cpp darkRefSettings/whiteRefSettings) serialisieren zufaellig zur selben Form, sind aber ein eigenstaendiger Typ ohne eigenes Schema -- siehe Kommentar an AcquisitionParameters in AppConfig.h.",
+  "type": "object",
+  "properties": {
+    "filter": {
+      "type": "string",
+      "enum": ["none", "650nm", "700nm"]
+    },
+    "sensor": {
+      "type": "object",
+      "title": "SensorSettings",
+      "properties": {
+        "gain": {
+          "type": "string",
+          "enum": ["0.5X", "1X", "2X", "4X", "8X", "16X", "32X", "64X", "128X", "256X", "512X"]
+        },
+        "atime": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "astep": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        }
+      },
+      "required": ["gain", "atime", "astep"],
+      "additionalProperties": false
+    }
+  },
+  "required": ["filter", "sensor"],
+  "additionalProperties": false
+}

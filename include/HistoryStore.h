@@ -15,7 +15,7 @@ struct MeasurementRecord {
   float tempC = 0.0f;         // ESP32-interner Temperatursensor, Grad Celsius
   uint32_t sessionMs = 0;     // millis() zum Messzeitpunkt (Laufzeit seit diesem Boot)
   uint32_t uptimeS = 0;       // UptimeLogger::totalSeconds() zum Messzeitpunkt (LED-Alter, lebenslang)
-  AcquisitionSettings settings;  // Filter/Gain/ATIME/ASTEP zum Messzeitpunkt
+  AcquisitionParameters settings;  // Filter/Gain/ATIME/ASTEP zum Messzeitpunkt
 
   // Messmodus + Praezisions-Telemetrie (siehe Spectrometer.h::MeasurementTelemetry).
   // sampleCount ist bei Precision::Single immer 1. relSemWorst ist NAN, wenn

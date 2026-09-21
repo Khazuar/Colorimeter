@@ -10,6 +10,7 @@
 #include "AppConfig.h"
 #include "Spectrometer.h"
 #include "AS7341Spectrometer.h"
+#include "SettingsCodec.h"
 #include "CalibrationStore.h"
 #include "Buttons.h"
 #include "DisplayViews.h"
@@ -30,21 +31,22 @@ Spectrometer& spectrometer = sensorImpl;
 // ------------------------- Kalibrierung: Sache der Orchestrierung -------------------------
 CalibrationStore calStore;
 Measurement darkRef, whiteRef;
-AcquisitionSettings darkRefSettings;   // eingefroren MIT darkRef, siehe CalibrationStore
-AcquisitionSettings whiteRefSettings;  // eingefroren MIT whiteRef
+AcquisitionParameters darkRefSettings;   // eingefroren MIT darkRef, siehe CalibrationStore
+AcquisitionParameters whiteRefSettings;  // eingefroren MIT whiteRef
 bool calibrated = false;  // "Referenz passt zu den AKTUELL gewaehlten Einstellungen" -- siehe calibrationValidFor()
 
-// Aktuell im Settings-Modus gewaehlte Einstellungen (siehe DisplayMode::Settings).
-AcquisitionSettings currentSettings;
+// Aktuell im Settings-Baum gewaehlte Einstellungs-Hierarchie (siehe
+// DisplayMode::Settings sowie RootSettings/AcquisitionParameters in AppConfig.h).
+RootSettings currentSettings;
 
 // Liefert true, wenn sowohl Dark- als auch White-Referenz vorhanden sind UND
-// beide unter GENAU dem angegebenen Einstellungs-Buendel (Filter+Gain+ATIME+
+// beide unter GENAU dem angegebenen Parameter-Buendel (Filter+Gain+ATIME+
 // ASTEP) aufgenommen wurden. Zentrale Stelle fuer die Regel "weicht auch nur
 // eine Einstellung ab, gilt die Referenz als nicht vorhanden" -- wird fuer die
 // Live-Anzeige (gegen lastMeasurementSettings), den globalen "ready/need cal"-
-// Status (gegen currentSettings) UND den CSV-Export (gegen rec.settings jeder
-// Zeile) gleichermassen benutzt.
-bool calibrationValidFor(const AcquisitionSettings& s) {
+// Status (gegen currentSettings.toAcquisitionParameters()) UND den CSV-Export
+// (gegen rec.settings jeder Zeile) gleichermassen benutzt.
+bool calibrationValidFor(const AcquisitionParameters& s) {
   return !darkRef.empty() && !whiteRef.empty()
       && darkRefSettings == s && whiteRefSettings == s;
 }
@@ -59,7 +61,7 @@ char lastLabel[16] = "";
 // waren -- eingefroren, NICHT die live im Settings-Modus editierbaren
 // currentSettings (siehe renderCurrentView() fuer die Begruendung dieser
 // Asymmetrie).
-AcquisitionSettings lastMeasurementSettings;
+AcquisitionParameters lastMeasurementSettings;
 bool busy = false;  // waehrend true: keine weitere Messung/kein weiterer Export ausloesbar
 
 DisplayMode currentDisplayMode = DisplayMode::Measure;
@@ -151,22 +153,10 @@ const char* filterStateUiLabel(FilterState fs) {
     default:                       return "kein Filter";
   }
 }
-const char* filterStateCsvLabel(FilterState fs) {
-  switch (fs) {
-    case FilterState::Filter650nm: return "650nm";
-    case FilterState::Filter700nm: return "700nm";
-    default:                       return "none";
-  }
-}
-
-// Reihenfolge == as7341_gain_t (siehe Adafruit_AS7341.h), verifiziert.
-static const char* const GAIN_LABELS[AS7341_GAIN_COUNT] = {
-  "0.5X", "1X", "2X", "4X", "8X", "16X", "32X", "64X", "128X", "256X", "512X"
-};
-const char* gainCsvLabel(as7341_gain_t g) {
-  uint8_t i = static_cast<uint8_t>(g);
-  return (i < AS7341_GAIN_COUNT) ? GAIN_LABELS[i] : "?";
-}
+// filterStateCsvLabel()/gainCsvLabel() (fuer CSV-Export UND die neuen
+// Settings-Baumknoten-Labels) wohnen jetzt in SettingsCodec.h/.cpp -- dieselbe
+// Quelle, die auch die JSON-Persistenz (CalibrationStore.cpp) nutzt, damit
+// beide niemals auseinanderlaufen.
 
 // "single"/"precision" -- wortwoertlich wie vom Nutzer benannt, statt der
 // internen Enum-Namen Single/Precise.
@@ -174,14 +164,29 @@ const char* precisionCsvLabel(Precision p) {
   return (p == Precision::Precise) ? "precision" : "single";
 }
 
-struct SettingDescriptor {
+// Settings sind eine beliebig tief verschachtelbare Baumstruktur (siehe Plan)
+// statt einer flachen Liste -- deren Form folgt RootSettings/AppConfig.h.
+// Ein Knoten ist entweder ein Blatt (editierbarer Wert, wie bisher
+// SettingDescriptor), ein Navigationsknoten (fuehrt per langem Trigger-Druck
+// eine Ebene tiefer) oder der fiktive "<Zurueck>"-Eintrag (fuehrt eine Ebene
+// hoeher). Ein Knoten traegt IMMER alle Felder, auch wenn nur ein Teil je
+// nach 'kind' benutzt wird -- gleiche Pragmatik wie zuvor bei
+// SettingDescriptor (dort war z.B. valueLabel nur bei digitCount==1 belegt).
+enum class SettingsNodeKind : uint8_t { Leaf, Branch, Back };
+
+struct SettingsNode {
   const char* name;
+  SettingsNodeKind kind;
+  // Leaf:
   uint8_t digitCount;                             // 1 = enum-artig (Filter, Gain)
   uint8_t digitCycleLen[DigitEditor::MAX_DIGITS];  // Zyklus-Laenge je Ziffernposition
   uint32_t maxValue;                               // Clamp des Endwerts (siehe DigitEditor::assembledValue())
   const char* (*valueLabel)(uint32_t value);       // nur bei digitCount==1, sonst nullptr (Ziffern direkt gerendert)
   uint32_t (*getValue)();
   void (*setValue)(uint32_t value);                // einmalig beim Abschluss der Bearbeitung aufgerufen
+  // Branch:
+  const SettingsNode* children;
+  uint8_t childCount;
 };
 
 // Gemeinsamer Abschluss fuer jede Einstellungsaenderung: persistieren +
@@ -189,7 +194,7 @@ struct SettingDescriptor {
 // kippen, ganz ohne neue Messung).
 void commitCurrentSettings() {
   calStore.saveSettings(currentSettings);
-  calibrated = calibrationValidFor(currentSettings);
+  calibrated = calibrationValidFor(currentSettings.toAcquisitionParameters());
 }
 
 const char* filterSettingLabel(uint32_t v) { return filterStateUiLabel(static_cast<FilterState>(v)); }
@@ -199,38 +204,65 @@ void setFilterSetting(uint32_t v) {
   commitCurrentSettings();
 }
 
-const char* gainSettingLabel(uint32_t v) { return (v < AS7341_GAIN_COUNT) ? GAIN_LABELS[v] : "?"; }
-uint32_t getGainSetting() { return static_cast<uint32_t>(currentSettings.gain); }
+const char* gainSettingLabel(uint32_t v) { return gainCsvLabel(static_cast<as7341_gain_t>(v)); }
+uint32_t getGainSetting() { return static_cast<uint32_t>(currentSettings.sensor.gain); }
 void setGainSetting(uint32_t v) {
-  currentSettings.gain = static_cast<as7341_gain_t>(v);
-  sensorImpl.applySettings(currentSettings);
+  currentSettings.sensor.gain = static_cast<as7341_gain_t>(v);
+  sensorImpl.applySettings(currentSettings.toAcquisitionParameters());
   commitCurrentSettings();
 }
 
-uint32_t getATimeSetting() { return currentSettings.atime; }
+uint32_t getATimeSetting() { return currentSettings.sensor.atime; }
 void setATimeSetting(uint32_t v) {
-  currentSettings.atime = static_cast<uint8_t>(v);
-  sensorImpl.applySettings(currentSettings);
+  currentSettings.sensor.atime = static_cast<uint8_t>(v);
+  sensorImpl.applySettings(currentSettings.toAcquisitionParameters());
   commitCurrentSettings();
 }
 
-uint32_t getAStepSetting() { return currentSettings.astep; }
+uint32_t getAStepSetting() { return currentSettings.sensor.astep; }
 void setAStepSetting(uint32_t v) {
-  currentSettings.astep = static_cast<uint16_t>(v);
-  sensorImpl.applySettings(currentSettings);
+  currentSettings.sensor.astep = static_cast<uint16_t>(v);
+  sensorImpl.applySettings(currentSettings.toAcquisitionParameters());
   commitCurrentSettings();
 }
 
-const SettingDescriptor SETTINGS[] = {
-  { "Filter", 1, {3},           2,     filterSettingLabel, getFilterSetting, setFilterSetting },
-  { "Gain",   1, {AS7341_GAIN_COUNT}, AS7341_GAIN_COUNT - 1, gainSettingLabel, getGainSetting, setGainSetting },
+// Kinder von "Sensor-Einst." -- "<Zurueck>" ist bewusst der erste Eintrag
+// (siehe Plan). Nur Leaf-Felder gesetzt, Branch-Felder (children/childCount)
+// bleiben 0/nullptr -- unbenutzt fuer Leaf/Back.
+const SettingsNode SETTINGS_SENSOR[] = {
+  { "<Zurueck>", SettingsNodeKind::Back },
+  { "Gain",  SettingsNodeKind::Leaf, 1, {AS7341_GAIN_COUNT}, AS7341_GAIN_COUNT - 1, gainSettingLabel, getGainSetting, setGainSetting },
   // ATIME (uint8_t, max 255): 3 Dezimalstellen, fuehrende Ziffer 0-2.
-  { "ATIME",  3, {3, 10, 10},   255,   nullptr, getATimeSetting, setATimeSetting },
+  { "ATIME", SettingsNodeKind::Leaf, 3, {3, 10, 10},         255,                  nullptr,          getATimeSetting, setATimeSetting },
   // ASTEP (uint16_t, max 65535): 5 Dezimalstellen, fuehrende Ziffer 0-6.
-  { "ASTEP",  5, {7, 10, 10, 10, 10}, 65535, nullptr, getAStepSetting, setAStepSetting },
+  { "ASTEP", SettingsNodeKind::Leaf, 5, {7, 10, 10, 10, 10}, 65535,                nullptr,          getAStepSetting, setAStepSetting },
 };
-const uint8_t SETTINGS_COUNT = sizeof(SETTINGS) / sizeof(SETTINGS[0]);
-uint8_t currentSettingIndex = 0;
+
+// Wurzel des Settings-Baums. Filter bleibt als eigenstaendiges Blatt an der
+// Wurzel (siehe RootSettings-Kommentar in AppConfig.h); Gain/ATIME/ASTEP
+// haengen als SensorSettings-Block darunter.
+const SettingsNode SETTINGS_ROOT[] = {
+  { "Filter",        SettingsNodeKind::Leaf,   1, {3}, 2, filterSettingLabel, getFilterSetting, setFilterSetting },
+  { "Sensor-Einst.", SettingsNodeKind::Branch, 0, {},  0, nullptr, nullptr, nullptr,
+    SETTINGS_SENSOR, sizeof(SETTINGS_SENSOR) / sizeof(SETTINGS_SENSOR[0]) },
+};
+
+// Navigations-Zustand im Settings-Baum: ein kleiner, fest dimensionierter
+// Stack aus (Geschwisterliste, deren Laenge, aktueller Cursor). Der Cursor
+// einer Ebene bleibt beim Abstieg unangetastet stehen -- zeigt also beim
+// spaeteren Aufstieg (Depth--) automatisch wieder auf genau den Branch-
+// Eintrag, von dem aus abgestiegen wurde, ganz ohne zusaetzliche Buchhaltung.
+struct SettingsLevel { const SettingsNode* nodes; uint8_t count; uint8_t index; };
+static const uint8_t SETTINGS_TREE_MAX_DEPTH = 4;  // Wurzel + 3 Ebenen Reserve fuer Kuenftiges
+SettingsLevel settingsStack[SETTINGS_TREE_MAX_DEPTH] = {
+  { SETTINGS_ROOT, sizeof(SETTINGS_ROOT) / sizeof(SETTINGS_ROOT[0]), 0 }
+};
+uint8_t settingsDepth = 0;  // 0 == Wurzel -- kein "<Zurueck>" dort (siehe Plan/Kontext)
+
+const SettingsNode& currentSettingsNode() {
+  const SettingsLevel& lvl = settingsStack[settingsDepth];
+  return lvl.nodes[lvl.index];
+}
 
 // Bearbeitungszustand: solange editingActive, hijacken Trigger/Mode ihre
 // sonstige Bedeutung (Messen/Moduswechsel) zugunsten der Ziffernbearbeitung
@@ -286,7 +318,7 @@ struct MeasurementContext {
   float tempC;
   uint32_t sessionMs;
   uint32_t uptimeS;
-  AcquisitionSettings settings;
+  AcquisitionParameters settings;
   // Messmodus + Praezisions-Telemetrie -- siehe MeasurementRecord-Kommentar
   // in HistoryStore.h. relSemWorst NAN = leer (kein relSEM berechnet), NICHT "0".
   Precision precision;
@@ -324,9 +356,9 @@ void appendCsvRow(std::string& out, const char* label, const Measurement& measur
     out += ',';
     out += filterStateCsvLabel(ctx->settings.filterState);
     out += ',';
-    out += gainCsvLabel(ctx->settings.gain);
-    snprintf(buf, sizeof(buf), ",%u", ctx->settings.atime); out += buf;
-    snprintf(buf, sizeof(buf), ",%u", ctx->settings.astep); out += buf;
+    out += gainCsvLabel(ctx->settings.sensor.gain);
+    snprintf(buf, sizeof(buf), ",%u", ctx->settings.sensor.atime); out += buf;
+    snprintf(buf, sizeof(buf), ",%u", ctx->settings.sensor.astep); out += buf;
     out += ',';
     out += precisionCsvLabel(ctx->precision);
     snprintf(buf, sizeof(buf), ",%u", ctx->sampleCount); out += buf;
@@ -563,8 +595,8 @@ void renderReferenceStatus() {
   display.println(isWhite ? "Weiss-Referenz" : "Dunkel-Referenz");
 
   const Measurement& ref = isWhite ? whiteRef : darkRef;
-  const AcquisitionSettings& refSettings = isWhite ? whiteRefSettings : darkRefSettings;
-  bool refValid = !ref.empty() && (refSettings == currentSettings);
+  const AcquisitionParameters& refSettings = isWhite ? whiteRefSettings : darkRefSettings;
+  bool refValid = !ref.empty() && (refSettings == currentSettings.toAcquisitionParameters());
 
   if (!refValid) {
     display.setCursor(0, 16);
@@ -668,55 +700,107 @@ void renderSettingsStatus() {
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(1);
 
-  display.setCursor(0, 0);
-  display.println("Einstellungen");
+  if (editingActive) {
+    // Ziffern-/Options-Bearbeitung eines Blatts -- UNVERAENDERT gegenueber
+    // der frueheren flachen Liste, liest nur den aktuellen Knoten jetzt aus
+    // dem Baum statt aus SETTINGS[currentSettingIndex].
+    const SettingsNode& s = currentSettingsNode();
+    display.setCursor(0, 0);
+    display.println("Einstellungen");
+    display.setCursor(0, 20);
+    display.print(s.name);
+    display.println(":");
 
-  const SettingDescriptor& s = SETTINGS[currentSettingIndex];
-  display.setCursor(0, 20);
-  display.print(s.name);
-  display.println(":");
-
-  display.setTextSize(2);
-
-  if (!editingActive) {
-    display.setCursor(0, 34);
-    if (s.valueLabel) {
-      display.println(s.valueLabel(s.getValue()));
+    display.setTextSize(2);
+    if (s.digitCount == 1) {
+      // Enum-artig: die einzige "Ziffer" ist der ganze Optionswert -- als
+      // Ganzes invertiert darstellen (nur eine Position, immer aktiv).
+      const char* label = s.valueLabel(editor.digitAt(0));
+      int16_t x1, y1;
+      uint16_t w, h;
+      display.getTextBounds(label, 0, 34, &x1, &y1, &w, &h);
+      display.fillRect(0, 34, w + 4, h + 4, SSD1306_WHITE);
+      display.setTextColor(SSD1306_BLACK);
+      display.setCursor(2, 36);
+      display.println(label);
+      display.setTextColor(SSD1306_WHITE);
     } else {
-      char buf[8];
-      snprintf(buf, sizeof(buf), "%lu", (unsigned long)s.getValue());
-      display.println(buf);
-    }
-  } else if (s.digitCount == 1) {
-    // Enum-artig: die einzige "Ziffer" ist der ganze Optionswert -- als
-    // Ganzes invertiert darstellen (nur eine Position, immer aktiv).
-    const char* label = s.valueLabel(editor.digitAt(0));
-    int16_t x1, y1;
-    uint16_t w, h;
-    display.getTextBounds(label, 0, 34, &x1, &y1, &w, &h);
-    display.fillRect(0, 34, w + 4, h + 4, SSD1306_WHITE);
-    display.setTextColor(SSD1306_BLACK);
-    display.setCursor(2, 36);
-    display.println(label);
-    display.setTextColor(SSD1306_WHITE);
-  } else {
-    // Mehrstellig: jede Ziffer einzeln zeichnen, die am Cursor invertiert.
-    const int digitW = 14;
-    int x = 0;
-    for (uint8_t i = 0; i < editor.digitCount(); i++) {
-      char ch[2] = { (char)('0' + editor.digitAt(i)), '\0' };
-      if (i == editor.cursor()) {
-        display.fillRect(x, 34, digitW, 18, SSD1306_WHITE);
-        display.setTextColor(SSD1306_BLACK);
-        display.setCursor(x + 3, 36);
-        display.print(ch);
-        display.setTextColor(SSD1306_WHITE);
-      } else {
-        display.setCursor(x + 3, 36);
-        display.print(ch);
+      // Mehrstellig: jede Ziffer einzeln zeichnen, die am Cursor invertiert.
+      const int digitW = 14;
+      int x = 0;
+      for (uint8_t i = 0; i < editor.digitCount(); i++) {
+        char ch[2] = { (char)('0' + editor.digitAt(i)), '\0' };
+        if (i == editor.cursor()) {
+          display.fillRect(x, 34, digitW, 18, SSD1306_WHITE);
+          display.setTextColor(SSD1306_BLACK);
+          display.setCursor(x + 3, 36);
+          display.print(ch);
+          display.setTextColor(SSD1306_WHITE);
+        } else {
+          display.setCursor(x + 3, 36);
+          display.print(ch);
+        }
+        x += digitW;
       }
-      x += digitW;
     }
+    display.display();
+    return;
+  }
+
+  // Baum-Navigation (nicht editierend): Liste aller Geschwister der aktuellen
+  // Ebene mit ">"-Cursor. Titel ist "Einstellungen" an der Wurzel, sonst der
+  // Name des Branch-Knotens, aus dem abgestiegen wurde (Breadcrumb). Passen
+  // nicht alle Geschwister aufs Display, haelt ein Scroll-Fenster von
+  // VISIBLE_ROWS Zeilen den Cursor moeglichst mittig (klemmt an den Raendern
+  // der Liste an deren Anfang/Ende).
+  const SettingsLevel& lvl = settingsStack[settingsDepth];
+  display.setCursor(0, 0);
+  if (settingsDepth == 0) {
+    display.println("Einstellungen");
+  } else {
+    const SettingsLevel& parent = settingsStack[settingsDepth - 1];
+    display.println(parent.nodes[parent.index].name);
+  }
+
+  const uint8_t VISIBLE_ROWS = 4;
+  uint8_t start = 0;
+  if (lvl.count > VISIBLE_ROWS) {
+    int centered = (int)lvl.index - VISIBLE_ROWS / 2;
+    if (centered < 0) centered = 0;
+    if (centered > (int)lvl.count - VISIBLE_ROWS) centered = (int)lvl.count - VISIBLE_ROWS;
+    start = (uint8_t)centered;
+  }
+
+  int y = 16;
+  for (uint8_t i = start; i < start + VISIBLE_ROWS && i < lvl.count; i++) {
+    const SettingsNode& n = lvl.nodes[i];
+    char line[22];
+    if (n.kind == SettingsNodeKind::Leaf) {
+      char val[10];
+      if (n.valueLabel) strncpy(val, n.valueLabel(n.getValue()), sizeof(val));
+      else snprintf(val, sizeof(val), "%lu", (unsigned long)n.getValue());
+      val[sizeof(val) - 1] = '\0';
+      snprintf(line, sizeof(line), "%-10.10s%s", n.name, val);
+    } else if (n.kind == SettingsNodeKind::Branch) {
+      snprintf(line, sizeof(line), "%-10.10s>", n.name);
+    } else {
+      snprintf(line, sizeof(line), "%s", n.name);
+    }
+    display.setCursor(0, y);
+    display.print(i == lvl.index ? "> " : "  ");
+    display.println(line);
+    y += 10;
+  }
+  // Kleiner Scroll-Hinweis, nur falls tatsaechlich mehr Geschwister ausserhalb
+  // des Fensters liegen -- oben rechts neben dem Titel, unten rechts unter
+  // der letzten Zeile (dort ueberschneidungsfrei, siehe Layout oben).
+  if (start > 0) {
+    display.setCursor(122, 0);
+    display.print("^");
+  }
+  if (start + VISIBLE_ROWS < lvl.count) {
+    display.setCursor(122, 56);
+    display.print("v");
   }
 
   display.display();
@@ -782,7 +866,7 @@ void renderCurrentView() {
   // gespeichert ist). In diesem Fall daher gegen currentSettings pruefen (die
   // eigentlich relevante Frage: "waere eine JETZT gestartete Messung gueltig
   // kalibriert").
-  const AcquisitionSettings& calCheckSettings = lastMeasurement.empty() ? currentSettings : lastMeasurementSettings;
+  const AcquisitionParameters calCheckSettings = lastMeasurement.empty() ? currentSettings.toAcquisitionParameters() : lastMeasurementSettings;
   bool haveMatchingCal = calibrationValidFor(calCheckSettings);
   static const Measurement emptyRef;
   const Measurement& effDark  = haveMatchingCal ? darkRef  : emptyRef;
@@ -904,7 +988,7 @@ bool performMeasurement(Precision precision, SampleKind kind) {
     return false;
   }
   lastMeasurement = measurement;
-  lastMeasurementSettings = currentSettings;
+  lastMeasurementSettings = currentSettings.toAcquisitionParameters();
 
   // Vor der Beschriftung inkrementieren: die Sample-Nummer ist der neue,
   // lebenslange Zaehlerstand -- so laufen die Nummern ueber Reboots/Sessions
@@ -937,7 +1021,7 @@ bool performMeasurement(Precision precision, SampleKind kind) {
   rec.tempC = temperatureRead();
   rec.sessionMs = millis();
   rec.uptimeS = uptimeLogger.totalSeconds();
-  rec.settings = currentSettings;
+  rec.settings = currentSettings.toAcquisitionParameters();
   rec.precision = precision;
   rec.sampleCount = telemetry.sampleCount;
   rec.relSemWorst = telemetry.relSemWorst;
@@ -947,15 +1031,15 @@ bool performMeasurement(Precision precision, SampleKind kind) {
 
   if (kind == SampleKind::Dark) {
     darkRef = measurement;
-    darkRefSettings = currentSettings;  // Einstellungen zum Aufnahmezeitpunkt einfrieren
+    darkRefSettings = currentSettings.toAcquisitionParameters();  // Einstellungen zum Aufnahmezeitpunkt einfrieren
     calStore.saveDark(darkRef, darkRefSettings);
   }
   if (kind == SampleKind::White) {
     whiteRef = measurement;
-    whiteRefSettings = currentSettings;
+    whiteRefSettings = currentSettings.toAcquisitionParameters();
     calStore.saveWhite(whiteRef, whiteRefSettings);
   }
-  calibrated = calibrationValidFor(currentSettings);
+  calibrated = calibrationValidFor(currentSettings.toAcquisitionParameters());
 
   printCsvRow(rec);
 
@@ -1030,7 +1114,8 @@ void cycleView() {
     return;
   }
   if (currentDisplayMode == DisplayMode::Settings) {
-    currentSettingIndex = (currentSettingIndex + 1) % SETTINGS_COUNT;
+    SettingsLevel& lvl = settingsStack[settingsDepth];
+    lvl.index = (lvl.index + 1) % lvl.count;
     renderCurrentView();
     return;
   }
@@ -1078,8 +1163,11 @@ void cycleMode() {
     exportPage = ExportPage::Normal;
   }
   if (currentDisplayMode == DisplayMode::Settings && previous != DisplayMode::Settings) {
-    // Gleiche Ueberlegung wie bei exportPage oben.
-    currentSettingIndex = 0;
+    // Gleiche Ueberlegung wie bei exportPage oben, jetzt auf den ganzen Baum
+    // bezogen: Position immer auf die Wurzel zuruecksetzen (siehe Plan) --
+    // man steigt beim naechsten Eintritt also immer wieder neu ein.
+    settingsDepth = 0;
+    settingsStack[0] = { SETTINGS_ROOT, sizeof(SETTINGS_ROOT) / sizeof(SETTINGS_ROOT[0]), 0 };
   }
   if (currentDisplayMode == DisplayMode::Calibration && previous != DisplayMode::Calibration) {
     // Gleiche Ueberlegung -- nicht unbemerkt auf "Dark" landen.
@@ -1146,7 +1234,7 @@ void setup() {
   calStore.loadDark(darkRef, darkRefSettings);
   calStore.loadWhite(whiteRef, whiteRefSettings);
   calStore.loadSettings(currentSettings);
-  calibrated = calibrationValidFor(currentSettings);
+  calibrated = calibrationValidFor(currentSettings.toAcquisitionParameters());
 
   uptimeLogger.begin();
   historyStore.begin();  // nicht fatal bei Fehlschlag -- Kernfunktion laeuft ohne Historie weiter
@@ -1161,7 +1249,7 @@ void setup() {
     Serial.println("# AS7341 not found");
     while (true) delay(1000);
   }
-  sensorImpl.applySettings(currentSettings);  // Hardware von Anfang an zum geladenen Zustand passend
+  sensorImpl.applySettings(currentSettings.toAcquisitionParameters());  // Hardware von Anfang an zum geladenen Zustand passend
 
   // Ersetzt den "startet ..."-Text von oben, sobald alles initialisiert ist --
   // currentDisplayMode/measurePage stehen bereits auf ihren Defaults
@@ -1226,17 +1314,37 @@ void loop() {
     // feuert dagegen nur beim Loslassen, und nur, wenn die Lang-Druck-
     // Schwelle waehrend des Haltens NICHT ueberschritten wurde (siehe
     // Buttons.h) -- exakt wie die Mode-Taste es bereits macht.
-    const SettingDescriptor& s = SETTINGS[currentSettingIndex];
     if (!editingActive) {
+      // Ausserhalb einer Bearbeitung wirkt ein langer Trigger-Druck je nach
+      // Knotenart unterschiedlich: "<Zurueck>" steigt eine Ebene auf,
+      // ein Navigationsknoten eine Ebene ab, ein Blatt startet die Bearbeitung
+      // (wie zuvor).
       if (te == DebouncedButton::Event::LongPress) {
-        editor.begin(s.digitCount, s.digitCycleLen, s.getValue());
-        editingActive = true;
-        renderCurrentView();
+        const SettingsNode& s = currentSettingsNode();
+        switch (s.kind) {
+          case SettingsNodeKind::Back:
+            if (settingsDepth > 0) settingsDepth--;
+            renderCurrentView();
+            break;
+          case SettingsNodeKind::Branch:
+            if (settingsDepth + 1 < SETTINGS_TREE_MAX_DEPTH) {
+              settingsDepth++;
+              settingsStack[settingsDepth] = { s.children, s.childCount, 0 };
+            }
+            renderCurrentView();
+            break;
+          case SettingsNodeKind::Leaf:
+            editor.begin(s.digitCount, s.digitCycleLen, s.getValue());
+            editingActive = true;
+            renderCurrentView();
+            break;
+        }
       }
     } else if (te == DebouncedButton::Event::ShortRelease) {
       editor.incrementCurrentDigit();
       renderCurrentView();
     } else if (te == DebouncedButton::Event::LongPress) {
+      const SettingsNode& s = currentSettingsNode();
       if (editor.advanceDigit()) {  // true = letzte Ziffer ueberschritten -> fertig
         s.setValue(editor.assembledValue(s.maxValue));
         editingActive = false;
@@ -1276,7 +1384,7 @@ void loop() {
   // (View/Modus wechseln) ist so lange blockiert.
   DebouncedButton::Event me = modeBtn.poll();
   if (currentDisplayMode == DisplayMode::Settings && editingActive) {
-    const SettingDescriptor& s = SETTINGS[currentSettingIndex];
+    const SettingsNode& s = currentSettingsNode();
     if (me == DebouncedButton::Event::ShortRelease) {
       editor.decrementCurrentDigit();
       renderCurrentView();
