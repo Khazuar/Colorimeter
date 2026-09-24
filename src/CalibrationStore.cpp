@@ -117,6 +117,7 @@ static bool deserializeOpticalSettings(const String& json, OpticalSettings& out)
 static void serializeTipCatalog(const TipCatalog& c, Print& out) {
   JsonDocument doc;
   doc["active"] = c.active.c_str();
+  doc["whiteReferenceGeneration"] = c.whiteReferenceGeneration;
   JsonArray arr = doc["tips"].to<JsonArray>();
   for (const MeasurementTip& t : c.tips) {
     JsonObject o = arr.add<JsonObject>();
@@ -126,6 +127,7 @@ static void serializeTipCatalog(const TipCatalog& c, Print& out) {
     for (const WhiteFingerprint& fp : t.whiteFingerprints) {
       JsonObject fpObj = fps.add<JsonObject>();
       fpObj["uptimeS"] = fp.uptimeS;
+      fpObj["generation"] = fp.generation;
       writeSensorFields(fpObj["sensor"].to<JsonObject>(), fp.sensor);
       JsonArray vals = fpObj["values"].to<JsonArray>();
       for (float v : fp.normalized) vals.add(v);
@@ -144,6 +146,7 @@ static bool deserializeTipCatalog(Stream& in, TipCatalog& out) {
   bool ok = (deserializeJson(doc, in) == DeserializationError::Ok);
   if (ok) {
     result.active = (const char*)(doc["active"] | "");
+    result.whiteReferenceGeneration = doc["whiteReferenceGeneration"] | 0;
     for (JsonObject o : doc["tips"].as<JsonArray>()) {
       MeasurementTip t;
       t.name = (const char*)(o["name"] | "");
@@ -161,6 +164,7 @@ static bool deserializeTipCatalog(Stream& in, TipCatalog& out) {
           if (!fpObj["values"].is<JsonArray>()) continue;
           WhiteFingerprint fp;
           fp.uptimeS = fpObj["uptimeS"] | 0;
+          fp.generation = fpObj["generation"] | 0;
           if (!readSensorFields(fpObj["sensor"], fp.sensor)) continue;
           for (JsonVariant v : fpObj["values"].as<JsonArray>()) fp.normalized.push_back(v.as<float>());
           t.whiteFingerprints.push_back(fp);

@@ -10,9 +10,13 @@
 // Asymmetrie wie AppConfig.h::RootSettings vs. main.cpp::lastMeasurementSettings)
 // fuer spaetere Ausreisser-Diagnose (z.B. "war der Gain hier ungewoehnlich
 // niedrig" statt vorschnell auf eine physische Veraenderung der Spitze zu
-// schliessen).
+// schliessen) + der zum Messzeitpunkt gueltige Stand von
+// TipCatalog::whiteReferenceGeneration (siehe dort) -- damit spaeter erkennbar
+// ist, ob dieser Fingerabdruck noch mit der AKTUELL benutzten physischen
+// Weissreferenz vergleichbar ist oder von einer frueheren stammt.
 struct WhiteFingerprint {
   uint32_t uptimeS = 0;
+  uint32_t generation = 0;
   SensorSettings sensor;
   Measurement normalized;
 };
@@ -44,6 +48,17 @@ struct MeasurementTip {
 struct TipCatalog {
   std::string active;
   std::vector<MeasurementTip> tips;
+
+  // Erhoeht sich NUR ueber die UI-Aktion "Fingerabdruecke invalidieren" (siehe
+  // main.cpp::invalidateFingerprints()) -- z.B. wenn das physische
+  // Weissreferenz-Material gewechselt wird und dadurch ALLE bisherigen
+  // Fingerabdruecke (ueber alle Spitzen hinweg, deshalb hier am Katalog statt
+  // je Spitze) nicht mehr mit kuenftigen vergleichbar sind. Ein
+  // WhiteFingerprint mit einem KLEINEREN gespeicherten generation-Wert als
+  // dieser hier gilt als veraltet. Reine Datengrundlage -- die eigentliche
+  // Erkennung/Reaktion auf veraltete Fingerabdruecke ist bewusst noch nicht
+  // Teil dieses Schritts.
+  uint32_t whiteReferenceGeneration = 0;
 
   MeasurementTip* find(const std::string& name) {
     for (auto& t : tips) if (t.name == name) return &t;

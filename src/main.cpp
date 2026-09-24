@@ -299,7 +299,10 @@ const SettingsNode& currentSettingsNode() {
 // generische Baum wird dann normal gezeigt/bedient).
 enum class TipMenuStage : uint8_t { Closed, List, Detail };
 TipMenuStage tipMenuStage = TipMenuStage::Closed;
-uint8_t tipListIndex = 0;    // 0 = <Zurueck>, 1 = "Neue Spitze anlegen", 2.. = tips[index-2]
+// 0 = <Zurueck>, 1 = "Neue Spitze anlegen", 2 = "Fingerabdruecke
+// invalidieren", TIP_LIST_FIXED_ENTRIES.. = tips[index-TIP_LIST_FIXED_ENTRIES].
+static const uint8_t TIP_LIST_FIXED_ENTRIES = 3;
+uint8_t tipListIndex = 0;
 size_t  tipDetailIndex = 0;  // welcher Tip (Index in tipCatalog.tips) wird im Detail-Screen gezeigt
 uint8_t tipActionIndex = 0;  // Cursor in der Aktionsliste des Detail-Screens (siehe renderTipDetail())
 
@@ -350,12 +353,25 @@ void deleteTip(size_t index) {
 void addWhiteFingerprint(MeasurementTip& tip, const Measurement& raw, const OpticalSettings& settings) {
   WhiteFingerprint fp;
   fp.uptimeS = uptimeLogger.totalSeconds();
+  fp.generation = tipCatalog.whiteReferenceGeneration;
   fp.sensor = settings.sensor;
   fp.normalized = spectrometer.normalize(raw, settings.sensor);
   if (tip.whiteFingerprints.size() >= MAX_WHITE_FINGERPRINTS_PER_TIP) {
     tip.whiteFingerprints.erase(tip.whiteFingerprints.begin());  // aeltester zuerst raus
   }
   tip.whiteFingerprints.push_back(fp);
+}
+
+// "Fingerabdruecke invalidieren" (Messspitzen-Liste) -- z.B. wenn das
+// physische Weissreferenz-Material gewechselt wird und dadurch alle
+// bisherigen Fingerabdruecke nicht mehr mit neuen vergleichbar sind. Erhoeht
+// NUR den globalen Generations-Zaehler, OHNE bestehende Fingerabdruecke zu
+// loeschen -- neue tragen ab jetzt den neuen Stand, bestehende bleiben bei
+// ihrem alten und sind dadurch spaeter als veraltet erkennbar (siehe
+// TipCatalog.h).
+void invalidateFingerprints() {
+  tipCatalog.whiteReferenceGeneration++;
+  calStore.saveTips(tipCatalog);
 }
 
 // Bearbeitungszustand: solange editingActive, hijacken Trigger/Mode ihre
@@ -919,13 +935,14 @@ void renderSettingsStatus() {
 }
 
 // Liste des Messspitzen-Menuepunkts: "<Zurueck>", "Neue Spitze anlegen",
-// dann alle Spitzen (aktive mit " AKTIV"-Suffix). Gleiches Scroll-Fenster wie
-// die generische Baum-Ansicht (siehe computeScrollStart()).
+// "Fingerabdruecke invalidieren", dann alle Spitzen (aktive mit " AKTIV"-
+// Suffix). Gleiches Scroll-Fenster wie die generische Baum-Ansicht (siehe
+// computeScrollStart()).
 void renderTipList() {
   display.setCursor(0, 0);
   display.println("Messspitzen");
 
-  uint8_t total = (uint8_t)(2 + tipCatalog.tips.size());
+  uint8_t total = (uint8_t)(TIP_LIST_FIXED_ENTRIES + tipCatalog.tips.size());
   uint8_t start = computeScrollStart(tipListIndex, total, 4);
 
   int y = 16;
@@ -935,8 +952,10 @@ void renderTipList() {
       snprintf(line, sizeof(line), "<Zurueck>");
     } else if (i == 1) {
       snprintf(line, sizeof(line), "Neue Spitze anlegen");
+    } else if (i == 2) {
+      snprintf(line, sizeof(line), "Fingerabdr. invalid");
     } else {
-      const MeasurementTip& t = tipCatalog.tips[i - 2];
+      const MeasurementTip& t = tipCatalog.tips[i - TIP_LIST_FIXED_ENTRIES];
       snprintf(line, sizeof(line), "%s%s", t.name.c_str(),
                (t.name == tipCatalog.active) ? " AKTIV" : "");
     }
@@ -1355,7 +1374,7 @@ void cycleView() {
   }
   if (currentDisplayMode == DisplayMode::Settings) {
     if (tipMenuStage == TipMenuStage::List) {
-      uint8_t total = (uint8_t)(2 + tipCatalog.tips.size());
+      uint8_t total = (uint8_t)(TIP_LIST_FIXED_ENTRIES + tipCatalog.tips.size());
       tipListIndex = (tipListIndex + 1) % total;
       renderCurrentView();
       return;
@@ -1578,16 +1597,19 @@ void loop() {
     if (tipMenuStage == TipMenuStage::List) {
       // "<Zurueck>" verlaesst den Messspitzen-Menuepunkt (zurueck in den
       // generischen Baum, auf "Messspitzen" stehend); "Neue Spitze anlegen"
-      // registriert+aktiviert sofort; jeder andere Eintrag oeffnet das
+      // registriert+aktiviert sofort; "Fingerabdruecke invalidieren" erhoeht
+      // den Generations-Zaehler sofort; jeder andere Eintrag oeffnet das
       // Detail-Menue der gewaehlten Spitze.
       if (te == DebouncedButton::Event::LongPress) {
         if (tipListIndex == 0) {
           tipMenuStage = TipMenuStage::Closed;
         } else if (tipListIndex == 1) {
           createTipFromCurrentSettings();
-          tipListIndex = (uint8_t)(2 + tipCatalog.tips.size() - 1);  // Cursor auf die neue Spitze
+          tipListIndex = (uint8_t)(TIP_LIST_FIXED_ENTRIES + tipCatalog.tips.size() - 1);  // Cursor auf die neue Spitze
+        } else if (tipListIndex == 2) {
+          invalidateFingerprints();
         } else {
-          tipDetailIndex = tipListIndex - 2;
+          tipDetailIndex = tipListIndex - TIP_LIST_FIXED_ENTRIES;
           tipActionIndex = 0;
           tipMenuStage = TipMenuStage::Detail;
         }
