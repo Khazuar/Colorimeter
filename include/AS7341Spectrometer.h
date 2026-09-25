@@ -39,6 +39,7 @@ public:
                                   ProgressCallback onProgress = nullptr,
                                   MeasurementTelemetry* outTelemetry = nullptr) override;
   const char* const* measurementLabels() const override { return MEASUREMENT_LABELS; }
+  const char* sensorId() const override { return "AS7341"; }
   Spectrum getSpectrum(const Measurement& measurement,
                         const Measurement& whiteReference,
                         const Measurement& darkReference,

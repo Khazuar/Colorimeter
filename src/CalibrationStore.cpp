@@ -128,6 +128,7 @@ static void serializeTipCatalog(const TipCatalog& c, Print& out) {
       JsonObject fpObj = fps.add<JsonObject>();
       fpObj["uptimeS"] = fp.uptimeS;
       fpObj["generation"] = fp.generation;
+      fpObj["sensorId"] = fp.sensorId.c_str();
       writeSensorFields(fpObj["sensor"].to<JsonObject>(), fp.sensor);
       JsonArray vals = fpObj["values"].to<JsonArray>();
       for (float v : fp.normalized) vals.add(v);
@@ -165,6 +166,7 @@ static bool deserializeTipCatalog(Stream& in, TipCatalog& out) {
           WhiteFingerprint fp;
           fp.uptimeS = fpObj["uptimeS"] | 0;
           fp.generation = fpObj["generation"] | 0;
+          fp.sensorId = (const char*)(fpObj["sensorId"] | "");
           if (!readSensorFields(fpObj["sensor"], fp.sensor)) continue;
           for (JsonVariant v : fpObj["values"].as<JsonArray>()) fp.normalized.push_back(v.as<float>());
           t.whiteFingerprints.push_back(fp);

@@ -134,6 +134,17 @@ public:
   // einzig zur menschenlesbaren Beschriftung beim Debug-Export gedacht.
   virtual const char* const* measurementLabels() const = 0;
 
+  // Kurzer, stabiler Bezeichner des Sensortyps (z.B. "AS7341") -- NUR als
+  // Vergleichsschluessel gedacht (siehe TipCatalog.h::WhiteFingerprint), NICHT
+  // zur Anzeige. Zwei WhiteFingerprint-Werte sind nur dann sinnvoll
+  // vergleichbar, wenn ihre sensorId uebereinstimmt (ein reiner
+  // Laengenvergleich der Measurement-Vektoren waere keine echte Garantie,
+  // siehe MeasurementTip::isPlausible()). Muss fuer einen gegebenen Sensor
+  // ZEITLOS stabil bleiben -- eine spaetere Aenderung wuerde bestehende
+  // Fingerabdruecke stillschweigend unvergleichbar mit neuen machen (kein
+  // Datenverlust, sie werden dann einfach nie wieder herangezogen).
+  virtual const char* sensorId() const = 0;
+
   // Reine Berechnung: baut ein sensor-unabhaengiges Spectrum aus einer
   // Messung plus Weiss-/Dunkelreferenzmessung (gleiches Measurement-Format).
   // Kein Hardwarezugriff, keine gespeicherte Kalibrierung -- jeder Aufruf ist

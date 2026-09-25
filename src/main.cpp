@@ -294,10 +294,12 @@ const SettingsNode& currentSettingsNode() {
 
 // ------------------------- Messspitzen-Unterfluss -------------------------
 // Eigener kleiner Zustand statt Teil des generischen Baum-Stacks (siehe
-// SettingsNodeKind::TipList-Kommentar oben) -- nur 2 Ebenen, kein eigener
+// SettingsNodeKind::TipList-Kommentar oben) -- nur 3 Ebenen, kein eigener
 // Stack noetig. Closed = wir sind NICHT im Messspitzen-Menuepunkt (der
-// generische Baum wird dann normal gezeigt/bedient).
-enum class TipMenuStage : uint8_t { Closed, List, Detail };
+// generische Baum wird dann normal gezeigt/bedient). FingerprintStats haengt
+// unter Detail (siehe renderWhiteFingerprintStats()/loop()) -- reiner
+// Anzeige-Screen, kein weiterer Cursor noetig.
+enum class TipMenuStage : uint8_t { Closed, List, Detail, FingerprintStats };
 TipMenuStage tipMenuStage = TipMenuStage::Closed;
 // 0 = <Zurueck>, 1 = "Neue Spitze anlegen", 2 = "Fingerabdruecke
 // invalidieren", TIP_LIST_FIXED_ENTRIES.. = tips[index-TIP_LIST_FIXED_ENTRIES].
@@ -305,6 +307,31 @@ static const uint8_t TIP_LIST_FIXED_ENTRIES = 3;
 uint8_t tipListIndex = 0;
 size_t  tipDetailIndex = 0;  // welcher Tip (Index in tipCatalog.tips) wird im Detail-Screen gezeigt
 uint8_t tipActionIndex = 0;  // Cursor in der Aktionsliste des Detail-Screens (siehe renderTipDetail())
+// Erster sichtbarer Kanal in renderWhiteFingerprintStats() -- reiner
+// Umlauf-Zaehler (kein Modulo hier, das macht der Renderer anhand der
+// tatsaechlichen Kanalanzahl), per kurzem Mode-Druck weitergeschaltet (siehe
+// cycleView()). Wird beim Betreten des Screens auf 0 zurueckgesetzt.
+uint8_t fingerprintStatsScroll = 0;
+
+// Eine Weissmessung, die checkValidity() bestanden hat, aber laut
+// MeasurementTip::isPlausible() Implausible/Indeterminate ist -- wartet auf
+// eine explizite Nutzer-Entscheidung (siehe renderWhitePlausibilityConfirm()/
+// loop()), bevor sie (oder gar nicht) uebernommen wird. 'active' = false
+// bedeutet "kein ausstehender Entscheid", der einzige Zustand, in dem der
+// normale Calibration-Screen gezeigt wird.
+struct PendingWhiteDecision {
+  bool active = false;
+  Precision precision = Precision::Precise;
+  Measurement measurement;
+  MeasurementTelemetry telemetry;
+  PlausibilityResult plausibility = PlausibilityResult::Indeterminate;
+};
+PendingWhiteDecision pendingWhite;
+// Cursor in der Auswahlliste von renderWhitePlausibilityConfirm(): 0 =
+// "Uebernehmen", 1 = "Verwerfen". Als Index gehalten (nicht bool), damit
+// spaeter mehr als zwei Eintraege moeglich sind, ohne die Cursor-Logik
+// umzubauen.
+uint8_t whiteConfirmIndex = 0;
 
 std::string nextTipName() {
   for (uint32_t n = 1; ; n++) {
@@ -344,18 +371,27 @@ void deleteTip(size_t index) {
   calStore.saveTips(tipCatalog);
 }
 
-// Haengt einen neuen "Fingerabdruck" (normalisierte Weissreferenz-Rohmessung)
-// an eine Spitze an -- FIFO, aeltester faellt raus sobald die Liste
-// MAX_WHITE_FINGERPRINTS_PER_TIP erreicht haette (siehe TipCatalog.h). Nutzt
-// AUSSCHLIESSLICH das Spectrometer-Interface (spectrometer.normalize()), nie
+// Baut EINEN WhiteFingerprint aus einer rohen Weissmessung -- reine
+// Berechnung, haengt nichts an (siehe appendWhiteFingerprint()). Muss VOR der
+// Entscheidung "wird diese Messung uebernommen" bereits vorliegen, da
+// MeasurementTip::isPlausible() genau so einen Kandidaten braucht. Nutzt
+// AUSSCHLIESSLICH das Spectrometer-Interface (normalize()/sensorId()), nie
 // die konkrete AS7341Spectrometer -- vorbereitet fuer einen kuenftigen
 // zweiten Sensor (siehe Spectrometer.h).
-void addWhiteFingerprint(MeasurementTip& tip, const Measurement& raw, const OpticalSettings& settings) {
+WhiteFingerprint buildWhiteFingerprint(const Measurement& raw, const OpticalSettings& settings) {
   WhiteFingerprint fp;
   fp.uptimeS = uptimeLogger.totalSeconds();
   fp.generation = tipCatalog.whiteReferenceGeneration;
+  fp.sensorId = spectrometer.sensorId();
   fp.sensor = settings.sensor;
   fp.normalized = spectrometer.normalize(raw, settings.sensor);
+  return fp;
+}
+
+// Haengt einen BEREITS gebauten Fingerabdruck an eine Spitze an -- FIFO,
+// aeltester faellt raus sobald die Liste MAX_WHITE_FINGERPRINTS_PER_TIP
+// erreicht haette (siehe TipCatalog.h).
+void appendWhiteFingerprint(MeasurementTip& tip, const WhiteFingerprint& fp) {
   if (tip.whiteFingerprints.size() >= MAX_WHITE_FINGERPRINTS_PER_TIP) {
     tip.whiteFingerprints.erase(tip.whiteFingerprints.begin());  // aeltester zuerst raus
   }
@@ -821,6 +857,12 @@ uint8_t computeScrollStart(uint8_t selected, uint8_t count, uint8_t visible) {
 // gebraucht.
 void renderTipList();
 void renderTipDetail();
+void renderWhiteFingerprintStats();
+
+// Vorwaertsdeklaration: unten definiert (naeher an performMeasurement(), das
+// den zugehoerigen pendingWhite-Zustand befuellt), aber schon von
+// renderCurrentView() gebraucht.
+void renderWhitePlausibilityConfirm();
 
 void renderSettingsStatus() {
   if (!displayOk) return;
@@ -830,6 +872,7 @@ void renderSettingsStatus() {
 
   if (tipMenuStage == TipMenuStage::List)   { renderTipList();   return; }
   if (tipMenuStage == TipMenuStage::Detail) { renderTipDetail(); return; }
+  if (tipMenuStage == TipMenuStage::FingerprintStats) { renderWhiteFingerprintStats(); return; }
 
   if (editingActive) {
     // Ziffern-/Options-Bearbeitung eines Blatts -- UNVERAENDERT gegenueber
@@ -979,7 +1022,8 @@ void renderTipList() {
 // Detail-Menue einer einzelnen Spitze: Name (+ "AKTIV"-Hinweis), darunter die
 // verfuegbaren Aktionen -- "Aktivieren"/"Loeschen" nur fuer NICHT-aktive
 // Spitzen (siehe Plan/Kontext: die aktive Spitze kann nicht geloescht werden,
-// "Aktivieren" waere fuer sie ohnehin ein No-Op). Nie mehr als 3 Zeilen, kein
+// "Aktivieren" waere fuer sie ohnehin ein No-Op), "Weiss-Fingerabdruck" (siehe
+// renderWhiteFingerprintStats()) fuer BEIDE. Nie mehr als 4 Zeilen, kein
 // Scroll-Fenster noetig.
 void renderTipDetail() {
   const MeasurementTip& tip = tipCatalog.tips[tipDetailIndex];
@@ -992,10 +1036,10 @@ void renderTipDetail() {
     display.println("AKTIV");
   }
 
-  static const char* const ACTIVE_ACTIONS[]   = { "<Zurueck>" };
-  static const char* const INACTIVE_ACTIONS[] = { "<Zurueck>", "Aktivieren", "Loeschen" };
+  static const char* const ACTIVE_ACTIONS[]   = { "<Zurueck>", "Weiss-Fingerabdruck" };
+  static const char* const INACTIVE_ACTIONS[] = { "<Zurueck>", "Aktivieren", "Loeschen", "Weiss-Fingerabdruck" };
   const char* const* actions = isActive ? ACTIVE_ACTIONS : INACTIVE_ACTIONS;
-  uint8_t count = isActive ? 1 : 3;
+  uint8_t count = isActive ? 2 : 4;
 
   int y = 24;
   for (uint8_t i = 0; i < count; i++) {
@@ -1003,6 +1047,88 @@ void renderTipDetail() {
     display.print(i == tipActionIndex ? "> " : "  ");
     display.println(actions[i]);
     y += 10;
+  }
+  display.display();
+}
+
+// Zerlegt 'value' (>= 0) in eine normalisierte Mantisse [1,10) + Exponent fuer
+// eine kompakte wissenschaftliche Anzeige (siehe renderWhiteFingerprintStats()
+// -- die normalisierten Fingerabdruck-Werte reichen ueber viele
+// Groessenordnungen, ein fixes Nachkommaformat macht kleine Kanaele
+// unlesbar/"0.0"). value <= 0 bleibt mantissa/exponent 0 (normalisierte
+// Rohwerte sind nie negativ; ein exaktes 0 ist der einzige Sonderfall, z.B.
+// ein unter einem Filter strukturell dunkler Kanal).
+static void splitScientific(float value, float& mantissa, int& exponent) {
+  if (value <= 0.0f) { mantissa = 0.0f; exponent = 0; return; }
+  exponent = (int)floorf(log10f(value));
+  mantissa = value / powf(10.0f, (float)exponent);
+  // Rundungs-Randfall: bei der Anzeige mit 2 Nachkommastellen wuerde z.B.
+  // 9.996 auf "10.00" runden und damit das Mantissen-Intervall [1,10)
+  // verlassen -- Exponent in diesem Fall nachziehen.
+  if (mantissa >= 9.995f) { mantissa /= 10.0f; exponent += 1; }
+}
+
+// "Weiss-Fingerabdruck"-Aktion aus renderTipDetail(): Mittelwert + absoluter
+// Standardfehler je Kanal der eigenen Fingerabdruecke DIESER Spitze, nur ueber
+// die AKTUELLE whiteReferenceGeneration und den gerade aktiven Sensor (siehe
+// MeasurementTip::whiteFingerprintStats() -- aeltere Generationen/andere
+// Sensoren sind nicht vergleichbar, siehe MeasurementTip::isPlausible()).
+// Wissenschaftliche Notation je Kanal (siehe splitScientific()) statt eines
+// festen Nachkommaformats -- Wert UND Fehler teilen sich denselben Exponenten
+// (beide sind per Definition dieselbe Groessenordnung), direkt vergleichbar
+// ohne zweimal denselben Exponenten hinzuschreiben. N_CH(10) Kanaele passen
+// nicht auf einmal aufs 64px-Display (eine Zeile pro Kanal) -- ein kurzer
+// Mode-Druck schiebt das sichtbare Fenster um einen Kanal weiter (siehe
+// cycleView()), umlaufend. Reiner Anzeige-Screen (kein Cursor); ein langer
+// Trigger-Druck geht zurueck ins Detail-Menue (siehe loop()).
+void renderWhiteFingerprintStats() {
+  const MeasurementTip& tip = tipCatalog.tips[tipDetailIndex];
+  WhiteFingerprintStats stats = tip.whiteFingerprintStats(spectrometer.sensorId(), tipCatalog.whiteReferenceGeneration);
+
+  char header[22];
+  snprintf(header, sizeof(header), "N=%u", (unsigned)stats.n);
+  display.setCursor(0, 0);
+  display.println(header);
+
+  if (stats.n == 0) {
+    display.setCursor(0, 10);
+    display.println("keine Messungen");
+    display.display();
+    return;
+  }
+
+  const char* const* labels = spectrometer.measurementLabels();
+  const uint8_t VISIBLE_ROWS = 7;  // Zeile 0 ist der "N="-Header, Rest bis 64px
+  uint8_t ch = (uint8_t)stats.mean.size();
+  uint8_t start = fingerprintStatsScroll % ch;
+
+  int y = 8;
+  for (uint8_t i = 0; i < VISIBLE_ROWS && i < ch; i++) {
+    uint8_t c = (start + i) % ch;
+    float mantissa;
+    int exponent;
+    splitScientific(stats.mean[c], mantissa, exponent);
+
+    char line[22];
+    if (stats.sem.empty()) {
+      // Nur 1 Fingerabdruck -- Standardfehler nicht definiert (siehe
+      // WhiteFingerprintStats-Kommentar), nur der Mittelwert wird gezeigt.
+      snprintf(line, sizeof(line), "%-4.4s %.2fe%d", labels[c], mantissa, exponent);
+    } else {
+      // Fehler im SELBEN Massstab wie der Wert (gleicher Exponent, siehe
+      // Funktionskommentar). Eigentlich sollte Byte 0xF1 im eingebauten
+      // 5x7-Font (Codepage-437-Position, siehe Adafruit_GFX glcdfont.c) ein
+      // "+-"-Zeichen sein -- auf dem tatsaechlichen Display sieht es aber wie
+      // ">" ueber "=" aus (Font-Variante weicht ab), deshalb hier das
+      // unzweideutige ASCII "+-" (2 Zeichen), trotz des einen Spalte teureren
+      // Platzbedarfs -- passt auf dem 21-Zeichen-Zeilenbudget weiterhin
+      // bequem.
+      float errMantissa = stats.sem[c] / powf(10.0f, (float)exponent);
+      snprintf(line, sizeof(line), "%-4.4s %.2f+-%.2fe%d", labels[c], mantissa, errMantissa, exponent);
+    }
+    display.setCursor(0, y);
+    display.print(line);
+    y += 8;
   }
   display.display();
 }
@@ -1043,6 +1169,7 @@ void renderCurrentView() {
     return;
   }
   if (currentDisplayMode == DisplayMode::Calibration) {
+    if (pendingWhite.active) { renderWhitePlausibilityConfirm(); return; }
     renderReferenceStatus();
     return;
   }
@@ -1190,56 +1317,48 @@ void renderWhiteValidityWarning(const Measurement& raw, const MeasurementValidit
   display.display();
 }
 
-// Gemeinsamer Einstiegspunkt fuer den Trigger-Taster in allen Mess-Modi.
-// precision/kind werden vom Aufrufer (loop()) bestimmt, nicht hier -- diese
-// Funktion kennt keinen DisplayMode mehr, nur noch "wie genau messen" und
-// "was fuer ein Messwert ist das". Rueckgabe: true bei Erfolg (lastMeasurement
-// aktualisiert) -- fuer den Measure-Modus relevant, siehe MEASUREMENT_MODES/
-// loop() (Calibration ignoriert die Rueckgabe weiterhin einfach).
-bool performMeasurement(Precision precision, SampleKind kind) {
-  if (busy) return false;  // keine zweite Messung waehrend eine laeuft
-  busy = true;
-
-  flashBorder();  // nur hier, also nur wenn tatsaechlich gestartet wird
-  showMeasuringScreen(0, 1);
-
-  MeasurementTelemetry telemetry;
-  Measurement measurement = spectrometer.performMeasurement(precision, showMeasuringScreen, &telemetry);
-  if (measurement.empty()) {
-    if (telemetry.status == MeasurementStatus::NotConverged) {
-      // relSemWorst ist hier haeufig kein NAN (im Gegensatz zum Erfolgsfall
-      // bei sehr dunklen Proben) -- der letzte erreichte Wert vor Aufgabe des
-      // Sample-Budgets ist ein nuetzlicher Diagnosewert beim Justieren von
-      // PRECISE_TARGET_REL_SEM/PRECISE_MAX_SAMPLES.
-      if (!isnan(telemetry.relSemWorst)) {
-        Serial.printf("# Messung nicht konvergiert (%u Samples, letztes relSEM %.2f%%) -- Geraet ruhig halten und erneut versuchen\n",
-                      telemetry.sampleCount, telemetry.relSemWorst * 100.0f);
-      } else {
-        Serial.println("# Messung nicht konvergiert -- Geraet ruhig halten und erneut versuchen");
-      }
-    } else {
-      Serial.println("# Sensorfehler bei der Messung");
-    }
-    busy = false;
-    renderMeasurementError(telemetry.status);
-    return false;
-  }
-  // Eine Weissreferenz, die in irgendeinem Kanal klippt oder unter der
-  // Rauschgrenze liegt, taugt weder als Referenz noch als Fingerabdruck --
-  // wird deshalb komplett verworfen (nicht als whiteRef uebernommen, nicht in
-  // der Historie, kein Fingerabdruck), aber dem Nutzer trotzdem mit den
-  // Rohwerten UND dem Grund angezeigt (siehe renderWhiteValidityWarning()).
-  // lastMeasurement/lastMeasurementSettings bleiben dabei unveraendert, wie
-  // beim Sensorfehler-/Nicht-Konvergenz-Fall oben.
-  if (kind == SampleKind::White) {
-    MeasurementValidity validity = spectrometer.checkValidity(measurement, currentSettings.optical);
-    if (!validity.ok) {
-      busy = false;
-      renderWhiteValidityWarning(measurement, validity);
-      return false;
-    }
+// Weissmessung, die checkValidity() bestanden hat, aber laut
+// MeasurementTip::isPlausible() Implausible oder Indeterminate ist (siehe
+// pendingWhite). Nutzer entscheidet per Auswahlliste (Cursor:
+// whiteConfirmIndex, kurzer Mode-Druck bewegt ihn, langer Trigger-Druck
+// waehlt -- siehe loop()), ob die Messung trotzdem uebernommen wird. Gleicher
+// Aufbau wie renderTipDetail()'s Aktionsliste.
+void renderWhitePlausibilityConfirm() {
+  if (!displayOk) return;
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  if (pendingWhite.plausibility == PlausibilityResult::Implausible) {
+    display.println("Weiss weicht ab");
+    display.setCursor(0, 9);
+    display.println("von alten Werten");
+  } else {
+    display.println("Weiss unklar");
+    display.setCursor(0, 9);
+    display.println("zu wenig Daten");
   }
 
+  static const char* const ACTIONS[] = { "Uebernehmen", "Verwerfen" };
+  int y = 24;
+  for (uint8_t i = 0; i < 2; i++) {
+    display.setCursor(0, y);
+    display.print(i == whiteConfirmIndex ? "> " : "  ");
+    display.println(ACTIONS[i]);
+    y += 10;
+  }
+  display.display();
+}
+
+// Gemeinsamer Abschluss einer AKZEPTIERTEN Messung -- sowohl fuer den
+// direkten Erfolgsfall in performMeasurement() als auch fuer eine per
+// "Uebernehmen" bestaetigte, zuvor als Implausible/Indeterminate
+// zurueckgehaltene Weissmessung (siehe pendingWhite/loop()). Schreibt
+// lastMeasurement/-Settings, vergibt die Sample-Nummer, haengt an die
+// Historie an, aktualisiert Dark-/Weiss-Referenz inkl. Fingerabdruck und
+// bestimmt 'calibrated' neu.
+void finalizeMeasurement(Precision precision, SampleKind kind,
+                          const Measurement& measurement, const MeasurementTelemetry& telemetry) {
   lastMeasurement = measurement;
   lastMeasurementSettings = currentSettings.optical;
 
@@ -1294,14 +1413,88 @@ bool performMeasurement(Precision precision, SampleKind kind) {
 
     MeasurementTip* active = tipCatalog.activeTip();
     if (active) {
-      addWhiteFingerprint(*active, measurement, currentSettings.optical);
+      appendWhiteFingerprint(*active, buildWhiteFingerprint(measurement, currentSettings.optical));
       calStore.saveTips(tipCatalog);
     }
   }
   calibrated = calibrationValidFor(currentSettings.optical);
 
   printCsvRow(rec);
+}
 
+// Gemeinsamer Einstiegspunkt fuer den Trigger-Taster in allen Mess-Modi.
+// precision/kind werden vom Aufrufer (loop()) bestimmt, nicht hier -- diese
+// Funktion kennt keinen DisplayMode mehr, nur noch "wie genau messen" und
+// "was fuer ein Messwert ist das". Rueckgabe: true bei Erfolg (lastMeasurement
+// aktualisiert) -- fuer den Measure-Modus relevant, siehe MEASUREMENT_MODES/
+// loop() (Calibration ignoriert die Rueckgabe weiterhin einfach).
+bool performMeasurement(Precision precision, SampleKind kind) {
+  if (busy) return false;  // keine zweite Messung waehrend eine laeuft
+  busy = true;
+
+  flashBorder();  // nur hier, also nur wenn tatsaechlich gestartet wird
+  showMeasuringScreen(0, 1);
+
+  MeasurementTelemetry telemetry;
+  Measurement measurement = spectrometer.performMeasurement(precision, showMeasuringScreen, &telemetry);
+  if (measurement.empty()) {
+    if (telemetry.status == MeasurementStatus::NotConverged) {
+      // relSemWorst ist hier haeufig kein NAN (im Gegensatz zum Erfolgsfall
+      // bei sehr dunklen Proben) -- der letzte erreichte Wert vor Aufgabe des
+      // Sample-Budgets ist ein nuetzlicher Diagnosewert beim Justieren von
+      // PRECISE_TARGET_REL_SEM/PRECISE_MAX_SAMPLES.
+      if (!isnan(telemetry.relSemWorst)) {
+        Serial.printf("# Messung nicht konvergiert (%u Samples, letztes relSEM %.2f%%) -- Geraet ruhig halten und erneut versuchen\n",
+                      telemetry.sampleCount, telemetry.relSemWorst * 100.0f);
+      } else {
+        Serial.println("# Messung nicht konvergiert -- Geraet ruhig halten und erneut versuchen");
+      }
+    } else {
+      Serial.println("# Sensorfehler bei der Messung");
+    }
+    busy = false;
+    renderMeasurementError(telemetry.status);
+    return false;
+  }
+  // Eine Weissreferenz, die in irgendeinem Kanal klippt oder unter der
+  // Rauschgrenze liegt, taugt weder als Referenz noch als Fingerabdruck --
+  // wird deshalb komplett verworfen (nicht als whiteRef uebernommen, nicht in
+  // der Historie, kein Fingerabdruck), aber dem Nutzer trotzdem mit den
+  // Rohwerten UND dem Grund angezeigt (siehe renderWhiteValidityWarning()).
+  // lastMeasurement/lastMeasurementSettings bleiben dabei unveraendert, wie
+  // beim Sensorfehler-/Nicht-Konvergenz-Fall oben.
+  if (kind == SampleKind::White) {
+    MeasurementValidity validity = spectrometer.checkValidity(measurement, currentSettings.optical);
+    if (!validity.ok) {
+      busy = false;
+      renderWhiteValidityWarning(measurement, validity);
+      return false;
+    }
+
+    // Verlaesslich (kein Klippen/Rauschgrenze), aber passt sie zu den
+    // bisherigen Fingerabdruecken dieser Spitze? Nur bei einer aktiven Spitze
+    // ueberhaupt pruefbar -- ohne aktive Spitze (sollte laut Invariante nicht
+    // vorkommen) gilt sie vorsichtshalber als Indeterminate. Nur Implausible/
+    // Indeterminate unterbrechen den Ablauf (siehe pendingWhite/loop()) --
+    // Plausible/PlausibleViaFallback werden wie bisher still uebernommen.
+    MeasurementTip* active = tipCatalog.activeTip();
+    WhiteFingerprint candidate = buildWhiteFingerprint(measurement, currentSettings.optical);
+    PlausibilityResult plaus = active ? active->isPlausible(candidate, tipCatalog)
+                                       : PlausibilityResult::Indeterminate;
+    if (plaus == PlausibilityResult::Implausible || plaus == PlausibilityResult::Indeterminate) {
+      busy = false;
+      pendingWhite.active = true;
+      pendingWhite.precision = precision;
+      pendingWhite.measurement = measurement;
+      pendingWhite.telemetry = telemetry;
+      pendingWhite.plausibility = plaus;
+      whiteConfirmIndex = 0;
+      renderCurrentView();
+      return false;
+    }
+  }
+
+  finalizeMeasurement(precision, kind, measurement, telemetry);
   busy = false;
   renderCurrentView();
   return true;
@@ -1381,8 +1574,14 @@ void cycleView() {
     }
     if (tipMenuStage == TipMenuStage::Detail) {
       bool isActive = (tipCatalog.tips[tipDetailIndex].name == tipCatalog.active);
-      uint8_t total = isActive ? 1 : 3;  // aktiv: nur <Zurueck>; sonst: <Zurueck>/Aktivieren/Loeschen
+      // aktiv: <Zurueck>/Weiss-Fingerabdruck; sonst: <Zurueck>/Aktivieren/Loeschen/Weiss-Fingerabdruck.
+      uint8_t total = isActive ? 2 : 4;
       tipActionIndex = (tipActionIndex + 1) % total;
+      renderCurrentView();
+      return;
+    }
+    if (tipMenuStage == TipMenuStage::FingerprintStats) {
+      fingerprintStatsScroll++;  // Modulo macht der Renderer anhand der Kanalanzahl
       renderCurrentView();
       return;
     }
@@ -1392,6 +1591,11 @@ void cycleView() {
     return;
   }
   if (currentDisplayMode == DisplayMode::Calibration) {
+    if (pendingWhite.active) {
+      whiteConfirmIndex = (whiteConfirmIndex + 1) % 2;
+      renderCurrentView();
+      return;
+    }
     calibrationTarget = (calibrationTarget == CalibrationTarget::White) ? CalibrationTarget::Dark : CalibrationTarget::White;
     renderCurrentView();
     return;
@@ -1459,6 +1663,11 @@ void cycleMode() {
   // auf ihren "keine Messung"/"nicht kalibriert"-Hinweis zurueck).
   lastMeasurement.clear();
   lastLabel[0] = '\0';
+  // Ein offener Plausibilitaets-Entscheid gehoert ebenfalls zum vorherigen
+  // Modus -- ein Moduswechsel gilt als implizites Verwerfen (nichts wurde je
+  // geschrieben, siehe performMeasurement()), das gehaltene Measurement wird
+  // dabei sauber freigegeben.
+  pendingWhite = PendingWhiteDecision();
 
   renderCurrentView();
 
@@ -1573,7 +1782,21 @@ void loop() {
       performExport();
     }
   } else if (currentDisplayMode == DisplayMode::Calibration) {
-    if (te == DebouncedButton::Event::LongPress) {
+    if (pendingWhite.active) {
+      // Nutzer entscheidet ueber eine zuvor als Implausible/Indeterminate
+      // zurueckgehaltene Weissmessung (siehe performMeasurement()/
+      // renderWhitePlausibilityConfirm()).
+      if (te == DebouncedButton::Event::LongPress) {
+        if (whiteConfirmIndex == 0) {  // "Uebernehmen"
+          busy = true;
+          finalizeMeasurement(pendingWhite.precision, SampleKind::White, pendingWhite.measurement, pendingWhite.telemetry);
+          busy = false;
+        }
+        // whiteConfirmIndex == 1 ("Verwerfen"): nichts tun, Messung bleibt verworfen.
+        pendingWhite = PendingWhiteDecision();  // Zustand + gehaltenes Measurement freigeben
+        renderCurrentView();
+      }
+    } else if (te == DebouncedButton::Event::LongPress) {
       SampleKind kind = (calibrationTarget == CalibrationTarget::White) ? SampleKind::White : SampleKind::Dark;
       performMeasurement(Precision::Precise, kind);  // Referenzmessungen immer Precise, wie bisher
     }
@@ -1628,7 +1851,19 @@ void loop() {
           deleteTip(tipDetailIndex);
           tipListIndex = 0;
           tipMenuStage = TipMenuStage::List;
+        } else if ((isActive && tipActionIndex == 1) || (!isActive && tipActionIndex == 3)) {
+          // "Weiss-Fingerabdruck" -- immer der letzte Eintrag beider Listen
+          // (siehe renderTipDetail()).
+          fingerprintStatsScroll = 0;
+          tipMenuStage = TipMenuStage::FingerprintStats;
         }
+        renderCurrentView();
+      }
+    } else if (tipMenuStage == TipMenuStage::FingerprintStats) {
+      // Reiner Anzeige-Screen -- ein langer Trigger-Druck geht zurueck ins
+      // Detail-Menue (kein "<Zurueck>"-Eintrag noetig, da es keinen Cursor gibt).
+      if (te == DebouncedButton::Event::LongPress) {
+        tipMenuStage = TipMenuStage::Detail;
         renderCurrentView();
       }
     } else if (!editingActive) {
