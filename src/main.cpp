@@ -325,12 +325,20 @@ struct PendingWhiteDecision {
   Measurement measurement;
   MeasurementTelemetry telemetry;
   PlausibilityResult plausibility = PlausibilityResult::Indeterminate;
+  // Andere Spitzen (Indizes in tipCatalog.tips), fuer die 'measurement' laut
+  // TipCatalog::rankPlausibleTips() plausibel waere -- einmalig berechnet,
+  // wenn dieser Entscheid entsteht (performMeasurement()), NICHT bei jedem
+  // Rendern neu (tipCatalog aendert sich waehrend eines offenen Entscheids
+  // nicht, siehe cycleMode()). Reihenfolge = Anzeige-Reihenfolge in
+  // renderWhitePlausibilityConfirm().
+  std::vector<size_t> suggestedTipIndices;
 };
 PendingWhiteDecision pendingWhite;
-// Cursor in der Auswahlliste von renderWhitePlausibilityConfirm(): 0 =
-// "Uebernehmen", 1 = "Verwerfen". Als Index gehalten (nicht bool), damit
-// spaeter mehr als zwei Eintraege moeglich sind, ohne die Cursor-Logik
-// umzubauen.
+// Cursor in der Auswahlliste von renderWhitePlausibilityConfirm(): 0..
+// suggestedTipIndices.size()-1 = eine vorgeschlagene Spitze, danach "Als neue
+// Spitze", "Uebernehmen", "Verwerfen" (siehe dort). Als Index gehalten (nicht
+// bool), damit eine variable Anzahl Eintraege moeglich ist, ohne die
+// Cursor-Logik umzubauen.
 uint8_t whiteConfirmIndex = 0;
 
 std::string nextTipName() {
@@ -1321,8 +1329,11 @@ void renderWhiteValidityWarning(const Measurement& raw, const MeasurementValidit
 // MeasurementTip::isPlausible() Implausible oder Indeterminate ist (siehe
 // pendingWhite). Nutzer entscheidet per Auswahlliste (Cursor:
 // whiteConfirmIndex, kurzer Mode-Druck bewegt ihn, langer Trigger-Druck
-// waehlt -- siehe loop()), ob die Messung trotzdem uebernommen wird. Gleicher
-// Aufbau wie renderTipDetail()'s Aktionsliste.
+// waehlt -- siehe loop()): erst alle vorgeschlagenen ANDEREN Spitzen, fuer die
+// die Messung plausibel waere (siehe pendingWhite.suggestedTipIndices/
+// TipCatalog::rankPlausibleTips()), dann "Als neue Spitze", "Uebernehmen",
+// "Verwerfen". Gleiches Scroll-Schema wie renderTipList() (computeScrollStart(),
+// 4 sichtbare Zeilen, "^"/"v"-Indikatoren bei Bedarf).
 void renderWhitePlausibilityConfirm() {
   if (!displayOk) return;
   display.clearDisplay();
@@ -1339,26 +1350,59 @@ void renderWhitePlausibilityConfirm() {
     display.println("zu wenig Daten");
   }
 
-  static const char* const ACTIONS[] = { "Uebernehmen", "Verwerfen" };
+  size_t sCount = pendingWhite.suggestedTipIndices.size();
+  uint8_t total = (uint8_t)(sCount + 3);  // Vorschlaege + "Als neue Spitze" + Uebernehmen + Verwerfen
+  const uint8_t VISIBLE_ROWS = 4;
+  uint8_t start = computeScrollStart(whiteConfirmIndex, total, VISIBLE_ROWS);
+
   int y = 24;
-  for (uint8_t i = 0; i < 2; i++) {
+  for (uint8_t i = start; i < start + VISIBLE_ROWS && i < total; i++) {
+    char line[22];
+    if (i < sCount) {
+      snprintf(line, sizeof(line), "%s", tipCatalog.tips[pendingWhite.suggestedTipIndices[i]].name.c_str());
+    } else if (i == sCount) {
+      snprintf(line, sizeof(line), "Als neue Spitze");
+    } else if (i == sCount + 1) {
+      snprintf(line, sizeof(line), "Uebernehmen");
+    } else {
+      snprintf(line, sizeof(line), "Verwerfen");
+    }
     display.setCursor(0, y);
     display.print(i == whiteConfirmIndex ? "> " : "  ");
-    display.println(ACTIONS[i]);
+    display.println(line);
     y += 10;
+  }
+  if (start > 0) {
+    display.setCursor(122, 0);
+    display.print("^");
+  }
+  if (start + VISIBLE_ROWS < total) {
+    display.setCursor(122, 56);
+    display.print("v");
   }
   display.display();
 }
 
 // Gemeinsamer Abschluss einer AKZEPTIERTEN Messung -- sowohl fuer den
 // direkten Erfolgsfall in performMeasurement() als auch fuer eine per
-// "Uebernehmen" bestaetigte, zuvor als Implausible/Indeterminate
-// zurueckgehaltene Weissmessung (siehe pendingWhite/loop()). Schreibt
-// lastMeasurement/-Settings, vergibt die Sample-Nummer, haengt an die
-// Historie an, aktualisiert Dark-/Weiss-Referenz inkl. Fingerabdruck und
-// bestimmt 'calibrated' neu.
-void finalizeMeasurement(Precision precision, SampleKind kind,
-                          const Measurement& measurement, const MeasurementTelemetry& telemetry) {
+// "Uebernehmen"/eine vorgeschlagene Spitze/"Als neue Spitze" bestaetigte,
+// zuvor als Implausible/Indeterminate zurueckgehaltene Weissmessung (siehe
+// pendingWhite/loop()). Schreibt lastMeasurement/-Settings, vergibt die
+// Sample-Nummer, haengt an die Historie an, aktualisiert Dark-/Weiss-Referenz
+// inkl. Fingerabdruck und bestimmt 'calibrated' neu.
+//
+// targetTip (optional): welcher Spitze der Fingerabdruck einer Weissmessung
+// zugeordnet wird -- Default nullptr bedeutet "die aktuell aktive Spitze"
+// (tipCatalog.activeTip(), bisheriges Verhalten). Wird explizit gesetzt, wenn
+// der Nutzer im Bestaetigungs-Screen eine ANDERE, bereits bekannte Spitze
+// ausgewaehlt hat (siehe loop()) -- WICHTIG: in diesem Fall wird
+// finalizeMeasurement() aufgerufen, BEVOR die Spitze aktiviert wird (siehe
+// dort), damit rec.settings/whiteRefSettings/fp.sensor weiterhin die
+// Einstellungen festhalten, unter denen tatsaechlich gemessen wurde --
+// activateTip() wuerde currentSettings.optical sonst schon vorher auf die
+// (moeglicherweise abweichenden) Einstellungen der neuen Spitze umstellen.
+void finalizeMeasurement(Precision precision, SampleKind kind, const Measurement& measurement,
+                          const MeasurementTelemetry& telemetry, MeasurementTip* targetTip = nullptr) {
   lastMeasurement = measurement;
   lastMeasurementSettings = currentSettings.optical;
 
@@ -1411,7 +1455,7 @@ void finalizeMeasurement(Precision precision, SampleKind kind,
     whiteRefSettings = currentSettings.optical;
     calStore.saveWhite(whiteRef, whiteRefSettings);
 
-    MeasurementTip* active = tipCatalog.activeTip();
+    MeasurementTip* active = targetTip ? targetTip : tipCatalog.activeTip();
     if (active) {
       appendWhiteFingerprint(*active, buildWhiteFingerprint(measurement, currentSettings.optical));
       calStore.saveTips(tipCatalog);
@@ -1488,6 +1532,12 @@ bool performMeasurement(Precision precision, SampleKind kind) {
       pendingWhite.measurement = measurement;
       pendingWhite.telemetry = telemetry;
       pendingWhite.plausibility = plaus;
+      // Vielleicht passt die Messung ja zu einer ANDEREN, bereits bekannten
+      // Spitze (z.B. physischer Spitzenwechsel, ohne das Geraet zu
+      // informieren) -- wird im Bestaetigungs-Screen VOR "Als neue Spitze"/
+      // "Uebernehmen"/"Verwerfen" angeboten (siehe renderWhitePlausibilityConfirm()).
+      pendingWhite.suggestedTipIndices = active ? tipCatalog.rankPlausibleTips(candidate, active->name)
+                                                 : std::vector<size_t>();
       whiteConfirmIndex = 0;
       renderCurrentView();
       return false;
@@ -1592,7 +1642,8 @@ void cycleView() {
   }
   if (currentDisplayMode == DisplayMode::Calibration) {
     if (pendingWhite.active) {
-      whiteConfirmIndex = (whiteConfirmIndex + 1) % 2;
+      uint8_t total = (uint8_t)(pendingWhite.suggestedTipIndices.size() + 3);
+      whiteConfirmIndex = (whiteConfirmIndex + 1) % total;
       renderCurrentView();
       return;
     }
@@ -1785,14 +1836,40 @@ void loop() {
     if (pendingWhite.active) {
       // Nutzer entscheidet ueber eine zuvor als Implausible/Indeterminate
       // zurueckgehaltene Weissmessung (siehe performMeasurement()/
-      // renderWhitePlausibilityConfirm()).
+      // renderWhitePlausibilityConfirm()): eine vorgeschlagene Spitze, "Als
+      // neue Spitze", "Uebernehmen" oder "Verwerfen".
       if (te == DebouncedButton::Event::LongPress) {
-        if (whiteConfirmIndex == 0) {  // "Uebernehmen"
+        size_t sCount = pendingWhite.suggestedTipIndices.size();
+        if (whiteConfirmIndex < sCount) {
+          // Die Messung gehoert laut Nutzer zu einer ANDEREN, bereits
+          // bekannten Spitze. ERST unter dieser Spitze festschreiben
+          // (waehrend currentSettings.optical noch die tatsaechlichen
+          // Aufnahme-Einstellungen sind), DANACH erst die Spitze aktivieren
+          // (das aendert currentSettings.optical/die Sensor-Register fuer
+          // KUENFTIGE Messungen) -- siehe finalizeMeasurement()-Kommentar.
+          MeasurementTip& target = tipCatalog.tips[pendingWhite.suggestedTipIndices[whiteConfirmIndex]];
+          busy = true;
+          finalizeMeasurement(pendingWhite.precision, SampleKind::White, pendingWhite.measurement,
+                               pendingWhite.telemetry, &target);
+          busy = false;
+          activateTip(target);
+        } else if (whiteConfirmIndex == sCount) {
+          // "Als neue Spitze" -- umgekehrte Reihenfolge: ERST anlegen+
+          // aktivieren (aendert currentSettings.optical NICHT, siehe
+          // createTipFromCurrentSettings()), DANACH erst festschreiben (landet
+          // ueber den Default-Zielpfad automatisch bei der frisch aktivierten,
+          // noch leeren Spitze).
+          createTipFromCurrentSettings();
+          busy = true;
+          finalizeMeasurement(pendingWhite.precision, SampleKind::White, pendingWhite.measurement, pendingWhite.telemetry);
+          busy = false;
+        } else if (whiteConfirmIndex == sCount + 1) {
+          // "Uebernehmen" -- fuer die aktive, bereits als un-plausibel gemeldete Spitze.
           busy = true;
           finalizeMeasurement(pendingWhite.precision, SampleKind::White, pendingWhite.measurement, pendingWhite.telemetry);
           busy = false;
         }
-        // whiteConfirmIndex == 1 ("Verwerfen"): nichts tun, Messung bleibt verworfen.
+        // sCount+2 ("Verwerfen"): nichts tun, Messung bleibt verworfen.
         pendingWhite = PendingWhiteDecision();  // Zustand + gehaltenes Measurement freigeben
         renderCurrentView();
       }

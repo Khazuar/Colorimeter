@@ -129,4 +129,13 @@ struct TipCatalog {
   }
   MeasurementTip* activeTip() { return find(active); }
   const MeasurementTip* activeTip() const { return find(active); }
+
+  // Findet alle ANDEREN Spitzen (Name != excludeName), fuer die 'candidate'
+  // plausibel waere (Plausible/PlausibleViaFallback), als Indizes in 'tips'.
+  // Sortierung: alle mit direkter Plausible-Bewertung zuerst, dann alle nur
+  // ueber PlausibleViaFallback -- jeweils in Katalog-Reihenfolge. Vorschlags-
+  // liste fuer main.cpp's Bestaetigungs-Screen, wenn 'candidate' fuer die
+  // AKTIVE Spitze Implausible/Indeterminate war (siehe MeasurementTip::
+  // isPlausible()).
+  std::vector<size_t> rankPlausibleTips(const WhiteFingerprint& candidate, const std::string& excludeName) const;
 };

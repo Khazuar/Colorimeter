@@ -179,3 +179,16 @@ WhiteFingerprintStats MeasurementTip::whiteFingerprintStats(const std::string& s
   }
   return result;
 }
+
+std::vector<size_t> TipCatalog::rankPlausibleTips(const WhiteFingerprint& candidate,
+                                                    const std::string& excludeName) const {
+  std::vector<size_t> direct, viaFallback;
+  for (size_t i = 0; i < tips.size(); i++) {
+    if (tips[i].name == excludeName) continue;
+    PlausibilityResult r = tips[i].isPlausible(candidate, *this);
+    if (r == PlausibilityResult::Plausible) direct.push_back(i);
+    else if (r == PlausibilityResult::PlausibleViaFallback) viaFallback.push_back(i);
+  }
+  direct.insert(direct.end(), viaFallback.begin(), viaFallback.end());
+  return direct;
+}
