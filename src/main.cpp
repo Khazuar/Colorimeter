@@ -491,15 +491,25 @@ std::string bandColumnName(const Band& b) {
 }
 
 // computeSpectrum=false (fuer Dark/White-Referenzen, die weiter unten
-// angehaengten "*_ref"-Zeilen, ODER eine Messung, deren Filter nicht zur
-// aktuell geladenen Kalibrierung passt -- siehe calibrationValidFor()): es
-// gibt keine sinnvolle abgeleitete Reflexion -- die Spectrum/Lab/Hex-Spalten
-// bleiben dann leer (aber vorhanden, `bandColumns.size()` Leerspalten). Die
-// rohen Measurement-Werte (falls includeRaw) bleiben davon unberuehrt.
+// angehaengten "*_ref"-Zeilen, ODER eine Messung, fuer die keine passende
+// Referenz aufloesbar war -- siehe SettingsRefState/collectBandsVisitor()/
+// appendRecordToCsv()): es gibt keine sinnvolle abgeleitete Reflexion -- die
+// Spectrum/Lab/Hex-Spalten bleiben dann leer (aber vorhanden,
+// `bandColumns.size()` Leerspalten). Die rohen Measurement-Werte (falls
+// includeRaw) bleiben davon unberuehrt.
+//
+// whiteForSpectrum/darkForSpectrum: die fuer DIESE Zeile geltende Referenz --
+// vom Aufrufer explizit bestimmt (live geladen fuer die aktuelle Zeile/die
+// "*_ref"-Sonderzeilen, oder aus der Historie aufgeloest fuer eine
+// vergangene Zeile, siehe SettingsRefState) statt hier blind die aktuell
+// geladene globale Referenz zu lesen. Nur relevant/gebraucht, wenn
+// computeSpectrum true ist.
 void appendCsvRow(std::string& out, const char* label, const Measurement& measurement,
                    FilterState filterState, bool computeSpectrum, bool includeRaw,
                    const std::vector<Band>& bandColumns,
-                   const MeasurementContext* ctx = nullptr) {
+                   const MeasurementContext* ctx = nullptr,
+                   const Measurement* whiteForSpectrum = nullptr,
+                   const Measurement* darkForSpectrum = nullptr) {
   out += label;
   char buf[16];
 
@@ -523,7 +533,7 @@ void appendCsvRow(std::string& out, const char* label, const Measurement& measur
   }
 
   if (computeSpectrum) {
-    Spectrum spec = spectrometer.getSpectrum(measurement, whiteRef, darkRef, filterState);
+    Spectrum spec = spectrometer.getSpectrum(measurement, *whiteForSpectrum, *darkForSpectrum, filterState);
     for (const Band& col : bandColumns) {
       out += ',';
       int idx = -1;
@@ -554,18 +564,72 @@ void appendCsvRow(std::string& out, const char* label, const Measurement& measur
   out += '\n';
 }
 
+// Waehrend eines forEach()-Durchlaufs (chronologisch aufsteigend) mitgefuehrte
+// Zuordnung Settings -> zuletzt DAFUER gemessene Dark-/Weissreferenz. Ersetzt
+// den frueheren "nimm die AKTUELL geladene Referenz"-Ansatz beim Export: eine
+// historische Zeile bekommt so die Referenz, die TATSAECHLICH zu ihrem
+// Aufnahmezeitpunkt galt (die zuletzt VOR ihr gemessene Dark-/Weisszeile MIT
+// DENSELBEN Settings), unabhaengig davon, was inzwischen (z.B. nach einem
+// Spitzenwechsel) neu gemessen wurde. Linearer Scan statt Map: die Anzahl
+// unterschiedlicher Settings-Kombinationen in einer Historie ist immer klein
+// (typischerweise <= Anzahl Spitzen).
+struct SettingsRefState {
+  OpticalSettings settings;
+  Measurement dark, white;  // je leer, falls fuer 'settings' noch nie gemessen
+};
+
+// Start-Zustand fuer einen Durchlauf: die aktuell geladene (live) Referenz als
+// Ausgangspunkt -- Absicherung, falls die Historie zwischenzeitlich geleert
+// wurde (historyStore.clear()) und deshalb selbst keine passende Dark-/
+// Weisszeile mehr enthaelt, obwohl die live geladene Referenz weiterhin gilt.
+std::vector<SettingsRefState> initialRefState() {
+  std::vector<SettingsRefState> states;
+  if (!darkRef.empty()) states.push_back({darkRefSettings, darkRef, {}});
+  if (!whiteRef.empty()) {
+    for (SettingsRefState& s : states) {
+      if (s.settings == whiteRefSettings) { s.white = whiteRef; return states; }
+    }
+    states.push_back({whiteRefSettings, {}, whiteRef});
+  }
+  return states;
+}
+
+// Aktualisiert 'states' mit einer Dark-/White-Zeile (kein Effekt fuer Regular).
+void observeReference(std::vector<SettingsRefState>& states, const MeasurementRecord& rec) {
+  if (rec.kind != SampleKind::Dark && rec.kind != SampleKind::White) return;
+  for (SettingsRefState& s : states) {
+    if (s.settings == rec.settings) {
+      (rec.kind == SampleKind::Dark ? s.dark : s.white) = rec.measurement;
+      return;
+    }
+  }
+  SettingsRefState s{rec.settings, {}, {}};
+  (rec.kind == SampleKind::Dark ? s.dark : s.white) = rec.measurement;
+  states.push_back(s);
+}
+
+// Beim jetzigen Stand von 'states' fuer 'settings' geltende Referenz --
+// nullptr, falls dafuer noch nie etwas gemessen wurde.
+const SettingsRefState* findRefState(const std::vector<SettingsRefState>& states, const OpticalSettings& settings) {
+  for (const SettingsRefState& s : states) if (s.settings == settings) return &s;
+  return nullptr;
+}
+
 // HistoryStore::forEach()-Visitor: sammelt die Vereinigungsmenge aller
-// vorkommenden Baender (nur von Datensaetzen, deren Filter zur aktuell
-// geladenen Kalibrierung passt -- alle anderen bekommen ohnehin keine echten
-// Spectrum-Spalten, ihre Baender "verdienen" also keine Kopfzeilen-Spalte).
+// vorkommenden Baender (nur von Datensaetzen, fuer die eine passende Referenz
+// aufloesbar ist -- alle anderen bekommen ohnehin keine echten Spectrum-
+// Spalten, ihre Baender "verdienen" also keine Kopfzeilen-Spalte).
 struct BandCollectCtx {
   std::vector<Band>* cols;
+  std::vector<SettingsRefState> refState;
 };
 void collectBandsVisitor(const MeasurementRecord& rec, void* userData) {
   BandCollectCtx* c = reinterpret_cast<BandCollectCtx*>(userData);
-  bool isRef = (rec.kind != SampleKind::Regular);
-  if (isRef || !calibrationValidFor(rec.settings)) return;
-  Spectrum spec = spectrometer.getSpectrum(rec.measurement, whiteRef, darkRef, rec.settings.filterState);
+  observeReference(c->refState, rec);
+  if (rec.kind != SampleKind::Regular) return;
+  const SettingsRefState* ref = findRefState(c->refState, rec.settings);
+  if (!ref || ref->dark.empty() || ref->white.empty()) return;
+  Spectrum spec = spectrometer.getSpectrum(rec.measurement, ref->white, ref->dark, rec.settings.filterState);
   for (const Band& b : spec.bands) {
     bool known = false;
     for (const Band& existing : *c->cols) {
@@ -576,24 +640,28 @@ void collectBandsVisitor(const MeasurementRecord& rec, void* userData) {
 }
 
 // HistoryStore::forEach()-Visitor: haengt einen persistierten Datensatz per
-// appendCsvRow() an 'out' an -- appendCsvRow() bleibt dabei unveraendert und
-// berechnet Spectrum/Lab/Hex weiterhin frisch gegen die AKTUELL geladene
-// Kalibrierung, nicht gegen eine zum Messzeitpunkt eingefrorene. Zeilen, deren
-// Filter nicht zur Kalibrierung passt, bekommen keine abgeleiteten Spalten
+// appendCsvRow() an 'out' an -- die Reflexion wird gegen die Referenz
+// berechnet, die laut SettingsRefState zum AUFNAHMEZEITPUNKT dieser Zeile
+// galt (nicht gegen die aktuell geladene). Zeilen, fuer die (noch) keine
+// passende Referenz aufloesbar ist, bekommen keine abgeleiteten Spalten
 // (computeSpectrum=false), behalten aber ihre Rohwerte.
 struct CsvBuildCtx {
   std::string* out;
   bool includeRaw;
   const std::vector<Band>* bandColumns;
+  std::vector<SettingsRefState> refState;
 };
 void appendRecordToCsv(const MeasurementRecord& rec, void* userData) {
   CsvBuildCtx* ctx = reinterpret_cast<CsvBuildCtx*>(userData);
+  observeReference(ctx->refState, rec);
   bool isRef = (rec.kind != SampleKind::Regular);
-  bool computeSpectrum = !isRef && calibrationValidFor(rec.settings);
+  const SettingsRefState* ref = isRef ? nullptr : findRefState(ctx->refState, rec.settings);
+  bool computeSpectrum = ref && !ref->dark.empty() && !ref->white.empty();
   MeasurementContext mctx{ rec.tempC, rec.sessionMs, rec.uptimeS, rec.settings,
                            rec.precision, rec.sampleCount, rec.relSemWorst };
   appendCsvRow(*ctx->out, rec.label, rec.measurement, rec.settings.filterState, computeSpectrum,
-               ctx->includeRaw, *ctx->bandColumns, &mctx);
+               ctx->includeRaw, *ctx->bandColumns, &mctx,
+               computeSpectrum ? &ref->white : nullptr, computeSpectrum ? &ref->dark : nullptr);
 }
 
 // Baut die komplette Messhistorie als CSV. includeRaw haengt zusaetzlich die
@@ -611,7 +679,7 @@ std::string buildHistoryCsv(bool includeRaw) {
   std::string out;
 
   std::vector<Band> bandColumns;
-  BandCollectCtx collectCtx{ &bandColumns };
+  BandCollectCtx collectCtx{ &bandColumns, initialRefState() };
   historyStore.forEach(collectBandsVisitor, &collectCtx);
   std::sort(bandColumns.begin(), bandColumns.end(), [](const Band& a, const Band& b) {
     return a.center_nm < b.center_nm;
@@ -648,7 +716,7 @@ std::string buildHistoryCsv(bool includeRaw) {
     if (!whiteRef.empty()) appendCsvRow(out, "white_ref", whiteRef, FilterState::None, false, true, bandColumns);
   }
 
-  CsvBuildCtx ctx{ &out, includeRaw, &bandColumns };
+  CsvBuildCtx ctx{ &out, includeRaw, &bandColumns, initialRefState() };
   historyStore.forEach(appendRecordToCsv, &ctx);
   return out;
 }
@@ -671,7 +739,8 @@ void printCsvRow(const MeasurementRecord& rec) {
   MeasurementContext ctx{ rec.tempC, rec.sessionMs, rec.uptimeS, rec.settings,
                           rec.precision, rec.sampleCount, rec.relSemWorst };
   appendCsvRow(row, rec.label, rec.measurement, rec.settings.filterState, computeSpectrum,
-               /*includeRaw=*/true, bandColumns, &ctx);
+               /*includeRaw=*/true, bandColumns, &ctx,
+               computeSpectrum ? &whiteRef : nullptr, computeSpectrum ? &darkRef : nullptr);
   Serial.print(row.c_str());
 }
 
