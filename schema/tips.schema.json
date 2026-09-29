@@ -1,11 +1,10 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "TipCatalog",
-  "$comment": "Beschreibt TipCatalog (include/TipCatalog.h, main.cpp::tipCatalog) -- den Katalog bekannter Messspitzen samt der aktiven Spitze, EIN atomar persistiertes Dokument, bewusst getrennt von settings.schema.json/RootSettings (die aktive Spitze ist eine Eigenschaft DES KATALOGS, keine RootSettings-Einstellung). 'optical' hat dieselbe Form wie dort (keine gemeinsame $ref -- beide Dateien sind unabhaengig lesbare Dokumentation). whiteFingerprints sind normalisierte Weissreferenz-Rohkanalwerte (VIS+NIR+Clear, siehe Spectrometer::normalize()), noch ohne NIR-Korrektur/Dunkelabzug, samt der zum Messzeitpunkt aktiven Sensor-Einstellungen (fuer spaetere Ausreisser-Diagnose) -- optional, aeltere Kataloge/Eintraege haben ggf. keine. whiteReferenceGeneration (Katalog-weit) erhoeht sich ueber die UI-Aktion 'Fingerabdruecke invalidieren' (z.B. nach Wechsel des physischen Weissreferenz-Materials); jeder WhiteFingerprint traegt den zum Messzeitpunkt gueltigen Stand in seinem eigenen 'generation'-Feld -- ein Fingerabdruck mit kleinerem Wert als die aktuelle whiteReferenceGeneration gilt als veraltet. 'sensorId' (siehe Spectrometer::sensorId()) identifiziert den Sensortyp, der die 'values' erzeugt hat -- 'values' ist ein opakes, sensorspezifisches Layout (Reihenfolge/Bedeutung nur im Kontext DESSELBEN Sensortyps definiert), zwei WhiteFingerprint-Eintraege sind nur bei uebereinstimmender sensorId vergleichbar (siehe MeasurementTip::isPlausible() in TipCatalog.cpp). Wird auf dem Geraet selbst nicht genutzt, keine automatische Generierung/Pruefung.",
+  "$comment": "Beschreibt TipCatalog (include/TipCatalog.h, main.cpp::tipCatalog) -- den Katalog bekannter Messspitzen samt der aktiven Spitze, EIN atomar persistiertes Dokument, bewusst getrennt von settings.schema.json/RootSettings (die aktive Spitze ist eine Eigenschaft DES KATALOGS, keine RootSettings-Einstellung). 'optical' hat dieselbe Form wie dort (keine gemeinsame $ref -- beide Dateien sind unabhaengig lesbare Dokumentation). whiteFingerprints sind normalisierte Weissreferenz-Rohkanalwerte (VIS+NIR+Clear, siehe Spectrometer::normalize()), noch ohne NIR-Korrektur/Dunkelabzug, samt der zum Messzeitpunkt aktiven Sensor-Einstellungen (fuer spaetere Ausreisser-Diagnose) -- optional, aeltere Kataloge/Eintraege haben ggf. keine. 'sensorId' (siehe Spectrometer::sensorId()) identifiziert den Sensortyp, der die 'values' erzeugt hat -- 'values' ist ein opakes, sensorspezifisches Layout (Reihenfolge/Bedeutung nur im Kontext DESSELBEN Sensortyps definiert), zwei WhiteFingerprint-Eintraege sind nur bei uebereinstimmender sensorId vergleichbar (siehe MeasurementTip::isPlausible() in TipCatalog.cpp). Wird auf dem Geraet selbst nicht genutzt, keine automatische Generierung/Pruefung.",
   "type": "object",
   "properties": {
     "active": { "type": "string" },
-    "whiteReferenceGeneration": { "type": "integer", "minimum": 0 },
     "tips": {
       "type": "array",
       "minItems": 1,
@@ -55,7 +54,6 @@
               "title": "WhiteFingerprint",
               "properties": {
                 "uptimeS": { "type": "integer", "minimum": 0 },
-                "generation": { "type": "integer", "minimum": 0 },
                 "sensorId": { "type": "string" },
                 "sensor": {
                   "type": "object",
@@ -86,7 +84,7 @@
                   "items": { "type": "number" }
                 }
               },
-              "required": ["uptimeS", "generation", "sensorId", "sensor", "values"],
+              "required": ["uptimeS", "sensorId", "sensor", "values"],
               "additionalProperties": false
             }
           }
@@ -96,6 +94,6 @@
       }
     }
   },
-  "required": ["active", "whiteReferenceGeneration", "tips"],
+  "required": ["active", "tips"],
   "additionalProperties": false
 }

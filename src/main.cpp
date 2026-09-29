@@ -301,9 +301,9 @@ const SettingsNode& currentSettingsNode() {
 // Anzeige-Screen, kein weiterer Cursor noetig.
 enum class TipMenuStage : uint8_t { Closed, List, Detail, FingerprintStats };
 TipMenuStage tipMenuStage = TipMenuStage::Closed;
-// 0 = <Zurueck>, 1 = "Neue Spitze anlegen", 2 = "Fingerabdruecke
-// invalidieren", TIP_LIST_FIXED_ENTRIES.. = tips[index-TIP_LIST_FIXED_ENTRIES].
-static const uint8_t TIP_LIST_FIXED_ENTRIES = 3;
+// 0 = <Zurueck>, 1 = "Neue Spitze anlegen",
+// TIP_LIST_FIXED_ENTRIES.. = tips[index-TIP_LIST_FIXED_ENTRIES].
+static const uint8_t TIP_LIST_FIXED_ENTRIES = 2;
 uint8_t tipListIndex = 0;
 size_t  tipDetailIndex = 0;  // welcher Tip (Index in tipCatalog.tips) wird im Detail-Screen gezeigt
 uint8_t tipActionIndex = 0;  // Cursor in der Aktionsliste des Detail-Screens (siehe renderTipDetail())
@@ -389,7 +389,6 @@ void deleteTip(size_t index) {
 WhiteFingerprint buildWhiteFingerprint(const Measurement& raw, const OpticalSettings& settings) {
   WhiteFingerprint fp;
   fp.uptimeS = uptimeLogger.totalSeconds();
-  fp.generation = tipCatalog.whiteReferenceGeneration;
   fp.sensorId = spectrometer.sensorId();
   fp.sensor = settings.sensor;
   fp.normalized = spectrometer.normalize(raw, settings.sensor);
@@ -404,18 +403,6 @@ void appendWhiteFingerprint(MeasurementTip& tip, const WhiteFingerprint& fp) {
     tip.whiteFingerprints.erase(tip.whiteFingerprints.begin());  // aeltester zuerst raus
   }
   tip.whiteFingerprints.push_back(fp);
-}
-
-// "Fingerabdruecke invalidieren" (Messspitzen-Liste) -- z.B. wenn das
-// physische Weissreferenz-Material gewechselt wird und dadurch alle
-// bisherigen Fingerabdruecke nicht mehr mit neuen vergleichbar sind. Erhoeht
-// NUR den globalen Generations-Zaehler, OHNE bestehende Fingerabdruecke zu
-// loeschen -- neue tragen ab jetzt den neuen Stand, bestehende bleiben bei
-// ihrem alten und sind dadurch spaeter als veraltet erkennbar (siehe
-// TipCatalog.h).
-void invalidateFingerprints() {
-  tipCatalog.whiteReferenceGeneration++;
-  calStore.saveTips(tipCatalog);
 }
 
 // Bearbeitungszustand: solange editingActive, hijacken Trigger/Mode ihre
@@ -1054,10 +1041,9 @@ void renderSettingsStatus() {
   display.display();
 }
 
-// Liste des Messspitzen-Menuepunkts: "<Zurueck>", "Neue Spitze anlegen",
-// "Fingerabdruecke invalidieren", dann alle Spitzen (aktive mit " AKTIV"-
-// Suffix). Gleiches Scroll-Fenster wie die generische Baum-Ansicht (siehe
-// computeScrollStart()).
+// Liste des Messspitzen-Menuepunkts: "<Zurueck>", "Neue Spitze anlegen", dann
+// alle Spitzen (aktive mit " AKTIV"-Suffix). Gleiches Scroll-Fenster wie die
+// generische Baum-Ansicht (siehe computeScrollStart()).
 void renderTipList() {
   display.setCursor(0, 0);
   display.println("Messspitzen");
@@ -1072,8 +1058,6 @@ void renderTipList() {
       snprintf(line, sizeof(line), "<Zurueck>");
     } else if (i == 1) {
       snprintf(line, sizeof(line), "Neue Spitze anlegen");
-    } else if (i == 2) {
-      snprintf(line, sizeof(line), "Fingerabdr. invalid");
     } else {
       const MeasurementTip& t = tipCatalog.tips[i - TIP_LIST_FIXED_ENTRIES];
       snprintf(line, sizeof(line), "%s%s", t.name.c_str(),
@@ -1147,9 +1131,8 @@ static void splitScientific(float value, float& mantissa, int& exponent) {
 
 // "Weiss-Fingerabdruck"-Aktion aus renderTipDetail(): Mittelwert + absoluter
 // Standardfehler je Kanal der eigenen Fingerabdruecke DIESER Spitze, nur ueber
-// die AKTUELLE whiteReferenceGeneration und den gerade aktiven Sensor (siehe
-// MeasurementTip::whiteFingerprintStats() -- aeltere Generationen/andere
-// Sensoren sind nicht vergleichbar, siehe MeasurementTip::isPlausible()).
+// den gerade aktiven Sensor (siehe MeasurementTip::whiteFingerprintStats() --
+// andere Sensoren sind nicht vergleichbar, siehe MeasurementTip::isPlausible()).
 // Wissenschaftliche Notation je Kanal (siehe splitScientific()) statt eines
 // festen Nachkommaformats -- Wert UND Fehler teilen sich denselben Exponenten
 // (beide sind per Definition dieselbe Groessenordnung), direkt vergleichbar
@@ -1160,7 +1143,7 @@ static void splitScientific(float value, float& mantissa, int& exponent) {
 // Trigger-Druck geht zurueck ins Detail-Menue (siehe loop()).
 void renderWhiteFingerprintStats() {
   const MeasurementTip& tip = tipCatalog.tips[tipDetailIndex];
-  WhiteFingerprintStats stats = tip.whiteFingerprintStats(spectrometer.sensorId(), tipCatalog.whiteReferenceGeneration);
+  WhiteFingerprintStats stats = tip.whiteFingerprintStats(spectrometer.sensorId());
 
   char header[22];
   snprintf(header, sizeof(header), "N=%u", (unsigned)stats.n);
@@ -1966,8 +1949,7 @@ void loop() {
     if (tipMenuStage == TipMenuStage::List) {
       // "<Zurueck>" verlaesst den Messspitzen-Menuepunkt (zurueck in den
       // generischen Baum, auf "Messspitzen" stehend); "Neue Spitze anlegen"
-      // registriert+aktiviert sofort; "Fingerabdruecke invalidieren" erhoeht
-      // den Generations-Zaehler sofort; jeder andere Eintrag oeffnet das
+      // registriert+aktiviert sofort; jeder andere Eintrag oeffnet das
       // Detail-Menue der gewaehlten Spitze.
       if (te == DebouncedButton::Event::LongPress) {
         if (tipListIndex == 0) {
@@ -1975,8 +1957,6 @@ void loop() {
         } else if (tipListIndex == 1) {
           createTipFromCurrentSettings();
           tipListIndex = (uint8_t)(TIP_LIST_FIXED_ENTRIES + tipCatalog.tips.size() - 1);  // Cursor auf die neue Spitze
-        } else if (tipListIndex == 2) {
-          invalidateFingerprints();
         } else {
           tipDetailIndex = tipListIndex - TIP_LIST_FIXED_ENTRIES;
           tipActionIndex = 0;

@@ -35,63 +35,38 @@ void channelStdDev(const std::vector<const Measurement*>& samples, size_t ch,
   for (size_t c = 0; c < ch; c++) outStd[c] = sqrtf(outStd[c] / (float)(samples.size() - 1));
 }
 
-// Eine Gruppe von Fingerabdruecken, die untereinander direkt vergleichbar sind
-// (gleicher Sensor, gleiche Spitze [tipKey], gleiche Generation) -- jede
-// Spitze+Generation-Kombination ist statistisch eine eigene "virtuelle
-// Spitze" mit eigenem Mittelwert/eigener Streuung: unterschiedliche
-// Generationen haben eine andere physische Weissreferenz, unterschiedliche
-// Spitzen einen anderen optischen Pfad -- beides veraendert die absolute
-// Skala. 'tipKey' ist rein ein Identitaets-Diskriminator (Adresse der
-// jeweiligen MeasurementTip innerhalb des aktuellen isPlausible()-Aufrufs),
-// wird nie dereferenziert -- noetig, damit beim Poolen ueber MEHRERE andere
-// Spitzen hinweg deren Fingerabdruecke nicht faelschlich anhand einer
-// zufaellig gleichen 'generation' zusammengeworfen werden (die 'generation'
-// ist ein katalogweiter Zaehler, siehe TipCatalog::whiteReferenceGeneration --
-// zwei verschiedene Spitzen koennen also denselben Wert tragen, ohne
-// deshalb vergleichbar zu sein).
-struct FingerprintGroup {
-  const void* tipKey;
-  uint32_t generation;
-  std::vector<const Measurement*> samples;
-};
-
-void groupByGeneration(const MeasurementTip& tip, const std::string& sensorId,
-                        std::vector<FingerprintGroup>& groups) {
-  const void* key = &tip;
-  for (const WhiteFingerprint& fp : tip.whiteFingerprints) {
-    if (fp.sensorId != sensorId) continue;
-    FingerprintGroup* g = nullptr;
-    for (FingerprintGroup& existing : groups)
-      if (existing.tipKey == key && existing.generation == fp.generation) { g = &existing; break; }
-    if (!g) { groups.push_back({key, fp.generation, {}}); g = &groups.back(); }
-    g->samples.push_back(&fp.normalized);
-  }
-}
-
-// Aggregiert die Streuung (als Variationskoeffizient je Kanal) ueber mehrere
-// Gruppen hinweg, OHNE deren Rohwerte zu mischen: je Gruppe eigener
-// Mittelwert/eigene Standardabweichung, die daraus abgeleiteten
-// Variationskoeffizienten werden gewichtet (Gewicht = Gruppengroesse - 1, wie
-// bei einer gepoolten Varianz) gemittelt. Gruppen mit < 2 Eintraegen tragen
-// nichts bei (Standardabweichung nicht definiert). false, wenn in Summe zu
-// wenige Eintraege (< MIN_FINGERPRINTS_FOR_FALLBACK_STATS) beigetragen haben.
-bool pooledCoefficientOfVariation(const std::vector<FingerprintGroup>& groups, size_t ch,
-                                   std::vector<float>& outCv) {
+// Aggregiert die Streuung (als Variationskoeffizient je Kanal) ueber alle
+// ANDEREN Spitzen hinweg, OHNE deren Rohwerte zu mischen: je Spitze eigener
+// Mittelwert/eigene Standardabweichung (ihre Fingerabdruecke mit passender
+// sensorId), die daraus abgeleiteten Variationskoeffizienten werden gewichtet
+// (Gewicht = Anzahl Fingerabdruecke - 1, wie bei einer gepoolten Varianz)
+// gemittelt -- unterschiedliche Spitzen haben unterschiedliche optische
+// Pfade, also eine andere absolute Skala, deshalb je Spitze getrennt
+// berechnet statt alle Rohwerte einfach zusammenzuwerfen. Spitzen mit < 2
+// passenden Fingerabdruecken tragen nichts bei (Standardabweichung nicht
+// definiert). false, wenn in Summe zu wenige Eintraege
+// (< MIN_FINGERPRINTS_FOR_FALLBACK_STATS) beigetragen haben.
+bool pooledCoefficientOfVariation(const std::vector<MeasurementTip>& tips, const std::string& excludeName,
+                                   const std::string& sensorId, size_t ch, std::vector<float>& outCv) {
   std::vector<float> weightedSum(ch, 0.0f);
   float weightTotal = 0.0f;
   size_t contributingSamples = 0;
-  for (const FingerprintGroup& g : groups) {
-    if (g.samples.size() < 2) continue;
-    std::vector<float> mean = channelMean(g.samples, ch);
+  for (const MeasurementTip& t : tips) {
+    if (t.name == excludeName) continue;
+    std::vector<const Measurement*> samples;
+    for (const WhiteFingerprint& fp : t.whiteFingerprints)
+      if (fp.sensorId == sensorId) samples.push_back(&fp.normalized);
+    if (samples.size() < 2) continue;
+    std::vector<float> mean = channelMean(samples, ch);
     std::vector<float> std_;
-    channelStdDev(g.samples, ch, mean, std_);
-    float weight = (float)(g.samples.size() - 1);
+    channelStdDev(samples, ch, mean, std_);
+    float weight = (float)(samples.size() - 1);
     for (size_t c = 0; c < ch; c++) {
       float cv = (mean[c] > 0.0f) ? (std_[c] / mean[c]) : 0.0f;
       weightedSum[c] += weight * cv;
     }
     weightTotal += weight;
-    contributingSamples += g.samples.size();
+    contributingSamples += samples.size();
   }
   if (contributingSamples < MIN_FINGERPRINTS_FOR_FALLBACK_STATS || weightTotal <= 0.0f) return false;
   outCv.assign(ch, 0.0f);
@@ -108,11 +83,11 @@ PlausibilityResult MeasurementTip::isPlausible(const WhiteFingerprint& candidate
   // Sonderbehandlung fuer den leeren Fall noetig.
   const size_t ch = candidate.normalized.size();
 
-  // Nur Fingerabdruecke DERSELBEN (aktuellen) Generation UND desselben Sensors
-  // sind absolut vergleichbar (siehe FingerprintGroup-Kommentar oben).
+  // Nur Fingerabdruecke DESSELBEN Sensors sind absolut vergleichbar (siehe
+  // WhiteFingerprint-Kommentar in TipCatalog.h).
   std::vector<const Measurement*> own;
   for (const WhiteFingerprint& fp : whiteFingerprints)
-    if (fp.generation == candidate.generation && fp.sensorId == candidate.sensorId) own.push_back(&fp.normalized);
+    if (fp.sensorId == candidate.sensorId) own.push_back(&fp.normalized);
 
   if (own.empty()) return PlausibilityResult::Indeterminate;  // keine Vergleichsbasis
 
@@ -123,24 +98,13 @@ PlausibilityResult MeasurementTip::isPlausible(const WhiteFingerprint& candidate
   if (own.size() >= MIN_FINGERPRINTS_FOR_DIRECT_STATS) {
     channelStdDev(own, ch, ownMean, effectiveStd);
   } else {
-    // Fallback: aeltere Generationen DERSELBEN Spitze zuerst, sonst alle
-    // Fingerabdruecke ALLER ANDEREN Spitzen -- je Spitze+Generation eine
-    // eigene Gruppe (siehe FingerprintGroup), nur der gepoolte
-    // Variationskoeffizient wird uebernommen.
-    std::vector<FingerprintGroup> ownTipGroups;
-    groupByGeneration(*this, candidate.sensorId, ownTipGroups);
-    std::vector<FingerprintGroup> olderGenerations;
-    for (FingerprintGroup& g : ownTipGroups)
-      if (g.generation != candidate.generation) olderGenerations.push_back(g);
-
+    // Fallback: zu wenige eigene Fingerabdruecke fuer eine direkte Schaetzung
+    // -- Streuung stattdessen aus den Fingerabdruecken ALLER ANDEREN Spitzen
+    // schaetzen (nur der gepoolte Variationskoeffizient wird uebernommen,
+    // siehe pooledCoefficientOfVariation()).
     std::vector<float> cv;
-    if (!pooledCoefficientOfVariation(olderGenerations, ch, cv)) {
-      std::vector<FingerprintGroup> otherTipGroups;
-      for (const MeasurementTip& t : catalog.tips) {
-        if (t.name == name) continue;
-        groupByGeneration(t, candidate.sensorId, otherTipGroups);
-      }
-      if (!pooledCoefficientOfVariation(otherTipGroups, ch, cv)) return PlausibilityResult::Indeterminate;
+    if (!pooledCoefficientOfVariation(catalog.tips, name, candidate.sensorId, ch, cv)) {
+      return PlausibilityResult::Indeterminate;
     }
 
     effectiveStd.assign(ch, 0.0f);
@@ -158,12 +122,11 @@ PlausibilityResult MeasurementTip::isPlausible(const WhiteFingerprint& candidate
   return viaFallback ? PlausibilityResult::PlausibleViaFallback : PlausibilityResult::Plausible;
 }
 
-WhiteFingerprintStats MeasurementTip::whiteFingerprintStats(const std::string& sensorId,
-                                                              uint32_t generation) const {
+WhiteFingerprintStats MeasurementTip::whiteFingerprintStats(const std::string& sensorId) const {
   WhiteFingerprintStats result;
   std::vector<const Measurement*> own;
   for (const WhiteFingerprint& fp : whiteFingerprints)
-    if (fp.generation == generation && fp.sensorId == sensorId) own.push_back(&fp.normalized);
+    if (fp.sensorId == sensorId) own.push_back(&fp.normalized);
 
   result.n = own.size();
   if (own.empty()) return result;
