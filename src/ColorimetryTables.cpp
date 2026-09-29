@@ -1,6 +1,5 @@
 #include "ColorimetryTables.h"
 #include <cmath>
-#include <vector>
 
 // Generiert mit colour-science (CIE 1931 2 Degree Standard Observer, D50),
 // 5nm-Raster 380-730nm. Siehe ColorimetryTables.h fuer die Quelle.
@@ -90,27 +89,39 @@ const float CIE_D50_SPD[CIE_N_WL] = {
   91.604000f, 92.246000f, 92.889000f, 84.872000f, 76.854000f, 81.683000f, 86.511000f,
 };
 
-void spectrumToXYZ(const float* wavelengths_nm, const float* values, int n,
+// FWHM (volle Breite bei halbem Maximum) einer Normalverteilung ->
+// Standardabweichung: FWHM = 2*sqrt(2*ln2)*sigma.
+static const float FWHM_TO_SIGMA = 1.0f / 2.35482f;
+
+void spectrumToXYZ(const Band* bands, const float* values, int n,
                     float& X, float& Y, float& Z) {
   X = Y = Z = 0.0f;
   float k = 0.0f;
   for (int i = 0; i < CIE_N_WL; i++) {
     float wl = (float)(CIE_WL_MIN + i * CIE_WL_STEP);
 
-    // Linear interpolieren, flach extrapoliert ausserhalb [wavelengths_nm[0], wavelengths_nm[n-1]]
-    float R;
-    if (wl <= wavelengths_nm[0]) {
-      R = values[0];
-    } else if (wl >= wavelengths_nm[n - 1]) {
-      R = values[n - 1];
-    } else {
-      int j = 0;
-      while (j + 1 < n && wavelengths_nm[j + 1] < wl) j++;
-      float x0 = wavelengths_nm[j], x1 = wavelengths_nm[j + 1];
-      float y0 = values[j], y1 = values[j + 1];
-      float t = (wl - x0) / (x1 - x0);
-      R = y0 + t * (y1 - y0);
+    // Gauss-gewichtete Summe ueber alle Baender (siehe Header-Kommentar) statt
+    // linearer Interpolation zwischen Bandmitten -- jedes Band traegt gemaess
+    // seiner eigenen (nahezu gaussfoermigen) Empfindlichkeitskurve zu R(wl)
+    // bei, nicht nur die beiden rechnerisch naechstgelegenen. Der Nenner wird
+    // auf MINDESTENS 1 gehalten statt strikt zu normalisieren: im eigentlichen
+    // Messbereich (Baender ueberlappen, Gewichtssumme >= 1) ergibt das einen
+    // echten gewichteten Mittelwert wie zuvor; weit ausserhalb ALLER Baender
+    // (Gewichtssumme -> 0) laesst es R(wl) dagegen glatt gegen 0 auslaufen,
+    // statt sich beliebig auf den naechstgelegenen Bandwert zu versteifen --
+    // fuer die CIE-Integration ohnehin der einzig relevante Fall dort: die
+    // Normbeobachter-Kurven selbst sind an den Raendern von 380-730nm schon
+    // vernachlaessigbar klein, R(wl) spielt dort fuer X/Y/Z keine Rolle mehr.
+    float weightedSum = 0.0f, weightTotal = 0.0f;
+    for (int j = 0; j < n; j++) {
+      float sigma = bands[j].fwhm_nm * FWHM_TO_SIGMA;
+      if (sigma <= 0.0f) continue;
+      float d = (wl - bands[j].center_nm) / sigma;
+      float w = expf(-0.5f * d * d);
+      weightedSum += w * values[j];
+      weightTotal += w;
     }
+    float R = weightedSum / fmaxf(weightTotal, 1.0f);
 
     float illum = CIE_D50_SPD[i];
     float xb = CIE_CMF[i][0], yb = CIE_CMF[i][1], zb = CIE_CMF[i][2];
@@ -171,11 +182,7 @@ void labToSRGB255(const Lab& lab, uint8_t& r, uint8_t& g, uint8_t& b) {
 }
 
 Lab getColor(const Spectrum& spectrum) {
-  size_t n = spectrum.bands.size();
-  std::vector<float> wavelengths(n);
-  for (size_t i = 0; i < n; i++) wavelengths[i] = spectrum.bands[i].center_nm;
-
   float X, Y, Z;
-  spectrumToXYZ(wavelengths.data(), spectrum.values.data(), (int)n, X, Y, Z);
+  spectrumToXYZ(spectrum.bands.data(), spectrum.values.data(), (int)spectrum.bands.size(), X, Y, Z);
   return xyzToLab(X, Y, Z);
 }

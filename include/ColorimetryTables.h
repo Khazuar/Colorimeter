@@ -19,10 +19,18 @@ static const float D50_XN = 96.429568f;
 static const float D50_YN = 100.000000f;
 static const float D50_ZN = 82.510460f;
 
-// Integriert R(lambda) (linear interpoliert an CIE_CMF-Stuetzstellen) gegen
-// CIE_CMF*CIE_D50_SPD zu XYZ, normalisiert so dass ein perfekter Diffusor (R=1
-// ueberall) auf Y=100 abgebildet wird.
-void spectrumToXYZ(const float* wavelengths_nm, const float* values, int n,
+// Integriert R(lambda) gegen CIE_CMF*CIE_D50_SPD zu XYZ, normalisiert so dass
+// ein perfekter Diffusor (R=1 ueberall) auf Y=100 abgebildet wird. R(lambda)
+// wird an jeder CIE_CMF-Stuetzstelle aus ALLEN Baendern rekonstruiert (Gewicht
+// je Band = Gausskurve um dessen center_nm mit einer aus fwhm_nm abgeleiteten
+// Breite) statt linear zwischen Bandmitten zu interpolieren -- die AS7341-
+// Empfindlichkeitskurven je Band sind laut Datenblatt selbst nahezu
+// gaussfoermig, das bildet die tatsaechliche physikalische Bandform nach,
+// statt sie durch Geradenstuecke zu ersetzen. Im ueberlappenden Kernbereich
+// der Baender ergibt das einen echten gewichteten Mittelwert; weit ausserhalb
+// aller Baender klingt R(lambda) glatt gegen 0 ab (siehe spectrumToXYZ) --
+// dort sind ohnehin auch die Normbeobachter-Kurven selbst vernachlaessigbar.
+void spectrumToXYZ(const Band* bands, const float* values, int n,
                     float& X, float& Y, float& Z);
 
 Lab  xyzToLab(float X, float Y, float Z);
@@ -33,8 +41,9 @@ void xyzToSRGB255(float X, float Y, float Z, uint8_t& r, uint8_t& g, uint8_t& b)
 void labToXYZ(const Lab& lab, float& X, float& Y, float& Z);
 void labToSRGB255(const Lab& lab, uint8_t& r, uint8_t& g, uint8_t& b);
 
-// Leitet eine Lab-Farbe aus einem sensor-unabhaengigen Spectrum ab (CIE-
-// Integration ueber die Bandzentren, siehe spectrumToXYZ). Bewusst NICHT Teil
-// der Spectrometer-Abstraktion -- generische Farbwissenschaft, haengt von
-// keinen Sensor-Details ab, nur vom (bereits kalibrierten) Spectrum.
+// Leitet eine Lab-Farbe aus einem sensor-unabhaengigen Spectrum ab (Gauss-
+// gewichtete CIE-Integration ueber Bandzentrum+-breite, siehe spectrumToXYZ).
+// Bewusst NICHT Teil der Spectrometer-Abstraktion -- generische
+// Farbwissenschaft, haengt von keinen Sensor-Details ab, nur vom (bereits
+// kalibrierten) Spectrum.
 Lab getColor(const Spectrum& spectrum);
