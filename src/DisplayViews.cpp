@@ -1,7 +1,6 @@
 #include "DisplayViews.h"
 #include "AppConfig.h"
 #include "ColorimetryTables.h"
-#include "ColorNames.h"
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -33,8 +32,8 @@ static void renderNoMeasurementYet(Adafruit_SSD1306& d) {
   d.println("Trigger druecken");
 }
 
-// Ersetzt die fruehere LabHex- und NearestName-View: Label, L*/a*/b*, naechster
-// Farbname+DeltaE und Hex-Code, alles auf einem Screen.
+// Ersetzt die fruehere LabHex-View: Label, L*/a*/b* und Hex-Code, alles auf
+// einem Screen.
 static void renderColorInfo(Adafruit_SSD1306& d, const ViewContext& ctx) {
   d.clearDisplay();
   d.setTextColor(SSD1306_WHITE);
@@ -49,8 +48,6 @@ static void renderColorInfo(Adafruit_SSD1306& d, const ViewContext& ctx) {
     Lab lab = getColor(spec);
     uint8_t r, g, b;
     labToSRGB255(lab, r, g, b);
-    float dE;
-    const char* name = nearestColorName(lab, &dE);
 
     char line[24];
     d.setCursor(0, 0);
@@ -60,9 +57,6 @@ static void renderColorInfo(Adafruit_SSD1306& d, const ViewContext& ctx) {
     snprintf(line, sizeof(line), "L* %6.2f", lab.L); d.println(line);
     snprintf(line, sizeof(line), "a* %6.2f", lab.a); d.println(line);
     snprintf(line, sizeof(line), "b* %6.2f", lab.b); d.println(line);
-
-    snprintf(line, sizeof(line), "%s dE%.1f", name, dE);
-    d.println(line);
 
     snprintf(line, sizeof(line), "#%02X%02X%02X", r, g, b);
     d.setTextSize(2);
