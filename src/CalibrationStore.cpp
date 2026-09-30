@@ -1,5 +1,6 @@
 #include "CalibrationStore.h"
 #include "SettingsCodec.h"
+#include <Arduino.h>
 #include <ArduinoJson.h>
 #include <LittleFS.h>
 
@@ -182,10 +183,18 @@ static bool deserializeTipCatalog(Stream& in, TipCatalog& out) {
 // missinterpretiert zu werden. Keine Migration: nach dem Flashen dieser
 // Aenderung springen Einstellungen/Referenzen einmalig auf ihre Defaults
 // zurueck, genau wie bei einem Erstboot.
+//
+// WICHTIG: NVS-Keys duerfen laut ESP-IDF hoechstens 15 Zeichen lang sein
+// (Preferences::putString()/getString() -> nvs_set_str()/nvs_get_str()
+// scheitern sonst mit ESP_ERR_NVS_KEY_TOO_LONG -- die Preferences-Bibliothek
+// meldet das nur per log_e(), der Rueckgabewert wird unten deshalb explizit
+// geprueft). "*_settings_json" waere 18-19 Zeichen lang gewesen und ist
+// NIEMALS tatsaechlich gespeichert worden -- "*_cfg_json" bleibt knapp
+// darunter.
 bool CalibrationStore::loadDark(Measurement& out, OpticalSettings& optical) {
   bool ok = load("dark_raw", out);
   if (ok) {
-    String json = prefs_.getString("dark_settings_json", "");
+    String json = prefs_.getString("dark_cfg_json", "");
     if (json.isEmpty() || !deserializeOpticalSettings(json, optical)) optical = OpticalSettings();
   }
   return ok;
@@ -194,7 +203,7 @@ bool CalibrationStore::loadDark(Measurement& out, OpticalSettings& optical) {
 bool CalibrationStore::loadWhite(Measurement& out, OpticalSettings& optical) {
   bool ok = load("white_raw", out);
   if (ok) {
-    String json = prefs_.getString("white_settings_json", "");
+    String json = prefs_.getString("white_cfg_json", "");
     if (json.isEmpty() || !deserializeOpticalSettings(json, optical)) optical = OpticalSettings();
   }
   return ok;
@@ -202,22 +211,28 @@ bool CalibrationStore::loadWhite(Measurement& out, OpticalSettings& optical) {
 
 void CalibrationStore::saveDark(const Measurement& v, const OpticalSettings& optical) {
   save("dark_raw", v);
-  prefs_.putString("dark_settings_json", serializeOpticalSettings(optical));
+  if (!prefs_.putString("dark_cfg_json", serializeOpticalSettings(optical))) {
+    Serial.println("# dark_cfg_json: NVS-Schreibfehler");
+  }
 }
 
 void CalibrationStore::saveWhite(const Measurement& v, const OpticalSettings& optical) {
   save("white_raw", v);
-  prefs_.putString("white_settings_json", serializeOpticalSettings(optical));
+  if (!prefs_.putString("white_cfg_json", serializeOpticalSettings(optical))) {
+    Serial.println("# white_cfg_json: NVS-Schreibfehler");
+  }
 }
 
 bool CalibrationStore::loadSettings(RootSettings& out) {
-  String json = prefs_.getString("live_settings_json", "");
+  String json = prefs_.getString("live_cfg_json", "");
   if (json.isEmpty()) { out = RootSettings(); return false; }
   return deserializeRootSettings(json, out);
 }
 
 void CalibrationStore::saveSettings(const RootSettings& v) {
-  prefs_.putString("live_settings_json", serializeRootSettings(v));
+  if (!prefs_.putString("live_cfg_json", serializeRootSettings(v))) {
+    Serial.println("# live_cfg_json: NVS-Schreibfehler");
+  }
 }
 
 // Auf LittleFS statt NVS/Preferences -- siehe Kommentar an TIPS_PATH oben.
