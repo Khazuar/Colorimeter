@@ -80,6 +80,19 @@ static void countingVisitor(const MeasurementRecord&, void* userData) {
   (*reinterpret_cast<size_t*>(userData))++;
 }
 
+// clear()-Helfer: merkt sich die LETZTE Dark- bzw. White-Zeile (per
+// Ueberschreiben bei jedem weiteren Treffer waehrend des chronologischen
+// Durchlaufs bleibt am Ende jeweils die juengste uebrig).
+struct LastRefCtx {
+  bool haveDark = false, haveWhite = false;
+  MeasurementRecord dark, white;
+};
+static void collectLastRefVisitor(const MeasurementRecord& rec, void* userData) {
+  LastRefCtx* ctx = reinterpret_cast<LastRefCtx*>(userData);
+  if (rec.kind == SampleKind::Dark) { ctx->dark = rec; ctx->haveDark = true; }
+  else if (rec.kind == SampleKind::White) { ctx->white = rec; ctx->haveWhite = true; }
+}
+
 bool HistoryStore::begin() {
   if (!LittleFS.begin(/*formatOnFail=*/true)) {
     Serial.println("# LittleFS mount failed -- Historie bleibt deaktiviert");
@@ -137,11 +150,29 @@ bool HistoryStore::append(const MeasurementRecord& rec) {
   return true;
 }
 
+// Behaelt bewusst die letzte Dark- UND die letzte White-Zeile (falls
+// vorhanden), statt die Historie restlos zu leeren: main.cpp berechnet
+// Reflexion/Lab/Hex fuer eine Messung gegen die Dark-/Weisszeile, die
+// chronologisch zuletzt VOR ihr in der Historie steht (siehe
+// SettingsRefState/observeReference() in main.cpp) -- ohne mindestens eine
+// erhaltene Referenzzeile koennten danach aufgenommene Messungen (bis zur
+// naechsten ECHTEN Referenzmessung) nicht mehr korrekt ausgewertet werden,
+// obwohl die zugehoerige Kalibrierung weiterhin gueltig ist. Die vollen,
+// ORIGINALEN Zeilen (samt Telemetrie) werden 1:1 zurueckgeschrieben -- keine
+// rekonstruierte/vereinfachte Ersatzzeile, deshalb ueber den normalen
+// append()-Pfad statt eines main.cpp-seitig neu gebauten MeasurementRecord.
 void HistoryStore::clear() {
   if (!mounted_) return;
+
+  LastRefCtx ref;
+  forEach(collectLastRefVisitor, &ref);
+
   File f = LittleFS.open(HISTORY_PATH, FILE_WRITE, true);  // "w" trunkiert automatisch
   if (f) f.close();
   count_ = 0;
+
+  if (ref.haveDark)  append(ref.dark);
+  if (ref.haveWhite) append(ref.white);
 }
 
 void HistoryStore::forEach(RecordVisitor visitor, void* userData) const {

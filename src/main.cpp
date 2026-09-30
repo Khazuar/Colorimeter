@@ -565,23 +565,16 @@ struct SettingsRefState {
   Measurement dark, white;  // je leer, falls fuer 'settings' noch nie gemessen
 };
 
-// Start-Zustand fuer einen Durchlauf: die aktuell geladene (live) Referenz als
-// Ausgangspunkt -- Absicherung, falls die Historie zwischenzeitlich geleert
-// wurde (historyStore.clear()) und deshalb selbst keine passende Dark-/
-// Weisszeile mehr enthaelt, obwohl die live geladene Referenz weiterhin gilt.
-std::vector<SettingsRefState> initialRefState() {
-  std::vector<SettingsRefState> states;
-  if (!darkRef.empty()) states.push_back({darkRefSettings, darkRef, {}});
-  if (!whiteRef.empty()) {
-    for (SettingsRefState& s : states) {
-      if (s.settings == whiteRefSettings) { s.white = whiteRef; return states; }
-    }
-    states.push_back({whiteRefSettings, {}, whiteRef});
-  }
-  return states;
-}
-
 // Aktualisiert 'states' mit einer Dark-/White-Zeile (kein Effekt fuer Regular).
+// KEIN Start-Seed aus der live geladenen Referenz (bewusst -- fruehere
+// Version hatte einen: seedete IMMER mit dem beim EXPORT-Zeitpunkt aktuellen
+// darkRef/whiteRef, was nach einem spaeteren Referenzwechsel dazwischen
+// aufgenommene Messungen stillschweigend gegen die FALSCHE, naemlich die
+// NEUERE Referenz ausgewertet haette. historyStore.clear() behaelt seither
+// selbst die letzte Dark-/Weisszeile (siehe dort), das deckt den Normalfall
+// vollstaendig ab. Ohne jede passende Zeile bleiben betroffene Messungen
+// jetzt bewusst OHNE Reflexion/Lab/Hex im Export -- sichtbar fehlende
+// Rohdaten-only-Zeilen statt einer heimlich falschen Berechnung.
 void observeReference(std::vector<SettingsRefState>& states, const MeasurementRecord& rec) {
   if (rec.kind != SampleKind::Dark && rec.kind != SampleKind::White) return;
   for (SettingsRefState& s : states) {
@@ -666,7 +659,7 @@ std::string buildHistoryCsv(bool includeRaw) {
   std::string out;
 
   std::vector<Band> bandColumns;
-  BandCollectCtx collectCtx{ &bandColumns, initialRefState() };
+  BandCollectCtx collectCtx{ &bandColumns, {} };
   historyStore.forEach(collectBandsVisitor, &collectCtx);
   std::sort(bandColumns.begin(), bandColumns.end(), [](const Band& a, const Band& b) {
     return a.center_nm < b.center_nm;
@@ -680,9 +673,7 @@ std::string buildHistoryCsv(bool includeRaw) {
   out += ",L,a,b,hex";
   if (includeRaw) {
     const char* const* labels = spectrometer.measurementLabels();
-    size_t n = !darkRef.empty()  ? darkRef.size()
-             : !whiteRef.empty() ? whiteRef.size()
-                                 : historyStore.firstRecordChannelCount();
+    size_t n = historyStore.firstRecordChannelCount();
     for (size_t i = 0; i < n; i++) { out += ','; out += labels[i]; }
   }
   out += '\n';
@@ -698,12 +689,7 @@ std::string buildHistoryCsv(bool includeRaw) {
            (unsigned long)uptimeLogger.measurementCount());
   out += uptimeLine;
 
-  if (includeRaw) {
-    if (!darkRef.empty())  appendCsvRow(out, "dark_ref",  darkRef,  FilterState::None, false, true, bandColumns);
-    if (!whiteRef.empty()) appendCsvRow(out, "white_ref", whiteRef, FilterState::None, false, true, bandColumns);
-  }
-
-  CsvBuildCtx ctx{ &out, includeRaw, &bandColumns, initialRefState() };
+  CsvBuildCtx ctx{ &out, includeRaw, &bandColumns, {} };
   historyStore.forEach(appendRecordToCsv, &ctx);
   return out;
 }
@@ -1878,7 +1864,7 @@ void loop() {
     if (exportPage == ExportPage::Clear) {
       if (te == DebouncedButton::Event::LongPress) {
         flashBorder();
-        historyStore.clear();
+        historyStore.clear();  // behaelt die letzte Dark-/Weisszeile, siehe dort
         renderCurrentView();
       }
     } else if (te == DebouncedButton::Event::Pressed) {
