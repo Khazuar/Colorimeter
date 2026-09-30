@@ -1,7 +1,7 @@
 #pragma once
 #include <Adafruit_AS7341.h>
 #include <cstdint>
-#include "Spectrometer.h"  // FilterState (Teil von AcquisitionSettings, siehe unten)
+#include "Spectrometer.h"  // FilterState (Teil von OpticalSettings, siehe unten)
 
 // ------------------------- I2C / Bus -------------------------
 static const uint8_t  SDA_PIN = 6;
@@ -15,7 +15,7 @@ static const uint8_t OLED_ADDR   = 0x3C;
 
 // ------------------------- AS7341 Timing -------------------------
 // Nur noch Startwerte fuer den allerersten Boot (vorher fest verdrahtet) --
-// zur Laufzeit im Settings-Modus einstellbar, siehe AcquisitionSettings unten.
+// zur Laufzeit im Settings-Baum einstellbar, siehe SensorSettings unten.
 static const uint8_t       AS_ATIME = 100;
 static const uint16_t      AS_ASTEP = 999;                 // ~281 ms Integration bei diesem Startwert
 static const as7341_gain_t AS_GAIN  = AS7341_GAIN_512X;    // Weiss bleibt unter Vollausschlag
@@ -68,19 +68,52 @@ enum class SampleKind : uint8_t { Regular = 0, Dark = 1, White = 2, COUNT = 3 };
 // Settings-Registry/Label-Tabelle (main.cpp).
 static const uint8_t AS7341_GAIN_COUNT = 11;
 
-// Buendel aller Sensor-/Aufnahme-Einstellungen, die eine Messung beeinflussen
-// -- als Ganzes verglichen (siehe main.cpp::calibrationValidFor()), pro
-// Messung mitgespeichert/exportiert und live im Settings-Modus editierbar.
-// AS_ATIME/AS_ASTEP/AS_GAIN dienen hier nur noch als Startwerte.
-struct AcquisitionSettings {
-  FilterState filterState = FilterState::None;
+// Gain/ATIME/ASTEP als Block -- siehe schema/settings.schema.json ("sensor").
+// Wird UNVERAENDERT als Ganzes als Teil von OpticalSettings verwendet (siehe
+// dort). AS_ATIME/AS_ASTEP/AS_GAIN dienen hier nur noch als Startwerte fuer
+// den allerersten Boot.
+struct SensorSettings {
   as7341_gain_t gain = AS_GAIN;
   uint8_t atime = AS_ATIME;
   uint16_t astep = AS_ASTEP;
-  bool operator==(const AcquisitionSettings& o) const {
-    return filterState == o.filterState && gain == o.gain && atime == o.atime && astep == o.astep;
+  bool operator==(const SensorSettings& o) const {
+    return gain == o.gain && atime == o.atime && astep == o.astep;
   }
-  bool operator!=(const AcquisitionSettings& o) const { return !(*this == o); }
+  bool operator!=(const SensorSettings& o) const { return !(*this == o); }
+};
+
+// Alle Einstellungen, die den optischen Pfad des Geraets betreffen (Filter +
+// Sensor-Tuning) -- eine ECHTE thematische Gruppe (nicht nur zufaellig gleich
+// geformt wie RootSettings::optical, siehe dort). Wird UNVERAENDERT als
+// Ganzes an AS7341Spectrometer::applySettings()/main.cpp::calibrationValidFor()
+// uebergeben, pro Messung/Referenz eingefroren (siehe
+// HistoryStore::MeasurementRecord::settings, main.cpp darkRefSettings/
+// whiteRefSettings -- das sind Snapshots "womit wurde das gemessen") UND ist
+// genau das, was jede Messspitze im Katalog speichert (main.cpp/TipCatalog.h)
+// -- eine Spitze ist im Kern "ein benannter OpticalSettings-Stand". Selbst
+// KEIN Einstellungs-Knoten -- wird nie selbst editiert oder im Settings-Baum
+// navigiert, siehe RootSettings unten dafuer. Siehe schema/settings.schema.json
+// ("optical").
+struct OpticalSettings {
+  FilterState filterState = FilterState::None;
+  SensorSettings sensor;
+  bool operator==(const OpticalSettings& o) const {
+    return filterState == o.filterState && sensor == o.sensor;
+  }
+  bool operator!=(const OpticalSettings& o) const { return !(*this == o); }
+};
+
+// Die tatsaechliche Einstellungs-Hierarchie: UI-Baum-Wurzel UND das, was als
+// EIN JSON-Dokument persistiert wird (CalibrationStore::save/loadSettings()).
+// Siehe schema/settings.schema.json ("Settings") -- BEIDE (dieses Struct und
+// die Schema-Datei) bei Aenderungen zusammen pflegen. Gruppiert aktuell genau
+// eine thematische Gruppe (optical); kuenftige, andersartige Einstellungen
+// (z.B. Sprache, Bluetooth-Name) werden hier als weitere, EIGENE
+// Geschwisterfelder ergaenzt -- NICHT in optical hineingemischt.
+struct RootSettings {
+  OpticalSettings optical;
+  bool operator==(const RootSettings& o) const { return optical == o.optical; }
+  bool operator!=(const RootSettings& o) const { return !(*this == o); }
 };
 
 // BLE-Export (Nordic UART Service) -- Geraetename ist app-weit relevant (main.cpp

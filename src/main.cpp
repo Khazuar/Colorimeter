@@ -10,7 +10,9 @@
 #include "AppConfig.h"
 #include "Spectrometer.h"
 #include "AS7341Spectrometer.h"
+#include "SettingsCodec.h"
 #include "CalibrationStore.h"
+#include "TipCatalog.h"
 #include "Buttons.h"
 #include "DisplayViews.h"
 #include "BleExporter.h"
@@ -30,21 +32,22 @@ Spectrometer& spectrometer = sensorImpl;
 // ------------------------- Kalibrierung: Sache der Orchestrierung -------------------------
 CalibrationStore calStore;
 Measurement darkRef, whiteRef;
-AcquisitionSettings darkRefSettings;   // eingefroren MIT darkRef, siehe CalibrationStore
-AcquisitionSettings whiteRefSettings;  // eingefroren MIT whiteRef
+OpticalSettings darkRefSettings;   // eingefroren MIT darkRef, siehe CalibrationStore
+OpticalSettings whiteRefSettings;  // eingefroren MIT whiteRef
 bool calibrated = false;  // "Referenz passt zu den AKTUELL gewaehlten Einstellungen" -- siehe calibrationValidFor()
 
-// Aktuell im Settings-Modus gewaehlte Einstellungen (siehe DisplayMode::Settings).
-AcquisitionSettings currentSettings;
+// Aktuell im Settings-Baum gewaehlte Einstellungs-Hierarchie (siehe
+// DisplayMode::Settings sowie RootSettings/OpticalSettings in AppConfig.h).
+RootSettings currentSettings;
 
 // Liefert true, wenn sowohl Dark- als auch White-Referenz vorhanden sind UND
-// beide unter GENAU dem angegebenen Einstellungs-Buendel (Filter+Gain+ATIME+
+// beide unter GENAU dem angegebenen OpticalSettings (Filter+Gain+ATIME+
 // ASTEP) aufgenommen wurden. Zentrale Stelle fuer die Regel "weicht auch nur
 // eine Einstellung ab, gilt die Referenz als nicht vorhanden" -- wird fuer die
 // Live-Anzeige (gegen lastMeasurementSettings), den globalen "ready/need cal"-
-// Status (gegen currentSettings) UND den CSV-Export (gegen rec.settings jeder
-// Zeile) gleichermassen benutzt.
-bool calibrationValidFor(const AcquisitionSettings& s) {
+// Status (gegen currentSettings.optical) UND den CSV-Export (gegen
+// rec.settings jeder Zeile) gleichermassen benutzt.
+bool calibrationValidFor(const OpticalSettings& s) {
   return !darkRef.empty() && !whiteRef.empty()
       && darkRefSettings == s && whiteRefSettings == s;
 }
@@ -59,7 +62,7 @@ char lastLabel[16] = "";
 // waren -- eingefroren, NICHT die live im Settings-Modus editierbaren
 // currentSettings (siehe renderCurrentView() fuer die Begruendung dieser
 // Asymmetrie).
-AcquisitionSettings lastMeasurementSettings;
+OpticalSettings lastMeasurementSettings;
 bool busy = false;  // waehrend true: keine weitere Messung/kein weiterer Export ausloesbar
 
 DisplayMode currentDisplayMode = DisplayMode::Measure;
@@ -151,22 +154,10 @@ const char* filterStateUiLabel(FilterState fs) {
     default:                       return "kein Filter";
   }
 }
-const char* filterStateCsvLabel(FilterState fs) {
-  switch (fs) {
-    case FilterState::Filter650nm: return "650nm";
-    case FilterState::Filter700nm: return "700nm";
-    default:                       return "none";
-  }
-}
-
-// Reihenfolge == as7341_gain_t (siehe Adafruit_AS7341.h), verifiziert.
-static const char* const GAIN_LABELS[AS7341_GAIN_COUNT] = {
-  "0.5X", "1X", "2X", "4X", "8X", "16X", "32X", "64X", "128X", "256X", "512X"
-};
-const char* gainCsvLabel(as7341_gain_t g) {
-  uint8_t i = static_cast<uint8_t>(g);
-  return (i < AS7341_GAIN_COUNT) ? GAIN_LABELS[i] : "?";
-}
+// filterStateCsvLabel()/gainCsvLabel() (fuer CSV-Export UND die neuen
+// Settings-Baumknoten-Labels) wohnen jetzt in SettingsCodec.h/.cpp -- dieselbe
+// Quelle, die auch die JSON-Persistenz (CalibrationStore.cpp) nutzt, damit
+// beide niemals auseinanderlaufen.
 
 // "single"/"precision" -- wortwoertlich wie vom Nutzer benannt, statt der
 // internen Enum-Namen Single/Precise.
@@ -174,63 +165,245 @@ const char* precisionCsvLabel(Precision p) {
   return (p == Precision::Precise) ? "precision" : "single";
 }
 
-struct SettingDescriptor {
+// Settings sind eine beliebig tief verschachtelbare Baumstruktur (siehe Plan)
+// statt einer flachen Liste -- deren Form folgt RootSettings/AppConfig.h.
+// Ein Knoten ist ein Blatt (editierbarer Wert, wie bisher SettingDescriptor),
+// ein Navigationsknoten (fuehrt per langem Trigger-Druck eine Ebene tiefer),
+// der fiktive "<Zurueck>"-Eintrag (fuehrt eine Ebene hoeher) ODER TipList --
+// ein main.cpp-lokaler Sonderfall, der statt in den generischen Baum-Stack in
+// einen eigenen, main.cpp-lokalen Unterfluss abzweigt (siehe TipMenuStage/
+// tipCatalog weiter unten), weil der Messspitzen-Katalog dynamisch ist (keine
+// zur Compile-Zeit feste Kinderliste). Ein Knoten traegt IMMER alle Felder,
+// auch wenn nur ein Teil je nach 'kind' benutzt wird -- gleiche Pragmatik wie
+// zuvor bei SettingDescriptor (dort war z.B. valueLabel nur bei
+// digitCount==1 belegt).
+enum class SettingsNodeKind : uint8_t { Leaf, Branch, Back, TipList };
+
+struct SettingsNode {
   const char* name;
+  SettingsNodeKind kind;
+  // Leaf:
   uint8_t digitCount;                             // 1 = enum-artig (Filter, Gain)
   uint8_t digitCycleLen[DigitEditor::MAX_DIGITS];  // Zyklus-Laenge je Ziffernposition
   uint32_t maxValue;                               // Clamp des Endwerts (siehe DigitEditor::assembledValue())
   const char* (*valueLabel)(uint32_t value);       // nur bei digitCount==1, sonst nullptr (Ziffern direkt gerendert)
   uint32_t (*getValue)();
   void (*setValue)(uint32_t value);                // einmalig beim Abschluss der Bearbeitung aufgerufen
+  // Branch:
+  const SettingsNode* children;
+  uint8_t childCount;
 };
+
+// ------------------------- Messspitzen-Katalog -------------------------
+// Siehe TipCatalog.h fuer die Invariante (nie leer, 'active' immer gueltig)
+// und main.cpp::setup() fuer deren Herstellung beim allerersten Boot.
+TipCatalog tipCatalog;
 
 // Gemeinsamer Abschluss fuer jede Einstellungsaenderung: persistieren +
 // calibrated neu bewerten (kann durch eine reine Einstellungsaenderung sofort
-// kippen, ganz ohne neue Messung).
+// kippen, ganz ohne neue Messung) + die aktive Messspitze mit dem neuen Stand
+// synchronisieren (siehe Kontext/Plan: "zuletzt eingestellte Werte je Spitze").
 void commitCurrentSettings() {
   calStore.saveSettings(currentSettings);
-  calibrated = calibrationValidFor(currentSettings);
+  calibrated = calibrationValidFor(currentSettings.optical);
+
+  MeasurementTip* active = tipCatalog.activeTip();
+  if (active) {
+    active->optical = currentSettings.optical;
+    calStore.saveTips(tipCatalog);
+  }
 }
 
 const char* filterSettingLabel(uint32_t v) { return filterStateUiLabel(static_cast<FilterState>(v)); }
-uint32_t getFilterSetting() { return static_cast<uint32_t>(currentSettings.filterState); }
+uint32_t getFilterSetting() { return static_cast<uint32_t>(currentSettings.optical.filterState); }
 void setFilterSetting(uint32_t v) {
-  currentSettings.filterState = static_cast<FilterState>(v);
+  currentSettings.optical.filterState = static_cast<FilterState>(v);
   commitCurrentSettings();
 }
 
-const char* gainSettingLabel(uint32_t v) { return (v < AS7341_GAIN_COUNT) ? GAIN_LABELS[v] : "?"; }
-uint32_t getGainSetting() { return static_cast<uint32_t>(currentSettings.gain); }
+const char* gainSettingLabel(uint32_t v) { return gainCsvLabel(static_cast<as7341_gain_t>(v)); }
+uint32_t getGainSetting() { return static_cast<uint32_t>(currentSettings.optical.sensor.gain); }
 void setGainSetting(uint32_t v) {
-  currentSettings.gain = static_cast<as7341_gain_t>(v);
-  sensorImpl.applySettings(currentSettings);
+  currentSettings.optical.sensor.gain = static_cast<as7341_gain_t>(v);
+  sensorImpl.applySettings(currentSettings.optical);
   commitCurrentSettings();
 }
 
-uint32_t getATimeSetting() { return currentSettings.atime; }
+uint32_t getATimeSetting() { return currentSettings.optical.sensor.atime; }
 void setATimeSetting(uint32_t v) {
-  currentSettings.atime = static_cast<uint8_t>(v);
-  sensorImpl.applySettings(currentSettings);
+  currentSettings.optical.sensor.atime = static_cast<uint8_t>(v);
+  sensorImpl.applySettings(currentSettings.optical);
   commitCurrentSettings();
 }
 
-uint32_t getAStepSetting() { return currentSettings.astep; }
+uint32_t getAStepSetting() { return currentSettings.optical.sensor.astep; }
 void setAStepSetting(uint32_t v) {
-  currentSettings.astep = static_cast<uint16_t>(v);
-  sensorImpl.applySettings(currentSettings);
+  currentSettings.optical.sensor.astep = static_cast<uint16_t>(v);
+  sensorImpl.applySettings(currentSettings.optical);
   commitCurrentSettings();
 }
 
-const SettingDescriptor SETTINGS[] = {
-  { "Filter", 1, {3},           2,     filterSettingLabel, getFilterSetting, setFilterSetting },
-  { "Gain",   1, {AS7341_GAIN_COUNT}, AS7341_GAIN_COUNT - 1, gainSettingLabel, getGainSetting, setGainSetting },
+// Kinder von "Sensor-Einst." -- "<Zurueck>" ist bewusst der erste Eintrag
+// (siehe Plan). Nur Leaf-Felder gesetzt, Branch-Felder (children/childCount)
+// bleiben 0/nullptr -- unbenutzt fuer Leaf/Back.
+const SettingsNode SETTINGS_SENSOR[] = {
+  { "<Zurueck>", SettingsNodeKind::Back },
+  { "Gain",  SettingsNodeKind::Leaf, 1, {AS7341_GAIN_COUNT}, AS7341_GAIN_COUNT - 1, gainSettingLabel, getGainSetting, setGainSetting },
   // ATIME (uint8_t, max 255): 3 Dezimalstellen, fuehrende Ziffer 0-2.
-  { "ATIME",  3, {3, 10, 10},   255,   nullptr, getATimeSetting, setATimeSetting },
+  { "ATIME", SettingsNodeKind::Leaf, 3, {3, 10, 10},         255,                  nullptr,          getATimeSetting, setATimeSetting },
   // ASTEP (uint16_t, max 65535): 5 Dezimalstellen, fuehrende Ziffer 0-6.
-  { "ASTEP",  5, {7, 10, 10, 10, 10}, 65535, nullptr, getAStepSetting, setAStepSetting },
+  { "ASTEP", SettingsNodeKind::Leaf, 5, {7, 10, 10, 10, 10}, 65535,                nullptr,          getAStepSetting, setAStepSetting },
 };
-const uint8_t SETTINGS_COUNT = sizeof(SETTINGS) / sizeof(SETTINGS[0]);
-uint8_t currentSettingIndex = 0;
+
+// Kinder von "Optical-Einst." -- Filter, Sensor-Einst. UND Messspitzen (die
+// Spitzenwahl wirkt sich ausschliesslich auf optical aus, gehoert deshalb
+// hier hinein statt an die Wurzel -- siehe Plan/Kontext: das haelt Baum- und
+// JSON-Struktur deckungsgleich).
+const SettingsNode SETTINGS_OPTICAL[] = {
+  { "<Zurueck>",     SettingsNodeKind::Back },
+  { "Messspitzen",   SettingsNodeKind::TipList, 0, {}, 0, nullptr, nullptr, nullptr, nullptr, 0 },
+  { "Filter",        SettingsNodeKind::Leaf,   1, {3}, 2, filterSettingLabel, getFilterSetting, setFilterSetting },
+  { "Sensor-Einst.", SettingsNodeKind::Branch, 0, {},  0, nullptr, nullptr, nullptr,
+    SETTINGS_SENSOR, sizeof(SETTINGS_SENSOR) / sizeof(SETTINGS_SENSOR[0]) },
+};
+
+// Wurzel des Settings-Baums. Aktuell nur EIN Eintrag -- bewusst in Kauf
+// genommen (siehe Plan/Kontext), lieber als eine UI-Ebene, die dem JSON-
+// Schema nicht entspricht.
+const SettingsNode SETTINGS_ROOT[] = {
+  { "Optical-Einst.", SettingsNodeKind::Branch, 0, {}, 0, nullptr, nullptr, nullptr,
+    SETTINGS_OPTICAL, sizeof(SETTINGS_OPTICAL) / sizeof(SETTINGS_OPTICAL[0]) },
+};
+
+// Navigations-Zustand im Settings-Baum: ein kleiner, fest dimensionierter
+// Stack aus (Geschwisterliste, deren Laenge, aktueller Cursor). Der Cursor
+// einer Ebene bleibt beim Abstieg unangetastet stehen -- zeigt also beim
+// spaeteren Aufstieg (Depth--) automatisch wieder auf genau den Branch-
+// Eintrag, von dem aus abgestiegen wurde, ganz ohne zusaetzliche Buchhaltung.
+struct SettingsLevel { const SettingsNode* nodes; uint8_t count; uint8_t index; };
+static const uint8_t SETTINGS_TREE_MAX_DEPTH = 4;  // Wurzel + 3 Ebenen Reserve fuer Kuenftiges
+SettingsLevel settingsStack[SETTINGS_TREE_MAX_DEPTH] = {
+  { SETTINGS_ROOT, sizeof(SETTINGS_ROOT) / sizeof(SETTINGS_ROOT[0]), 0 }
+};
+uint8_t settingsDepth = 0;  // 0 == Wurzel -- kein "<Zurueck>" dort (siehe Plan/Kontext)
+
+const SettingsNode& currentSettingsNode() {
+  const SettingsLevel& lvl = settingsStack[settingsDepth];
+  return lvl.nodes[lvl.index];
+}
+
+// ------------------------- Messspitzen-Unterfluss -------------------------
+// Eigener kleiner Zustand statt Teil des generischen Baum-Stacks (siehe
+// SettingsNodeKind::TipList-Kommentar oben) -- nur 3 Ebenen, kein eigener
+// Stack noetig. Closed = wir sind NICHT im Messspitzen-Menuepunkt (der
+// generische Baum wird dann normal gezeigt/bedient). FingerprintStats haengt
+// unter Detail (siehe renderWhiteFingerprintStats()/loop()) -- reiner
+// Anzeige-Screen, kein weiterer Cursor noetig.
+enum class TipMenuStage : uint8_t { Closed, List, Detail, FingerprintStats };
+TipMenuStage tipMenuStage = TipMenuStage::Closed;
+// 0 = <Zurueck>, 1 = "Neue Spitze anlegen",
+// TIP_LIST_FIXED_ENTRIES.. = tips[index-TIP_LIST_FIXED_ENTRIES].
+static const uint8_t TIP_LIST_FIXED_ENTRIES = 2;
+uint8_t tipListIndex = 0;
+size_t  tipDetailIndex = 0;  // welcher Tip (Index in tipCatalog.tips) wird im Detail-Screen gezeigt
+uint8_t tipActionIndex = 0;  // Cursor in der Aktionsliste des Detail-Screens (siehe renderTipDetail())
+// Erster sichtbarer Kanal in renderWhiteFingerprintStats() -- reiner
+// Umlauf-Zaehler (kein Modulo hier, das macht der Renderer anhand der
+// tatsaechlichen Kanalanzahl), per kurzem Mode-Druck weitergeschaltet (siehe
+// cycleView()). Wird beim Betreten des Screens auf 0 zurueckgesetzt.
+uint8_t fingerprintStatsScroll = 0;
+
+// Eine Weissmessung, die checkValidity() bestanden hat, aber laut
+// MeasurementTip::isPlausible() Implausible/Indeterminate ist -- wartet auf
+// eine explizite Nutzer-Entscheidung (siehe renderWhitePlausibilityConfirm()/
+// loop()), bevor sie (oder gar nicht) uebernommen wird. 'active' = false
+// bedeutet "kein ausstehender Entscheid", der einzige Zustand, in dem der
+// normale Calibration-Screen gezeigt wird.
+struct PendingWhiteDecision {
+  bool active = false;
+  Precision precision = Precision::Precise;
+  Measurement measurement;
+  MeasurementTelemetry telemetry;
+  PlausibilityResult plausibility = PlausibilityResult::Indeterminate;
+  // Andere Spitzen (Indizes in tipCatalog.tips), fuer die 'measurement' laut
+  // TipCatalog::rankPlausibleTips() plausibel waere -- einmalig berechnet,
+  // wenn dieser Entscheid entsteht (performMeasurement()), NICHT bei jedem
+  // Rendern neu (tipCatalog aendert sich waehrend eines offenen Entscheids
+  // nicht, siehe cycleMode()). Reihenfolge = Anzeige-Reihenfolge in
+  // renderWhitePlausibilityConfirm().
+  std::vector<size_t> suggestedTipIndices;
+};
+PendingWhiteDecision pendingWhite;
+// Cursor in der Auswahlliste von renderWhitePlausibilityConfirm(): 0..
+// suggestedTipIndices.size()-1 = eine vorgeschlagene Spitze, danach "Als neue
+// Spitze", "Uebernehmen", "Verwerfen" (siehe dort). Als Index gehalten (nicht
+// bool), damit eine variable Anzahl Eintraege moeglich ist, ohne die
+// Cursor-Logik umzubauen.
+uint8_t whiteConfirmIndex = 0;
+
+std::string nextTipName() {
+  for (uint32_t n = 1; ; n++) {
+    char buf[24];
+    snprintf(buf, sizeof(buf), "Messspitze %lu", (unsigned long)n);
+    if (!tipCatalog.find(buf)) return buf;
+  }
+}
+
+// Registriert eine NEUE Spitze mit dem AKTUELL live eingestellten
+// OpticalSettings (keine freie Texteingabe -- "was gerade eingestellt ist"
+// ist die einzig sinnvolle Quelle fuer eine frisch benannte Spitze) und
+// macht sie zur aktiven.
+void createTipFromCurrentSettings() {
+  MeasurementTip t;
+  t.name = nextTipName();
+  t.optical = currentSettings.optical;
+  tipCatalog.tips.push_back(t);
+  tipCatalog.active = t.name;
+  commitCurrentSettings();  // persistiert Katalog (und harmlos RootSettings erneut, siehe dort)
+}
+
+// Wendet die gespeicherten Filter-/Sensor-Werte einer Spitze an (Hardware +
+// RootSettings) und macht sie zur aktiven.
+void activateTip(const MeasurementTip& tip) {
+  currentSettings.optical = tip.optical;
+  sensorImpl.applySettings(currentSettings.optical);
+  tipCatalog.active = tip.name;
+  commitCurrentSettings();
+}
+
+// Nur fuer NICHT-aktive Spitzen erreichbar (siehe renderTipDetail()/loop()) --
+// kein Sonderfall fuer "letzte Spitze" noetig: die aktive Spitze kann gar
+// nicht geloescht werden, der Katalog wird dadurch nie leer (siehe Plan/Kontext).
+void deleteTip(size_t index) {
+  tipCatalog.tips.erase(tipCatalog.tips.begin() + index);
+  calStore.saveTips(tipCatalog);
+}
+
+// Baut EINEN WhiteFingerprint aus einer rohen Weissmessung -- reine
+// Berechnung, haengt nichts an (siehe appendWhiteFingerprint()). Muss VOR der
+// Entscheidung "wird diese Messung uebernommen" bereits vorliegen, da
+// MeasurementTip::isPlausible() genau so einen Kandidaten braucht. Nutzt
+// AUSSCHLIESSLICH das Spectrometer-Interface (normalize()/sensorId()), nie
+// die konkrete AS7341Spectrometer -- vorbereitet fuer einen kuenftigen
+// zweiten Sensor (siehe Spectrometer.h).
+WhiteFingerprint buildWhiteFingerprint(const Measurement& raw, const OpticalSettings& settings) {
+  WhiteFingerprint fp;
+  fp.uptimeS = uptimeLogger.totalSeconds();
+  fp.sensorId = spectrometer.sensorId();
+  fp.sensor = settings.sensor;
+  fp.normalized = spectrometer.normalize(raw, settings.sensor);
+  return fp;
+}
+
+// Haengt einen BEREITS gebauten Fingerabdruck an eine Spitze an -- FIFO,
+// aeltester faellt raus sobald die Liste MAX_WHITE_FINGERPRINTS_PER_TIP
+// erreicht haette (siehe TipCatalog.h).
+void appendWhiteFingerprint(MeasurementTip& tip, const WhiteFingerprint& fp) {
+  if (tip.whiteFingerprints.size() >= MAX_WHITE_FINGERPRINTS_PER_TIP) {
+    tip.whiteFingerprints.erase(tip.whiteFingerprints.begin());  // aeltester zuerst raus
+  }
+  tip.whiteFingerprints.push_back(fp);
+}
 
 // Bearbeitungszustand: solange editingActive, hijacken Trigger/Mode ihre
 // sonstige Bedeutung (Messen/Moduswechsel) zugunsten der Ziffernbearbeitung
@@ -286,7 +459,7 @@ struct MeasurementContext {
   float tempC;
   uint32_t sessionMs;
   uint32_t uptimeS;
-  AcquisitionSettings settings;
+  OpticalSettings settings;
   // Messmodus + Praezisions-Telemetrie -- siehe MeasurementRecord-Kommentar
   // in HistoryStore.h. relSemWorst NAN = leer (kein relSEM berechnet), NICHT "0".
   Precision precision;
@@ -305,15 +478,25 @@ std::string bandColumnName(const Band& b) {
 }
 
 // computeSpectrum=false (fuer Dark/White-Referenzen, die weiter unten
-// angehaengten "*_ref"-Zeilen, ODER eine Messung, deren Filter nicht zur
-// aktuell geladenen Kalibrierung passt -- siehe calibrationValidFor()): es
-// gibt keine sinnvolle abgeleitete Reflexion -- die Spectrum/Lab/Hex-Spalten
-// bleiben dann leer (aber vorhanden, `bandColumns.size()` Leerspalten). Die
-// rohen Measurement-Werte (falls includeRaw) bleiben davon unberuehrt.
+// angehaengten "*_ref"-Zeilen, ODER eine Messung, fuer die keine passende
+// Referenz aufloesbar war -- siehe SettingsRefState/collectBandsVisitor()/
+// appendRecordToCsv()): es gibt keine sinnvolle abgeleitete Reflexion -- die
+// Spectrum/Lab/Hex-Spalten bleiben dann leer (aber vorhanden,
+// `bandColumns.size()` Leerspalten). Die rohen Measurement-Werte (falls
+// includeRaw) bleiben davon unberuehrt.
+//
+// whiteForSpectrum/darkForSpectrum: die fuer DIESE Zeile geltende Referenz --
+// vom Aufrufer explizit bestimmt (live geladen fuer die aktuelle Zeile/die
+// "*_ref"-Sonderzeilen, oder aus der Historie aufgeloest fuer eine
+// vergangene Zeile, siehe SettingsRefState) statt hier blind die aktuell
+// geladene globale Referenz zu lesen. Nur relevant/gebraucht, wenn
+// computeSpectrum true ist.
 void appendCsvRow(std::string& out, const char* label, const Measurement& measurement,
                    FilterState filterState, bool computeSpectrum, bool includeRaw,
                    const std::vector<Band>& bandColumns,
-                   const MeasurementContext* ctx = nullptr) {
+                   const MeasurementContext* ctx = nullptr,
+                   const Measurement* whiteForSpectrum = nullptr,
+                   const Measurement* darkForSpectrum = nullptr) {
   out += label;
   char buf[16];
 
@@ -324,9 +507,9 @@ void appendCsvRow(std::string& out, const char* label, const Measurement& measur
     out += ',';
     out += filterStateCsvLabel(ctx->settings.filterState);
     out += ',';
-    out += gainCsvLabel(ctx->settings.gain);
-    snprintf(buf, sizeof(buf), ",%u", ctx->settings.atime); out += buf;
-    snprintf(buf, sizeof(buf), ",%u", ctx->settings.astep); out += buf;
+    out += gainCsvLabel(ctx->settings.sensor.gain);
+    snprintf(buf, sizeof(buf), ",%u", ctx->settings.sensor.atime); out += buf;
+    snprintf(buf, sizeof(buf), ",%u", ctx->settings.sensor.astep); out += buf;
     out += ',';
     out += precisionCsvLabel(ctx->precision);
     snprintf(buf, sizeof(buf), ",%u", ctx->sampleCount); out += buf;
@@ -337,7 +520,7 @@ void appendCsvRow(std::string& out, const char* label, const Measurement& measur
   }
 
   if (computeSpectrum) {
-    Spectrum spec = spectrometer.getSpectrum(measurement, whiteRef, darkRef, filterState);
+    Spectrum spec = spectrometer.getSpectrum(measurement, *whiteForSpectrum, *darkForSpectrum, filterState);
     for (const Band& col : bandColumns) {
       out += ',';
       int idx = -1;
@@ -368,18 +551,65 @@ void appendCsvRow(std::string& out, const char* label, const Measurement& measur
   out += '\n';
 }
 
+// Waehrend eines forEach()-Durchlaufs (chronologisch aufsteigend) mitgefuehrte
+// Zuordnung Settings -> zuletzt DAFUER gemessene Dark-/Weissreferenz. Ersetzt
+// den frueheren "nimm die AKTUELL geladene Referenz"-Ansatz beim Export: eine
+// historische Zeile bekommt so die Referenz, die TATSAECHLICH zu ihrem
+// Aufnahmezeitpunkt galt (die zuletzt VOR ihr gemessene Dark-/Weisszeile MIT
+// DENSELBEN Settings), unabhaengig davon, was inzwischen (z.B. nach einem
+// Spitzenwechsel) neu gemessen wurde. Linearer Scan statt Map: die Anzahl
+// unterschiedlicher Settings-Kombinationen in einer Historie ist immer klein
+// (typischerweise <= Anzahl Spitzen).
+struct SettingsRefState {
+  OpticalSettings settings;
+  Measurement dark, white;  // je leer, falls fuer 'settings' noch nie gemessen
+};
+
+// Aktualisiert 'states' mit einer Dark-/White-Zeile (kein Effekt fuer Regular).
+// KEIN Start-Seed aus der live geladenen Referenz (bewusst -- fruehere
+// Version hatte einen: seedete IMMER mit dem beim EXPORT-Zeitpunkt aktuellen
+// darkRef/whiteRef, was nach einem spaeteren Referenzwechsel dazwischen
+// aufgenommene Messungen stillschweigend gegen die FALSCHE, naemlich die
+// NEUERE Referenz ausgewertet haette. historyStore.clear() behaelt seither
+// selbst die letzte Dark-/Weisszeile (siehe dort), das deckt den Normalfall
+// vollstaendig ab. Ohne jede passende Zeile bleiben betroffene Messungen
+// jetzt bewusst OHNE Reflexion/Lab/Hex im Export -- sichtbar fehlende
+// Rohdaten-only-Zeilen statt einer heimlich falschen Berechnung.
+void observeReference(std::vector<SettingsRefState>& states, const MeasurementRecord& rec) {
+  if (rec.kind != SampleKind::Dark && rec.kind != SampleKind::White) return;
+  for (SettingsRefState& s : states) {
+    if (s.settings == rec.settings) {
+      (rec.kind == SampleKind::Dark ? s.dark : s.white) = rec.measurement;
+      return;
+    }
+  }
+  SettingsRefState s{rec.settings, {}, {}};
+  (rec.kind == SampleKind::Dark ? s.dark : s.white) = rec.measurement;
+  states.push_back(s);
+}
+
+// Beim jetzigen Stand von 'states' fuer 'settings' geltende Referenz --
+// nullptr, falls dafuer noch nie etwas gemessen wurde.
+const SettingsRefState* findRefState(const std::vector<SettingsRefState>& states, const OpticalSettings& settings) {
+  for (const SettingsRefState& s : states) if (s.settings == settings) return &s;
+  return nullptr;
+}
+
 // HistoryStore::forEach()-Visitor: sammelt die Vereinigungsmenge aller
-// vorkommenden Baender (nur von Datensaetzen, deren Filter zur aktuell
-// geladenen Kalibrierung passt -- alle anderen bekommen ohnehin keine echten
-// Spectrum-Spalten, ihre Baender "verdienen" also keine Kopfzeilen-Spalte).
+// vorkommenden Baender (nur von Datensaetzen, fuer die eine passende Referenz
+// aufloesbar ist -- alle anderen bekommen ohnehin keine echten Spectrum-
+// Spalten, ihre Baender "verdienen" also keine Kopfzeilen-Spalte).
 struct BandCollectCtx {
   std::vector<Band>* cols;
+  std::vector<SettingsRefState> refState;
 };
 void collectBandsVisitor(const MeasurementRecord& rec, void* userData) {
   BandCollectCtx* c = reinterpret_cast<BandCollectCtx*>(userData);
-  bool isRef = (rec.kind != SampleKind::Regular);
-  if (isRef || !calibrationValidFor(rec.settings)) return;
-  Spectrum spec = spectrometer.getSpectrum(rec.measurement, whiteRef, darkRef, rec.settings.filterState);
+  observeReference(c->refState, rec);
+  if (rec.kind != SampleKind::Regular) return;
+  const SettingsRefState* ref = findRefState(c->refState, rec.settings);
+  if (!ref || ref->dark.empty() || ref->white.empty()) return;
+  Spectrum spec = spectrometer.getSpectrum(rec.measurement, ref->white, ref->dark, rec.settings.filterState);
   for (const Band& b : spec.bands) {
     bool known = false;
     for (const Band& existing : *c->cols) {
@@ -390,24 +620,28 @@ void collectBandsVisitor(const MeasurementRecord& rec, void* userData) {
 }
 
 // HistoryStore::forEach()-Visitor: haengt einen persistierten Datensatz per
-// appendCsvRow() an 'out' an -- appendCsvRow() bleibt dabei unveraendert und
-// berechnet Spectrum/Lab/Hex weiterhin frisch gegen die AKTUELL geladene
-// Kalibrierung, nicht gegen eine zum Messzeitpunkt eingefrorene. Zeilen, deren
-// Filter nicht zur Kalibrierung passt, bekommen keine abgeleiteten Spalten
+// appendCsvRow() an 'out' an -- die Reflexion wird gegen die Referenz
+// berechnet, die laut SettingsRefState zum AUFNAHMEZEITPUNKT dieser Zeile
+// galt (nicht gegen die aktuell geladene). Zeilen, fuer die (noch) keine
+// passende Referenz aufloesbar ist, bekommen keine abgeleiteten Spalten
 // (computeSpectrum=false), behalten aber ihre Rohwerte.
 struct CsvBuildCtx {
   std::string* out;
   bool includeRaw;
   const std::vector<Band>* bandColumns;
+  std::vector<SettingsRefState> refState;
 };
 void appendRecordToCsv(const MeasurementRecord& rec, void* userData) {
   CsvBuildCtx* ctx = reinterpret_cast<CsvBuildCtx*>(userData);
+  observeReference(ctx->refState, rec);
   bool isRef = (rec.kind != SampleKind::Regular);
-  bool computeSpectrum = !isRef && calibrationValidFor(rec.settings);
+  const SettingsRefState* ref = isRef ? nullptr : findRefState(ctx->refState, rec.settings);
+  bool computeSpectrum = ref && !ref->dark.empty() && !ref->white.empty();
   MeasurementContext mctx{ rec.tempC, rec.sessionMs, rec.uptimeS, rec.settings,
                            rec.precision, rec.sampleCount, rec.relSemWorst };
   appendCsvRow(*ctx->out, rec.label, rec.measurement, rec.settings.filterState, computeSpectrum,
-               ctx->includeRaw, *ctx->bandColumns, &mctx);
+               ctx->includeRaw, *ctx->bandColumns, &mctx,
+               computeSpectrum ? &ref->white : nullptr, computeSpectrum ? &ref->dark : nullptr);
 }
 
 // Baut die komplette Messhistorie als CSV. includeRaw haengt zusaetzlich die
@@ -425,7 +659,7 @@ std::string buildHistoryCsv(bool includeRaw) {
   std::string out;
 
   std::vector<Band> bandColumns;
-  BandCollectCtx collectCtx{ &bandColumns };
+  BandCollectCtx collectCtx{ &bandColumns, {} };
   historyStore.forEach(collectBandsVisitor, &collectCtx);
   std::sort(bandColumns.begin(), bandColumns.end(), [](const Band& a, const Band& b) {
     return a.center_nm < b.center_nm;
@@ -439,9 +673,7 @@ std::string buildHistoryCsv(bool includeRaw) {
   out += ",L,a,b,hex";
   if (includeRaw) {
     const char* const* labels = spectrometer.measurementLabels();
-    size_t n = !darkRef.empty()  ? darkRef.size()
-             : !whiteRef.empty() ? whiteRef.size()
-                                 : historyStore.firstRecordChannelCount();
+    size_t n = historyStore.firstRecordChannelCount();
     for (size_t i = 0; i < n; i++) { out += ','; out += labels[i]; }
   }
   out += '\n';
@@ -457,12 +689,7 @@ std::string buildHistoryCsv(bool includeRaw) {
            (unsigned long)uptimeLogger.measurementCount());
   out += uptimeLine;
 
-  if (includeRaw) {
-    if (!darkRef.empty())  appendCsvRow(out, "dark_ref",  darkRef,  FilterState::None, false, true, bandColumns);
-    if (!whiteRef.empty()) appendCsvRow(out, "white_ref", whiteRef, FilterState::None, false, true, bandColumns);
-  }
-
-  CsvBuildCtx ctx{ &out, includeRaw, &bandColumns };
+  CsvBuildCtx ctx{ &out, includeRaw, &bandColumns, {} };
   historyStore.forEach(appendRecordToCsv, &ctx);
   return out;
 }
@@ -485,7 +712,8 @@ void printCsvRow(const MeasurementRecord& rec) {
   MeasurementContext ctx{ rec.tempC, rec.sessionMs, rec.uptimeS, rec.settings,
                           rec.precision, rec.sampleCount, rec.relSemWorst };
   appendCsvRow(row, rec.label, rec.measurement, rec.settings.filterState, computeSpectrum,
-               /*includeRaw=*/true, bandColumns, &ctx);
+               /*includeRaw=*/true, bandColumns, &ctx,
+               computeSpectrum ? &whiteRef : nullptr, computeSpectrum ? &darkRef : nullptr);
   Serial.print(row.c_str());
 }
 
@@ -563,8 +791,8 @@ void renderReferenceStatus() {
   display.println(isWhite ? "Weiss-Referenz" : "Dunkel-Referenz");
 
   const Measurement& ref = isWhite ? whiteRef : darkRef;
-  const AcquisitionSettings& refSettings = isWhite ? whiteRefSettings : darkRefSettings;
-  bool refValid = !ref.empty() && (refSettings == currentSettings);
+  const OpticalSettings& refSettings = isWhite ? whiteRefSettings : darkRefSettings;
+  bool refValid = !ref.empty() && (refSettings == currentSettings.optical);
 
   if (!refValid) {
     display.setCursor(0, 16);
@@ -662,63 +890,292 @@ void renderExportClear() {
 // grosser Wertetext darunter -- entweder im Browsing-Zustand (kein Cursor)
 // oder waehrend der Bearbeitung (aktive Ziffer/Option invertiert
 // dargestellt, siehe editingActive/editor).
+// Start-Index eines Scroll-Fensters von 'visible' Zeilen, das 'selected'
+// innerhalb von [0, count) moeglichst mittig zeigt (klemmt an den Raendern
+// der Liste). Gemeinsam genutzt von renderSettingsStatus() (Baum-Navigation)
+// und renderTipList() (Messspitzen-Liste).
+uint8_t computeScrollStart(uint8_t selected, uint8_t count, uint8_t visible) {
+  if (count <= visible) return 0;
+  int start = (int)selected - visible / 2;
+  if (start < 0) start = 0;
+  if (start > (int)count - visible) start = (int)count - visible;
+  return (uint8_t)start;
+}
+
+// Vorwaertsdeklarationen: unten definiert (nach renderSettingsStatus(), naeher
+// an ihrem main.cpp-lokalen Messspitzen-Zustand), werden aber schon hier
+// gebraucht.
+void renderTipList();
+void renderTipDetail();
+void renderWhiteFingerprintStats();
+
+// Vorwaertsdeklaration: unten definiert (naeher an performMeasurement(), das
+// den zugehoerigen pendingWhite-Zustand befuellt), aber schon von
+// renderCurrentView() gebraucht.
+void renderWhitePlausibilityConfirm();
+
 void renderSettingsStatus() {
   if (!displayOk) return;
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(1);
 
-  display.setCursor(0, 0);
-  display.println("Einstellungen");
+  if (tipMenuStage == TipMenuStage::List)   { renderTipList();   return; }
+  if (tipMenuStage == TipMenuStage::Detail) { renderTipDetail(); return; }
+  if (tipMenuStage == TipMenuStage::FingerprintStats) { renderWhiteFingerprintStats(); return; }
 
-  const SettingDescriptor& s = SETTINGS[currentSettingIndex];
-  display.setCursor(0, 20);
-  display.print(s.name);
-  display.println(":");
+  if (editingActive) {
+    // Ziffern-/Options-Bearbeitung eines Blatts -- UNVERAENDERT gegenueber
+    // der frueheren flachen Liste, liest nur den aktuellen Knoten jetzt aus
+    // dem Baum statt aus SETTINGS[currentSettingIndex].
+    const SettingsNode& s = currentSettingsNode();
+    display.setCursor(0, 0);
+    display.println("Einstellungen");
+    display.setCursor(0, 20);
+    display.print(s.name);
+    display.println(":");
 
-  display.setTextSize(2);
-
-  if (!editingActive) {
-    display.setCursor(0, 34);
-    if (s.valueLabel) {
-      display.println(s.valueLabel(s.getValue()));
+    display.setTextSize(2);
+    if (s.digitCount == 1) {
+      // Enum-artig: die einzige "Ziffer" ist der ganze Optionswert -- als
+      // Ganzes invertiert darstellen (nur eine Position, immer aktiv).
+      const char* label = s.valueLabel(editor.digitAt(0));
+      int16_t x1, y1;
+      uint16_t w, h;
+      display.getTextBounds(label, 0, 34, &x1, &y1, &w, &h);
+      display.fillRect(0, 34, w + 4, h + 4, SSD1306_WHITE);
+      display.setTextColor(SSD1306_BLACK);
+      display.setCursor(2, 36);
+      display.println(label);
+      display.setTextColor(SSD1306_WHITE);
     } else {
-      char buf[8];
-      snprintf(buf, sizeof(buf), "%lu", (unsigned long)s.getValue());
-      display.println(buf);
-    }
-  } else if (s.digitCount == 1) {
-    // Enum-artig: die einzige "Ziffer" ist der ganze Optionswert -- als
-    // Ganzes invertiert darstellen (nur eine Position, immer aktiv).
-    const char* label = s.valueLabel(editor.digitAt(0));
-    int16_t x1, y1;
-    uint16_t w, h;
-    display.getTextBounds(label, 0, 34, &x1, &y1, &w, &h);
-    display.fillRect(0, 34, w + 4, h + 4, SSD1306_WHITE);
-    display.setTextColor(SSD1306_BLACK);
-    display.setCursor(2, 36);
-    display.println(label);
-    display.setTextColor(SSD1306_WHITE);
-  } else {
-    // Mehrstellig: jede Ziffer einzeln zeichnen, die am Cursor invertiert.
-    const int digitW = 14;
-    int x = 0;
-    for (uint8_t i = 0; i < editor.digitCount(); i++) {
-      char ch[2] = { (char)('0' + editor.digitAt(i)), '\0' };
-      if (i == editor.cursor()) {
-        display.fillRect(x, 34, digitW, 18, SSD1306_WHITE);
-        display.setTextColor(SSD1306_BLACK);
-        display.setCursor(x + 3, 36);
-        display.print(ch);
-        display.setTextColor(SSD1306_WHITE);
-      } else {
-        display.setCursor(x + 3, 36);
-        display.print(ch);
+      // Mehrstellig: jede Ziffer einzeln zeichnen, die am Cursor invertiert.
+      const int digitW = 14;
+      int x = 0;
+      for (uint8_t i = 0; i < editor.digitCount(); i++) {
+        char ch[2] = { (char)('0' + editor.digitAt(i)), '\0' };
+        if (i == editor.cursor()) {
+          display.fillRect(x, 34, digitW, 18, SSD1306_WHITE);
+          display.setTextColor(SSD1306_BLACK);
+          display.setCursor(x + 3, 36);
+          display.print(ch);
+          display.setTextColor(SSD1306_WHITE);
+        } else {
+          display.setCursor(x + 3, 36);
+          display.print(ch);
+        }
+        x += digitW;
       }
-      x += digitW;
     }
+    display.display();
+    return;
   }
 
+  // Baum-Navigation (nicht editierend): Liste aller Geschwister der aktuellen
+  // Ebene mit ">"-Cursor. Titel ist "Einstellungen" an der Wurzel, sonst der
+  // Name des Branch-Knotens, aus dem abgestiegen wurde (Breadcrumb). Passen
+  // nicht alle Geschwister aufs Display, haelt ein Scroll-Fenster von
+  // VISIBLE_ROWS Zeilen den Cursor moeglichst mittig (klemmt an den Raendern
+  // der Liste an deren Anfang/Ende).
+  const SettingsLevel& lvl = settingsStack[settingsDepth];
+  display.setCursor(0, 0);
+  if (settingsDepth == 0) {
+    display.println("Einstellungen");
+  } else {
+    const SettingsLevel& parent = settingsStack[settingsDepth - 1];
+    display.println(parent.nodes[parent.index].name);
+  }
+
+  const uint8_t VISIBLE_ROWS = 4;
+  uint8_t start = computeScrollStart(lvl.index, lvl.count, VISIBLE_ROWS);
+
+  int y = 16;
+  for (uint8_t i = start; i < start + VISIBLE_ROWS && i < lvl.count; i++) {
+    const SettingsNode& n = lvl.nodes[i];
+    char line[22];
+    if (n.kind == SettingsNodeKind::Leaf) {
+      char val[10];
+      if (n.valueLabel) strncpy(val, n.valueLabel(n.getValue()), sizeof(val));
+      else snprintf(val, sizeof(val), "%lu", (unsigned long)n.getValue());
+      val[sizeof(val) - 1] = '\0';
+      snprintf(line, sizeof(line), "%-10.10s%s", n.name, val);
+    } else if (n.kind == SettingsNodeKind::Branch || n.kind == SettingsNodeKind::TipList) {
+      // Beide fuehren per langem Trigger-Druck eine Ebene tiefer (TipList in
+      // den Messspitzen-Unterfluss statt in den generischen Baum) -- optisch
+      // ununterscheidbar, ">" zeigt "fuehrt weiter".
+      snprintf(line, sizeof(line), "%-10.10s>", n.name);
+    } else {
+      snprintf(line, sizeof(line), "%s", n.name);
+    }
+    display.setCursor(0, y);
+    display.print(i == lvl.index ? "> " : "  ");
+    display.println(line);
+    y += 10;
+  }
+  // Kleiner Scroll-Hinweis, nur falls tatsaechlich mehr Geschwister ausserhalb
+  // des Fensters liegen -- oben rechts neben dem Titel, unten rechts unter
+  // der letzten Zeile (dort ueberschneidungsfrei, siehe Layout oben).
+  if (start > 0) {
+    display.setCursor(122, 0);
+    display.print("^");
+  }
+  if (start + VISIBLE_ROWS < lvl.count) {
+    display.setCursor(122, 56);
+    display.print("v");
+  }
+
+  display.display();
+}
+
+// Liste des Messspitzen-Menuepunkts: "<Zurueck>", "Neue Spitze anlegen", dann
+// alle Spitzen (aktive mit " AKTIV"-Suffix). Gleiches Scroll-Fenster wie die
+// generische Baum-Ansicht (siehe computeScrollStart()).
+void renderTipList() {
+  display.setCursor(0, 0);
+  display.println("Messspitzen");
+
+  uint8_t total = (uint8_t)(TIP_LIST_FIXED_ENTRIES + tipCatalog.tips.size());
+  uint8_t start = computeScrollStart(tipListIndex, total, 4);
+
+  int y = 16;
+  for (uint8_t i = start; i < start + 4 && i < total; i++) {
+    char line[22];
+    if (i == 0) {
+      snprintf(line, sizeof(line), "<Zurueck>");
+    } else if (i == 1) {
+      snprintf(line, sizeof(line), "Neue Spitze anlegen");
+    } else {
+      const MeasurementTip& t = tipCatalog.tips[i - TIP_LIST_FIXED_ENTRIES];
+      snprintf(line, sizeof(line), "%s%s", t.name.c_str(),
+               (t.name == tipCatalog.active) ? " AKTIV" : "");
+    }
+    display.setCursor(0, y);
+    display.print(i == tipListIndex ? "> " : "  ");
+    display.println(line);
+    y += 10;
+  }
+  if (start > 0) {
+    display.setCursor(122, 0);
+    display.print("^");
+  }
+  if (start + 4 < total) {
+    display.setCursor(122, 56);
+    display.print("v");
+  }
+
+  display.display();
+}
+
+// Detail-Menue einer einzelnen Spitze: Name (+ "AKTIV"-Hinweis), darunter die
+// verfuegbaren Aktionen -- "Aktivieren"/"Loeschen" nur fuer NICHT-aktive
+// Spitzen (siehe Plan/Kontext: die aktive Spitze kann nicht geloescht werden,
+// "Aktivieren" waere fuer sie ohnehin ein No-Op), "Weiss-Fingerabdruck" (siehe
+// renderWhiteFingerprintStats()) fuer BEIDE. Nie mehr als 4 Zeilen, kein
+// Scroll-Fenster noetig.
+void renderTipDetail() {
+  const MeasurementTip& tip = tipCatalog.tips[tipDetailIndex];
+  bool isActive = (tip.name == tipCatalog.active);
+
+  display.setCursor(0, 0);
+  display.println(tip.name.c_str());
+  if (isActive) {
+    display.setCursor(0, 10);
+    display.println("AKTIV");
+  }
+
+  static const char* const ACTIVE_ACTIONS[]   = { "<Zurueck>", "Weiss-Fingerabdruck" };
+  static const char* const INACTIVE_ACTIONS[] = { "<Zurueck>", "Aktivieren", "Loeschen", "Weiss-Fingerabdruck" };
+  const char* const* actions = isActive ? ACTIVE_ACTIONS : INACTIVE_ACTIONS;
+  uint8_t count = isActive ? 2 : 4;
+
+  int y = 24;
+  for (uint8_t i = 0; i < count; i++) {
+    display.setCursor(0, y);
+    display.print(i == tipActionIndex ? "> " : "  ");
+    display.println(actions[i]);
+    y += 10;
+  }
+  display.display();
+}
+
+// Zerlegt 'value' (>= 0) in eine normalisierte Mantisse [1,10) + Exponent fuer
+// eine kompakte wissenschaftliche Anzeige (siehe renderWhiteFingerprintStats()
+// -- die normalisierten Fingerabdruck-Werte reichen ueber viele
+// Groessenordnungen, ein fixes Nachkommaformat macht kleine Kanaele
+// unlesbar/"0.0"). value <= 0 bleibt mantissa/exponent 0 (normalisierte
+// Rohwerte sind nie negativ; ein exaktes 0 ist der einzige Sonderfall, z.B.
+// ein unter einem Filter strukturell dunkler Kanal).
+static void splitScientific(float value, float& mantissa, int& exponent) {
+  if (value <= 0.0f) { mantissa = 0.0f; exponent = 0; return; }
+  exponent = (int)floorf(log10f(value));
+  mantissa = value / powf(10.0f, (float)exponent);
+  // Rundungs-Randfall: bei der Anzeige mit 2 Nachkommastellen wuerde z.B.
+  // 9.996 auf "10.00" runden und damit das Mantissen-Intervall [1,10)
+  // verlassen -- Exponent in diesem Fall nachziehen.
+  if (mantissa >= 9.995f) { mantissa /= 10.0f; exponent += 1; }
+}
+
+// "Weiss-Fingerabdruck"-Aktion aus renderTipDetail(): Mittelwert + absoluter
+// Standardfehler je Kanal der eigenen Fingerabdruecke DIESER Spitze, nur ueber
+// den gerade aktiven Sensor (siehe MeasurementTip::whiteFingerprintStats() --
+// andere Sensoren sind nicht vergleichbar, siehe MeasurementTip::isPlausible()).
+// Wissenschaftliche Notation je Kanal (siehe splitScientific()) statt eines
+// festen Nachkommaformats -- Wert UND Fehler teilen sich denselben Exponenten
+// (beide sind per Definition dieselbe Groessenordnung), direkt vergleichbar
+// ohne zweimal denselben Exponenten hinzuschreiben. N_CH(10) Kanaele passen
+// nicht auf einmal aufs 64px-Display (eine Zeile pro Kanal) -- ein kurzer
+// Mode-Druck schiebt das sichtbare Fenster um einen Kanal weiter (siehe
+// cycleView()), umlaufend. Reiner Anzeige-Screen (kein Cursor); ein langer
+// Trigger-Druck geht zurueck ins Detail-Menue (siehe loop()).
+void renderWhiteFingerprintStats() {
+  const MeasurementTip& tip = tipCatalog.tips[tipDetailIndex];
+  WhiteFingerprintStats stats = tip.whiteFingerprintStats(spectrometer.sensorId());
+
+  char header[22];
+  snprintf(header, sizeof(header), "N=%u", (unsigned)stats.n);
+  display.setCursor(0, 0);
+  display.println(header);
+
+  if (stats.n == 0) {
+    display.setCursor(0, 10);
+    display.println("keine Messungen");
+    display.display();
+    return;
+  }
+
+  const char* const* labels = spectrometer.measurementLabels();
+  const uint8_t VISIBLE_ROWS = 7;  // Zeile 0 ist der "N="-Header, Rest bis 64px
+  uint8_t ch = (uint8_t)stats.mean.size();
+  uint8_t start = fingerprintStatsScroll % ch;
+
+  int y = 8;
+  for (uint8_t i = 0; i < VISIBLE_ROWS && i < ch; i++) {
+    uint8_t c = (start + i) % ch;
+    float mantissa;
+    int exponent;
+    splitScientific(stats.mean[c], mantissa, exponent);
+
+    char line[22];
+    if (stats.sem.empty()) {
+      // Nur 1 Fingerabdruck -- Standardfehler nicht definiert (siehe
+      // WhiteFingerprintStats-Kommentar), nur der Mittelwert wird gezeigt.
+      snprintf(line, sizeof(line), "%-4.4s %.2fe%d", labels[c], mantissa, exponent);
+    } else {
+      // Fehler im SELBEN Massstab wie der Wert (gleicher Exponent, siehe
+      // Funktionskommentar). Eigentlich sollte Byte 0xF1 im eingebauten
+      // 5x7-Font (Codepage-437-Position, siehe Adafruit_GFX glcdfont.c) ein
+      // "+-"-Zeichen sein -- auf dem tatsaechlichen Display sieht es aber wie
+      // ">" ueber "=" aus (Font-Variante weicht ab), deshalb hier das
+      // unzweideutige ASCII "+-" (2 Zeichen), trotz des einen Spalte teureren
+      // Platzbedarfs -- passt auf dem 21-Zeichen-Zeilenbudget weiterhin
+      // bequem.
+      float errMantissa = stats.sem[c] / powf(10.0f, (float)exponent);
+      snprintf(line, sizeof(line), "%-4.4s %.2f+-%.2fe%d", labels[c], mantissa, errMantissa, exponent);
+    }
+    display.setCursor(0, y);
+    display.print(line);
+    y += 8;
+  }
   display.display();
 }
 
@@ -758,6 +1215,7 @@ void renderCurrentView() {
     return;
   }
   if (currentDisplayMode == DisplayMode::Calibration) {
+    if (pendingWhite.active) { renderWhitePlausibilityConfirm(); return; }
     renderReferenceStatus();
     return;
   }
@@ -782,7 +1240,7 @@ void renderCurrentView() {
   // gespeichert ist). In diesem Fall daher gegen currentSettings pruefen (die
   // eigentlich relevante Frage: "waere eine JETZT gestartete Messung gueltig
   // kalibriert").
-  const AcquisitionSettings& calCheckSettings = lastMeasurement.empty() ? currentSettings : lastMeasurementSettings;
+  const OpticalSettings calCheckSettings = lastMeasurement.empty() ? currentSettings.optical : lastMeasurementSettings;
   bool haveMatchingCal = calibrationValidFor(calCheckSettings);
   static const Measurement emptyRef;
   const Measurement& effDark  = haveMatchingCal ? darkRef  : emptyRef;
@@ -869,6 +1327,183 @@ void renderMeasurementError(MeasurementStatus status) {
   display.display();
 }
 
+// Sticky-Screen (wie renderMeasurementError()) fuer eine Weissmessung, die
+// spectrometer.checkValidity() nicht besteht -- zeigt die rohen Kanalwerte
+// (gleiches Layout wie renderReferenceStatus()) plus den Grund. whiteRef/
+// Historie/Spitzenkatalog werden dafuer NICHT angefasst (siehe
+// performMeasurement()).
+void renderWhiteValidityWarning(const Measurement& raw, const MeasurementValidity& v) {
+  if (!displayOk) return;
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("Weiss ungueltig");
+  display.setCursor(0, 9);
+  if (v.anyClipping && v.anyBelowNoiseFloor) display.println("klippt + zu dunkel");
+  else if (v.anyClipping) display.println("Kanal klippt");
+  else display.println("Kanal zu dunkel");
+
+  const char* const* labels = spectrometer.measurementLabels();
+  char line[27];
+  int y = 20;
+  size_t i = 0;
+  for (; i + 1 < raw.size(); i += 2) {
+    snprintf(line, sizeof(line), "%-4.4s %5.0f %-4.4s %5.0f",
+             labels[i], raw[i], labels[i + 1], raw[i + 1]);
+    display.setCursor(0, y);
+    display.print(line);
+    y += 8;
+  }
+  if (i < raw.size()) {
+    snprintf(line, sizeof(line), "%-4.4s %5.0f", labels[i], raw[i]);
+    display.setCursor(0, y);
+    display.print(line);
+  }
+  display.display();
+}
+
+// Weissmessung, die checkValidity() bestanden hat, aber laut
+// MeasurementTip::isPlausible() Implausible oder Indeterminate ist (siehe
+// pendingWhite). Nutzer entscheidet per Auswahlliste (Cursor:
+// whiteConfirmIndex, kurzer Mode-Druck bewegt ihn, langer Trigger-Druck
+// waehlt -- siehe loop()): erst alle vorgeschlagenen ANDEREN Spitzen, fuer die
+// die Messung plausibel waere (siehe pendingWhite.suggestedTipIndices/
+// TipCatalog::rankPlausibleTips()), dann "Als neue Spitze", "Uebernehmen",
+// "Verwerfen". Gleiches Scroll-Schema wie renderTipList() (computeScrollStart(),
+// 4 sichtbare Zeilen, "^"/"v"-Indikatoren bei Bedarf).
+void renderWhitePlausibilityConfirm() {
+  if (!displayOk) return;
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  if (pendingWhite.plausibility == PlausibilityResult::Implausible) {
+    display.println("Weiss weicht ab");
+    display.setCursor(0, 9);
+    display.println("von alten Werten");
+  } else {
+    display.println("Weiss unklar");
+    display.setCursor(0, 9);
+    display.println("zu wenig Daten");
+  }
+
+  size_t sCount = pendingWhite.suggestedTipIndices.size();
+  uint8_t total = (uint8_t)(sCount + 3);  // Vorschlaege + "Als neue Spitze" + Uebernehmen + Verwerfen
+  const uint8_t VISIBLE_ROWS = 4;
+  uint8_t start = computeScrollStart(whiteConfirmIndex, total, VISIBLE_ROWS);
+
+  int y = 24;
+  for (uint8_t i = start; i < start + VISIBLE_ROWS && i < total; i++) {
+    char line[22];
+    if (i < sCount) {
+      snprintf(line, sizeof(line), "%s", tipCatalog.tips[pendingWhite.suggestedTipIndices[i]].name.c_str());
+    } else if (i == sCount) {
+      snprintf(line, sizeof(line), "Als neue Spitze");
+    } else if (i == sCount + 1) {
+      snprintf(line, sizeof(line), "Uebernehmen");
+    } else {
+      snprintf(line, sizeof(line), "Verwerfen");
+    }
+    display.setCursor(0, y);
+    display.print(i == whiteConfirmIndex ? "> " : "  ");
+    display.println(line);
+    y += 10;
+  }
+  if (start > 0) {
+    display.setCursor(122, 0);
+    display.print("^");
+  }
+  if (start + VISIBLE_ROWS < total) {
+    display.setCursor(122, 56);
+    display.print("v");
+  }
+  display.display();
+}
+
+// Gemeinsamer Abschluss einer AKZEPTIERTEN Messung -- sowohl fuer den
+// direkten Erfolgsfall in performMeasurement() als auch fuer eine per
+// "Uebernehmen"/eine vorgeschlagene Spitze/"Als neue Spitze" bestaetigte,
+// zuvor als Implausible/Indeterminate zurueckgehaltene Weissmessung (siehe
+// pendingWhite/loop()). Schreibt lastMeasurement/-Settings, vergibt die
+// Sample-Nummer, haengt an die Historie an, aktualisiert Dark-/Weiss-Referenz
+// inkl. Fingerabdruck und bestimmt 'calibrated' neu.
+//
+// targetTip (optional): welcher Spitze der Fingerabdruck einer Weissmessung
+// zugeordnet wird -- Default nullptr bedeutet "die aktuell aktive Spitze"
+// (tipCatalog.activeTip(), bisheriges Verhalten). Wird explizit gesetzt, wenn
+// der Nutzer im Bestaetigungs-Screen eine ANDERE, bereits bekannte Spitze
+// ausgewaehlt hat (siehe loop()) -- WICHTIG: in diesem Fall wird
+// finalizeMeasurement() aufgerufen, BEVOR die Spitze aktiviert wird (siehe
+// dort), damit rec.settings/whiteRefSettings/fp.sensor weiterhin die
+// Einstellungen festhalten, unter denen tatsaechlich gemessen wurde --
+// activateTip() wuerde currentSettings.optical sonst schon vorher auf die
+// (moeglicherweise abweichenden) Einstellungen der neuen Spitze umstellen.
+void finalizeMeasurement(Precision precision, SampleKind kind, const Measurement& measurement,
+                          const MeasurementTelemetry& telemetry, MeasurementTip* targetTip = nullptr) {
+  lastMeasurement = measurement;
+  lastMeasurementSettings = currentSettings.optical;
+
+  // Vor der Beschriftung inkrementieren: die Sample-Nummer ist der neue,
+  // lebenslange Zaehlerstand -- so laufen die Nummern ueber Reboots/Sessions
+  // hinweg durch, statt bei jedem Neustart wieder bei 1 anzufangen. Dark/White
+  // verbrauchen dabei ebenfalls eine Nummer (zaehlen als Messung), tauchen aber
+  // nicht als "sample_NN" auf -- entstehende Luecken in der Sample-Numerierung
+  // sind bewusst in Kauf genommen.
+  uptimeLogger.recordMeasurement();
+
+  char lbl[16];
+  if (kind == SampleKind::Dark) {
+    strncpy(lbl, "dark", sizeof(lbl));
+  } else if (kind == SampleKind::White) {
+    strncpy(lbl, "white", sizeof(lbl));
+  } else {
+    snprintf(lbl, sizeof(lbl), "sample_%02u", (unsigned)uptimeLogger.measurementCount());
+  }
+  lbl[sizeof(lbl) - 1] = '\0';
+  strncpy(lastLabel, lbl, sizeof(lastLabel));
+  lastLabel[sizeof(lastLabel) - 1] = '\0';
+
+  MeasurementRecord rec;
+  strncpy(rec.label, lbl, sizeof(rec.label));
+  rec.label[sizeof(rec.label) - 1] = '\0';
+  rec.kind = kind;
+  rec.measurement = measurement;
+  // Kontext zum Messzeitpunkt -- siehe MeasurementRecord-Kommentar in
+  // HistoryStore.h: kein Ersatz fuer eine echte LED-Temperaturmessung, aber
+  // ein greifbarer Hinweis bei spaeterer Auswertung unerklaerter Abweichungen.
+  rec.tempC = temperatureRead();
+  rec.sessionMs = millis();
+  rec.uptimeS = uptimeLogger.totalSeconds();
+  rec.settings = currentSettings.optical;
+  rec.precision = precision;
+  rec.sampleCount = telemetry.sampleCount;
+  rec.relSemWorst = telemetry.relSemWorst;
+  if (!historyStore.append(rec)) {
+    Serial.println("# history append failed (Flash voll?)");
+  }
+
+  if (kind == SampleKind::Dark) {
+    darkRef = measurement;
+    darkRefSettings = currentSettings.optical;  // Einstellungen zum Aufnahmezeitpunkt einfrieren
+    calStore.saveDark(darkRef, darkRefSettings);
+  }
+  if (kind == SampleKind::White) {
+    whiteRef = measurement;
+    whiteRefSettings = currentSettings.optical;
+    calStore.saveWhite(whiteRef, whiteRefSettings);
+
+    MeasurementTip* active = targetTip ? targetTip : tipCatalog.activeTip();
+    if (active) {
+      appendWhiteFingerprint(*active, buildWhiteFingerprint(measurement, currentSettings.optical));
+      calStore.saveTips(tipCatalog);
+    }
+  }
+  calibrated = calibrationValidFor(currentSettings.optical);
+
+  printCsvRow(rec);
+}
+
 // Gemeinsamer Einstiegspunkt fuer den Trigger-Taster in allen Mess-Modi.
 // precision/kind werden vom Aufrufer (loop()) bestimmt, nicht hier -- diese
 // Funktion kennt keinen DisplayMode mehr, nur noch "wie genau messen" und
@@ -903,62 +1538,51 @@ bool performMeasurement(Precision precision, SampleKind kind) {
     renderMeasurementError(telemetry.status);
     return false;
   }
-  lastMeasurement = measurement;
-  lastMeasurementSettings = currentSettings;
-
-  // Vor der Beschriftung inkrementieren: die Sample-Nummer ist der neue,
-  // lebenslange Zaehlerstand -- so laufen die Nummern ueber Reboots/Sessions
-  // hinweg durch, statt bei jedem Neustart wieder bei 1 anzufangen. Dark/White
-  // verbrauchen dabei ebenfalls eine Nummer (zaehlen als Messung), tauchen aber
-  // nicht als "sample_NN" auf -- entstehende Luecken in der Sample-Numerierung
-  // sind bewusst in Kauf genommen.
-  uptimeLogger.recordMeasurement();
-
-  char lbl[16];
-  if (kind == SampleKind::Dark) {
-    strncpy(lbl, "dark", sizeof(lbl));
-  } else if (kind == SampleKind::White) {
-    strncpy(lbl, "white", sizeof(lbl));
-  } else {
-    snprintf(lbl, sizeof(lbl), "sample_%02u", (unsigned)uptimeLogger.measurementCount());
-  }
-  lbl[sizeof(lbl) - 1] = '\0';
-  strncpy(lastLabel, lbl, sizeof(lastLabel));
-  lastLabel[sizeof(lastLabel) - 1] = '\0';
-
-  MeasurementRecord rec;
-  strncpy(rec.label, lbl, sizeof(rec.label));
-  rec.label[sizeof(rec.label) - 1] = '\0';
-  rec.kind = kind;
-  rec.measurement = measurement;
-  // Kontext zum Messzeitpunkt -- siehe MeasurementRecord-Kommentar in
-  // HistoryStore.h: kein Ersatz fuer eine echte LED-Temperaturmessung, aber
-  // ein greifbarer Hinweis bei spaeterer Auswertung unerklaerter Abweichungen.
-  rec.tempC = temperatureRead();
-  rec.sessionMs = millis();
-  rec.uptimeS = uptimeLogger.totalSeconds();
-  rec.settings = currentSettings;
-  rec.precision = precision;
-  rec.sampleCount = telemetry.sampleCount;
-  rec.relSemWorst = telemetry.relSemWorst;
-  if (!historyStore.append(rec)) {
-    Serial.println("# history append failed (Flash voll?)");
-  }
-
-  if (kind == SampleKind::Dark) {
-    darkRef = measurement;
-    darkRefSettings = currentSettings;  // Einstellungen zum Aufnahmezeitpunkt einfrieren
-    calStore.saveDark(darkRef, darkRefSettings);
-  }
+  // Eine Weissreferenz, die in irgendeinem Kanal klippt oder unter der
+  // Rauschgrenze liegt, taugt weder als Referenz noch als Fingerabdruck --
+  // wird deshalb komplett verworfen (nicht als whiteRef uebernommen, nicht in
+  // der Historie, kein Fingerabdruck), aber dem Nutzer trotzdem mit den
+  // Rohwerten UND dem Grund angezeigt (siehe renderWhiteValidityWarning()).
+  // lastMeasurement/lastMeasurementSettings bleiben dabei unveraendert, wie
+  // beim Sensorfehler-/Nicht-Konvergenz-Fall oben.
   if (kind == SampleKind::White) {
-    whiteRef = measurement;
-    whiteRefSettings = currentSettings;
-    calStore.saveWhite(whiteRef, whiteRefSettings);
+    MeasurementValidity validity = spectrometer.checkValidity(measurement, currentSettings.optical);
+    if (!validity.ok) {
+      busy = false;
+      renderWhiteValidityWarning(measurement, validity);
+      return false;
+    }
+
+    // Verlaesslich (kein Klippen/Rauschgrenze), aber passt sie zu den
+    // bisherigen Fingerabdruecken dieser Spitze? Nur bei einer aktiven Spitze
+    // ueberhaupt pruefbar -- ohne aktive Spitze (sollte laut Invariante nicht
+    // vorkommen) gilt sie vorsichtshalber als Indeterminate. Nur Implausible/
+    // Indeterminate unterbrechen den Ablauf (siehe pendingWhite/loop()) --
+    // Plausible/PlausibleViaFallback werden wie bisher still uebernommen.
+    MeasurementTip* active = tipCatalog.activeTip();
+    WhiteFingerprint candidate = buildWhiteFingerprint(measurement, currentSettings.optical);
+    PlausibilityResult plaus = active ? active->isPlausible(candidate, tipCatalog)
+                                       : PlausibilityResult::Indeterminate;
+    if (plaus == PlausibilityResult::Implausible || plaus == PlausibilityResult::Indeterminate) {
+      busy = false;
+      pendingWhite.active = true;
+      pendingWhite.precision = precision;
+      pendingWhite.measurement = measurement;
+      pendingWhite.telemetry = telemetry;
+      pendingWhite.plausibility = plaus;
+      // Vielleicht passt die Messung ja zu einer ANDEREN, bereits bekannten
+      // Spitze (z.B. physischer Spitzenwechsel, ohne das Geraet zu
+      // informieren) -- wird im Bestaetigungs-Screen VOR "Als neue Spitze"/
+      // "Uebernehmen"/"Verwerfen" angeboten (siehe renderWhitePlausibilityConfirm()).
+      pendingWhite.suggestedTipIndices = active ? tipCatalog.rankPlausibleTips(candidate, active->name)
+                                                 : std::vector<size_t>();
+      whiteConfirmIndex = 0;
+      renderCurrentView();
+      return false;
+    }
   }
-  calibrated = calibrationValidFor(currentSettings);
 
-  printCsvRow(rec);
-
+  finalizeMeasurement(precision, kind, measurement, telemetry);
   busy = false;
   renderCurrentView();
   return true;
@@ -1030,11 +1654,37 @@ void cycleView() {
     return;
   }
   if (currentDisplayMode == DisplayMode::Settings) {
-    currentSettingIndex = (currentSettingIndex + 1) % SETTINGS_COUNT;
+    if (tipMenuStage == TipMenuStage::List) {
+      uint8_t total = (uint8_t)(TIP_LIST_FIXED_ENTRIES + tipCatalog.tips.size());
+      tipListIndex = (tipListIndex + 1) % total;
+      renderCurrentView();
+      return;
+    }
+    if (tipMenuStage == TipMenuStage::Detail) {
+      bool isActive = (tipCatalog.tips[tipDetailIndex].name == tipCatalog.active);
+      // aktiv: <Zurueck>/Weiss-Fingerabdruck; sonst: <Zurueck>/Aktivieren/Loeschen/Weiss-Fingerabdruck.
+      uint8_t total = isActive ? 2 : 4;
+      tipActionIndex = (tipActionIndex + 1) % total;
+      renderCurrentView();
+      return;
+    }
+    if (tipMenuStage == TipMenuStage::FingerprintStats) {
+      fingerprintStatsScroll++;  // Modulo macht der Renderer anhand der Kanalanzahl
+      renderCurrentView();
+      return;
+    }
+    SettingsLevel& lvl = settingsStack[settingsDepth];
+    lvl.index = (lvl.index + 1) % lvl.count;
     renderCurrentView();
     return;
   }
   if (currentDisplayMode == DisplayMode::Calibration) {
+    if (pendingWhite.active) {
+      uint8_t total = (uint8_t)(pendingWhite.suggestedTipIndices.size() + 3);
+      whiteConfirmIndex = (whiteConfirmIndex + 1) % total;
+      renderCurrentView();
+      return;
+    }
     calibrationTarget = (calibrationTarget == CalibrationTarget::White) ? CalibrationTarget::Dark : CalibrationTarget::White;
     renderCurrentView();
     return;
@@ -1078,8 +1728,12 @@ void cycleMode() {
     exportPage = ExportPage::Normal;
   }
   if (currentDisplayMode == DisplayMode::Settings && previous != DisplayMode::Settings) {
-    // Gleiche Ueberlegung wie bei exportPage oben.
-    currentSettingIndex = 0;
+    // Gleiche Ueberlegung wie bei exportPage oben, jetzt auf den ganzen Baum
+    // bezogen: Position immer auf die Wurzel zuruecksetzen (siehe Plan) --
+    // man steigt beim naechsten Eintritt also immer wieder neu ein.
+    settingsDepth = 0;
+    settingsStack[0] = { SETTINGS_ROOT, sizeof(SETTINGS_ROOT) / sizeof(SETTINGS_ROOT[0]), 0 };
+    tipMenuStage = TipMenuStage::Closed;
   }
   if (currentDisplayMode == DisplayMode::Calibration && previous != DisplayMode::Calibration) {
     // Gleiche Ueberlegung -- nicht unbemerkt auf "Dark" landen.
@@ -1098,6 +1752,11 @@ void cycleMode() {
   // auf ihren "keine Messung"/"nicht kalibriert"-Hinweis zurueck).
   lastMeasurement.clear();
   lastLabel[0] = '\0';
+  // Ein offener Plausibilitaets-Entscheid gehoert ebenfalls zum vorherigen
+  // Modus -- ein Moduswechsel gilt als implizites Verwerfen (nichts wurde je
+  // geschrieben, siehe performMeasurement()), das gehaltene Measurement wird
+  // dabei sauber freigegeben.
+  pendingWhite = PendingWhiteDecision();
 
   renderCurrentView();
 
@@ -1146,7 +1805,14 @@ void setup() {
   calStore.loadDark(darkRef, darkRefSettings);
   calStore.loadWhite(whiteRef, whiteRefSettings);
   calStore.loadSettings(currentSettings);
-  calibrated = calibrationValidFor(currentSettings);
+  calibrated = calibrationValidFor(currentSettings.optical);
+
+  // Katalog nie leer, siehe TipCatalog.h -- beim allerersten Boot (oder falls
+  // das gespeicherte JSON ungueltig ist) gibt es noch keine Spitze: legt
+  // "Messspitze 1" mit den gerade geladenen/Default-Einstellungen an.
+  if (!calStore.loadTips(tipCatalog)) {
+    createTipFromCurrentSettings();
+  }
 
   uptimeLogger.begin();
   historyStore.begin();  // nicht fatal bei Fehlschlag -- Kernfunktion laeuft ohne Historie weiter
@@ -1161,7 +1827,7 @@ void setup() {
     Serial.println("# AS7341 not found");
     while (true) delay(1000);
   }
-  sensorImpl.applySettings(currentSettings);  // Hardware von Anfang an zum geladenen Zustand passend
+  sensorImpl.applySettings(currentSettings.optical);  // Hardware von Anfang an zum geladenen Zustand passend
 
   // Ersetzt den "startet ..."-Text von oben, sobald alles initialisiert ist --
   // currentDisplayMode/measurePage stehen bereits auf ihren Defaults
@@ -1198,14 +1864,54 @@ void loop() {
     if (exportPage == ExportPage::Clear) {
       if (te == DebouncedButton::Event::LongPress) {
         flashBorder();
-        historyStore.clear();
+        historyStore.clear();  // behaelt die letzte Dark-/Weisszeile, siehe dort
         renderCurrentView();
       }
     } else if (te == DebouncedButton::Event::Pressed) {
       performExport();
     }
   } else if (currentDisplayMode == DisplayMode::Calibration) {
-    if (te == DebouncedButton::Event::LongPress) {
+    if (pendingWhite.active) {
+      // Nutzer entscheidet ueber eine zuvor als Implausible/Indeterminate
+      // zurueckgehaltene Weissmessung (siehe performMeasurement()/
+      // renderWhitePlausibilityConfirm()): eine vorgeschlagene Spitze, "Als
+      // neue Spitze", "Uebernehmen" oder "Verwerfen".
+      if (te == DebouncedButton::Event::LongPress) {
+        size_t sCount = pendingWhite.suggestedTipIndices.size();
+        if (whiteConfirmIndex < sCount) {
+          // Die Messung gehoert laut Nutzer zu einer ANDEREN, bereits
+          // bekannten Spitze. ERST unter dieser Spitze festschreiben
+          // (waehrend currentSettings.optical noch die tatsaechlichen
+          // Aufnahme-Einstellungen sind), DANACH erst die Spitze aktivieren
+          // (das aendert currentSettings.optical/die Sensor-Register fuer
+          // KUENFTIGE Messungen) -- siehe finalizeMeasurement()-Kommentar.
+          MeasurementTip& target = tipCatalog.tips[pendingWhite.suggestedTipIndices[whiteConfirmIndex]];
+          busy = true;
+          finalizeMeasurement(pendingWhite.precision, SampleKind::White, pendingWhite.measurement,
+                               pendingWhite.telemetry, &target);
+          busy = false;
+          activateTip(target);
+        } else if (whiteConfirmIndex == sCount) {
+          // "Als neue Spitze" -- umgekehrte Reihenfolge: ERST anlegen+
+          // aktivieren (aendert currentSettings.optical NICHT, siehe
+          // createTipFromCurrentSettings()), DANACH erst festschreiben (landet
+          // ueber den Default-Zielpfad automatisch bei der frisch aktivierten,
+          // noch leeren Spitze).
+          createTipFromCurrentSettings();
+          busy = true;
+          finalizeMeasurement(pendingWhite.precision, SampleKind::White, pendingWhite.measurement, pendingWhite.telemetry);
+          busy = false;
+        } else if (whiteConfirmIndex == sCount + 1) {
+          // "Uebernehmen" -- fuer die aktive, bereits als un-plausibel gemeldete Spitze.
+          busy = true;
+          finalizeMeasurement(pendingWhite.precision, SampleKind::White, pendingWhite.measurement, pendingWhite.telemetry);
+          busy = false;
+        }
+        // sCount+2 ("Verwerfen"): nichts tun, Messung bleibt verworfen.
+        pendingWhite = PendingWhiteDecision();  // Zustand + gehaltenes Measurement freigeben
+        renderCurrentView();
+      }
+    } else if (te == DebouncedButton::Event::LongPress) {
       SampleKind kind = (calibrationTarget == CalibrationTarget::White) ? SampleKind::White : SampleKind::Dark;
       performMeasurement(Precision::Precise, kind);  // Referenzmessungen immer Precise, wie bisher
     }
@@ -1226,17 +1932,88 @@ void loop() {
     // feuert dagegen nur beim Loslassen, und nur, wenn die Lang-Druck-
     // Schwelle waehrend des Haltens NICHT ueberschritten wurde (siehe
     // Buttons.h) -- exakt wie die Mode-Taste es bereits macht.
-    const SettingDescriptor& s = SETTINGS[currentSettingIndex];
-    if (!editingActive) {
+    if (tipMenuStage == TipMenuStage::List) {
+      // "<Zurueck>" verlaesst den Messspitzen-Menuepunkt (zurueck in den
+      // generischen Baum, auf "Messspitzen" stehend); "Neue Spitze anlegen"
+      // registriert+aktiviert sofort; jeder andere Eintrag oeffnet das
+      // Detail-Menue der gewaehlten Spitze.
       if (te == DebouncedButton::Event::LongPress) {
-        editor.begin(s.digitCount, s.digitCycleLen, s.getValue());
-        editingActive = true;
+        if (tipListIndex == 0) {
+          tipMenuStage = TipMenuStage::Closed;
+        } else if (tipListIndex == 1) {
+          createTipFromCurrentSettings();
+          tipListIndex = (uint8_t)(TIP_LIST_FIXED_ENTRIES + tipCatalog.tips.size() - 1);  // Cursor auf die neue Spitze
+        } else {
+          tipDetailIndex = tipListIndex - TIP_LIST_FIXED_ENTRIES;
+          tipActionIndex = 0;
+          tipMenuStage = TipMenuStage::Detail;
+        }
         renderCurrentView();
+      }
+    } else if (tipMenuStage == TipMenuStage::Detail) {
+      if (te == DebouncedButton::Event::LongPress) {
+        const MeasurementTip& tip = tipCatalog.tips[tipDetailIndex];
+        bool isActive = (tip.name == tipCatalog.active);
+        if (tipActionIndex == 0) {
+          tipMenuStage = TipMenuStage::List;
+        } else if (!isActive && tipActionIndex == 1) {
+          activateTip(tip);
+          tipMenuStage = TipMenuStage::List;
+        } else if (!isActive && tipActionIndex == 2) {
+          deleteTip(tipDetailIndex);
+          tipListIndex = 0;
+          tipMenuStage = TipMenuStage::List;
+        } else if ((isActive && tipActionIndex == 1) || (!isActive && tipActionIndex == 3)) {
+          // "Weiss-Fingerabdruck" -- immer der letzte Eintrag beider Listen
+          // (siehe renderTipDetail()).
+          fingerprintStatsScroll = 0;
+          tipMenuStage = TipMenuStage::FingerprintStats;
+        }
+        renderCurrentView();
+      }
+    } else if (tipMenuStage == TipMenuStage::FingerprintStats) {
+      // Reiner Anzeige-Screen -- ein langer Trigger-Druck geht zurueck ins
+      // Detail-Menue (kein "<Zurueck>"-Eintrag noetig, da es keinen Cursor gibt).
+      if (te == DebouncedButton::Event::LongPress) {
+        tipMenuStage = TipMenuStage::Detail;
+        renderCurrentView();
+      }
+    } else if (!editingActive) {
+      // Ausserhalb einer Bearbeitung wirkt ein langer Trigger-Druck je nach
+      // Knotenart unterschiedlich: "<Zurueck>" steigt eine Ebene auf,
+      // ein Navigationsknoten eine Ebene ab, ein Blatt startet die Bearbeitung
+      // (wie zuvor), TipList oeffnet den Messspitzen-Menuepunkt.
+      if (te == DebouncedButton::Event::LongPress) {
+        const SettingsNode& s = currentSettingsNode();
+        switch (s.kind) {
+          case SettingsNodeKind::Back:
+            if (settingsDepth > 0) settingsDepth--;
+            renderCurrentView();
+            break;
+          case SettingsNodeKind::Branch:
+            if (settingsDepth + 1 < SETTINGS_TREE_MAX_DEPTH) {
+              settingsDepth++;
+              settingsStack[settingsDepth] = { s.children, s.childCount, 0 };
+            }
+            renderCurrentView();
+            break;
+          case SettingsNodeKind::Leaf:
+            editor.begin(s.digitCount, s.digitCycleLen, s.getValue());
+            editingActive = true;
+            renderCurrentView();
+            break;
+          case SettingsNodeKind::TipList:
+            tipMenuStage = TipMenuStage::List;
+            tipListIndex = 0;
+            renderCurrentView();
+            break;
+        }
       }
     } else if (te == DebouncedButton::Event::ShortRelease) {
       editor.incrementCurrentDigit();
       renderCurrentView();
     } else if (te == DebouncedButton::Event::LongPress) {
+      const SettingsNode& s = currentSettingsNode();
       if (editor.advanceDigit()) {  // true = letzte Ziffer ueberschritten -> fertig
         s.setValue(editor.assembledValue(s.maxValue));
         editingActive = false;
@@ -1276,7 +2053,7 @@ void loop() {
   // (View/Modus wechseln) ist so lange blockiert.
   DebouncedButton::Event me = modeBtn.poll();
   if (currentDisplayMode == DisplayMode::Settings && editingActive) {
-    const SettingDescriptor& s = SETTINGS[currentSettingIndex];
+    const SettingsNode& s = currentSettingsNode();
     if (me == DebouncedButton::Event::ShortRelease) {
       editor.decrementCurrentDigit();
       renderCurrentView();
