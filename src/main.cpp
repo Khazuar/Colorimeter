@@ -530,15 +530,18 @@ void appendCsvRow(std::string& out, const char* label, const Measurement& measur
       if (idx >= 0) { snprintf(buf, sizeof(buf), "%.4f", spec.values[idx]); out += buf; }
     }
     Lab lab = getColor(spec);
+    LCh lch = labToLCh(lab);
     uint8_t r, g, b;
     labToSRGB255(lab, r, g, b);
     snprintf(buf, sizeof(buf), ",%.2f", lab.L); out += buf;
     snprintf(buf, sizeof(buf), ",%.2f", lab.a); out += buf;
     snprintf(buf, sizeof(buf), ",%.2f", lab.b); out += buf;
+    snprintf(buf, sizeof(buf), ",%.2f", lch.C); out += buf;
+    snprintf(buf, sizeof(buf), ",%.2f", lch.h); out += buf;
     snprintf(buf, sizeof(buf), ",#%02X%02X%02X", r, g, b); out += buf;
   } else {
     for (size_t i = 0; i < bandColumns.size(); i++) out += ',';
-    out += ",,,,";
+    out += ",,,,,,";
   }
 
   if (includeRaw) {
@@ -670,7 +673,7 @@ std::string buildHistoryCsv(bool includeRaw) {
     out += ',';
     out += bandColumnName(b);
   }
-  out += ",L,a,b,hex";
+  out += ",L,a,b,C,h,hex";
   if (includeRaw) {
     const char* const* labels = spectrometer.measurementLabels();
     size_t n = historyStore.firstRecordChannelCount();

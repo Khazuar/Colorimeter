@@ -181,6 +181,14 @@ void labToSRGB255(const Lab& lab, uint8_t& r, uint8_t& g, uint8_t& b) {
   xyzToSRGB255(X, Y, Z, r, g, b);
 }
 
+LCh labToLCh(const Lab& lab) {
+  const float RAD_TO_DEG = 180.0f / 3.14159265358979323846f;
+  float C = sqrtf(lab.a * lab.a + lab.b * lab.b);
+  float h = atan2f(lab.b, lab.a) * RAD_TO_DEG;
+  if (h < 0.0f) h += 360.0f;
+  return LCh{ C, h };
+}
+
 Lab getColor(const Spectrum& spectrum) {
   float X, Y, Z;
   spectrumToXYZ(spectrum.bands.data(), spectrum.values.data(), (int)spectrum.bands.size(), X, Y, Z);

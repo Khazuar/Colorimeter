@@ -41,6 +41,17 @@ void xyzToSRGB255(float X, float Y, float Z, uint8_t& r, uint8_t& g, uint8_t& b)
 void labToXYZ(const Lab& lab, float& X, float& Y, float& Z);
 void labToSRGB255(const Lab& lab, uint8_t& r, uint8_t& g, uint8_t& b);
 
+// Zylindrische Darstellung von Lab (CIELCh): C* = Chroma (Farbsaettigung,
+// Abstand von der neutralen Achse), h = Bunttonwinkel in Grad [0,360) (0=+a*/
+// rot, 90=+b*/gelb, 180=-a*/gruen, 270=-b*/blau). Reine Umrechnung derselben
+// Information wie a*/b*, keine neue Messung -- fuer die Anzeige oft
+// anschaulicher als die kartesischen a*/b*-Werte.
+struct LCh {
+  float C;
+  float h;
+};
+LCh labToLCh(const Lab& lab);
+
 // Leitet eine Lab-Farbe aus einem sensor-unabhaengigen Spectrum ab (Gauss-
 // gewichtete CIE-Integration ueber Bandzentrum+-breite, siehe spectrumToXYZ).
 // Bewusst NICHT Teil der Spectrometer-Abstraktion -- generische

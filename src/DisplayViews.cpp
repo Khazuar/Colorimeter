@@ -32,8 +32,9 @@ static void renderNoMeasurementYet(Adafruit_SSD1306& d) {
   d.println("Trigger druecken");
 }
 
-// Ersetzt die fruehere LabHex-View: Label, L*/a*/b* und Hex-Code, alles auf
-// einem Screen.
+// Ersetzt die fruehere LabHex-View: Label, L*/a*/b*, Chroma/Bunttonwinkel
+// (C*/h, siehe labToLCh() -- dieselbe Information wie a*/b*, nur zylindrisch
+// und oft anschaulicher) und Hex-Code, alles auf einem Screen.
 static void renderColorInfo(Adafruit_SSD1306& d, const ViewContext& ctx) {
   d.clearDisplay();
   d.setTextColor(SSD1306_WHITE);
@@ -46,6 +47,7 @@ static void renderColorInfo(Adafruit_SSD1306& d, const ViewContext& ctx) {
   } else {
     Spectrum spec = ctx.spectrometer.getSpectrum(ctx.measurement, ctx.whiteReference, ctx.darkReference, ctx.filterState);
     Lab lab = getColor(spec);
+    LCh lch = labToLCh(lab);
     uint8_t r, g, b;
     labToSRGB255(lab, r, g, b);
 
@@ -57,6 +59,8 @@ static void renderColorInfo(Adafruit_SSD1306& d, const ViewContext& ctx) {
     snprintf(line, sizeof(line), "L* %6.2f", lab.L); d.println(line);
     snprintf(line, sizeof(line), "a* %6.2f", lab.a); d.println(line);
     snprintf(line, sizeof(line), "b* %6.2f", lab.b); d.println(line);
+
+    snprintf(line, sizeof(line), "C* %5.1f h %5.1f", lch.C, lch.h); d.println(line);
 
     snprintf(line, sizeof(line), "#%02X%02X%02X", r, g, b);
     d.setTextSize(2);
