@@ -8,6 +8,7 @@
 #include <algorithm>
 
 #include "AppConfig.h"
+#include "FirmwareRevision.h"
 #include "Spectrometer.h"
 #include "AS7341Spectrometer.h"
 #include "SettingsCodec.h"
@@ -695,6 +696,14 @@ std::string buildHistoryCsv(bool includeRaw) {
            (unsigned long)uptimeLogger.measurementCount());
   out += uptimeLine;
 
+  // Firmware revision (git describe --always --dirty, baked in at build
+  // time by scripts/gen_firmware_revision.py) -- one line per export,
+  // same precedent as uptime_seconds/measurement_count above.
+  char revisionLine[48];
+  snprintf(revisionLine, sizeof(revisionLine), "firmware_revision,%s\n",
+           FIRMWARE_REVISION);
+  out += revisionLine;
+
   CsvBuildCtx ctx{ &out, includeRaw, &bandColumns, {} };
   historyStore.forEach(appendRecordToCsv, &ctx);
   return out;
@@ -860,6 +869,10 @@ void renderInfoStatus() {
 
   snprintf(line, sizeof(line), "Temp: %.1f C", temperatureRead());
   display.setCursor(0, 44);
+  display.println(line);
+
+  snprintf(line, sizeof(line), "Rev: %.18s", FIRMWARE_REVISION);
+  display.setCursor(0, 54);
   display.println(line);
 
   display.display();
