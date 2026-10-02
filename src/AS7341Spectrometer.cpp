@@ -1,4 +1,5 @@
 #include "AS7341Spectrometer.h"
+#include "AS7341Math.h"
 #include "AppConfig.h"
 #include <Arduino.h>
 #include <cmath>
@@ -34,11 +35,13 @@ static const uint8_t PRECISE_MIN_SAMPLES    = 8;
 static const uint8_t PRECISE_MAX_SAMPLES    = 32;    // Cap, ersetzt frueheres festes N_AVG=16
 static const float   PRECISE_TARGET_REL_SEM = 0.01f; // 1% rel. Standardfehler d. Mittelwerts -- TODO tunen
 
-// Fuer checkValidity()/normalize() (siehe dort). ADC-Vollausschlag =
-// (ATIME+1)*(ASTEP+1)*1024, gedeckelt auf die 16 Bit des Datenregisters.
+// Fuer checkValidity()/normalize() (siehe dort). ADC-Vollausschlag laut
+// AS7341-Datenblatt: (ATIME+1)*(ASTEP+1), gedeckelt auf die 16 Bit des
+// Datenregisters (65535). Bei kurzen Integrationszeiten liegt der
+// Vollausschlag also deutlich UNTER 65535 (z. B. ATIME 150/ASTEP 100 ->
+// 15251) -- eine feste 65535-Schwelle wuerde Klippen dort nie erkennen.
 // SATURATION_LIMIT_FRAC exakt wie beim frueheren Belichtungs-Assistenten-
 // Entwurf. ASTEP_TIME_MS laut Datenblatt/Adafruit_AS7341::toBasicCounts().
-static const uint32_t ADC_FULL_SCALE_CAP    = 65535;
 static const float    SATURATION_LIMIT_FRAC = 0.80f;
 static const float    ASTEP_TIME_MS         = 0.00278f;
 // Reihenfolge == as7341_gain_t (siehe Adafruit_AS7341.h), wie GAIN_LABELS in
@@ -352,8 +355,7 @@ MeasurementValidity AS7341Spectrometer::checkValidity(const Measurement& raw, co
   MeasurementValidity result;
   if (raw.size() != N_CH) return result;  // ok bleibt false
 
-  uint32_t aintRaw = (uint32_t)(settings.sensor.atime + 1) * (uint32_t)(settings.sensor.astep + 1);
-  uint32_t fullScale = (aintRaw >= 64) ? ADC_FULL_SCALE_CAP : (aintRaw * 1024u);
+  uint32_t fullScale = adcFullScale(settings.sensor.atime, settings.sensor.astep);
   float satLimit = SATURATION_LIMIT_FRAC * (float)fullScale;
   for (uint8_t c = 0; c < N_CH; c++) {
     if (raw[c] > satLimit) result.anyClipping = true;
