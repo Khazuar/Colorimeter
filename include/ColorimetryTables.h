@@ -27,9 +27,10 @@ static const float D50_ZN = 82.510460f;
 // Empfindlichkeitskurven je Band sind laut Datenblatt selbst nahezu
 // gaussfoermig, das bildet die tatsaechliche physikalische Bandform nach,
 // statt sie durch Geradenstuecke zu ersetzen. Im ueberlappenden Kernbereich
-// der Baender ergibt das einen echten gewichteten Mittelwert; weit ausserhalb
-// aller Baender klingt R(lambda) glatt gegen 0 ab (siehe spectrumToXYZ) --
-// dort sind ohnehin auch die Normbeobachter-Kurven selbst vernachlaessigbar.
+// der Baender ergibt das einen echten gewichteten Mittelwert; ausserhalb der
+// Baender wird strikt normalisiert, R(lambda) haelt dort also den Wert des
+// naechstgelegenen Bandes (siehe spectrumToXYZ). Ein konstantes Spektrum
+// ergibt damit eine exakt neutrale Farbe.
 void spectrumToXYZ(const Band* bands, const float* values, int n,
                     float& X, float& Y, float& Z);
 

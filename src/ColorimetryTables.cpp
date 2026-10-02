@@ -103,15 +103,16 @@ void spectrumToXYZ(const Band* bands, const float* values, int n,
     // Gauss-gewichtete Summe ueber alle Baender (siehe Header-Kommentar) statt
     // linearer Interpolation zwischen Bandmitten -- jedes Band traegt gemaess
     // seiner eigenen (nahezu gaussfoermigen) Empfindlichkeitskurve zu R(wl)
-    // bei, nicht nur die beiden rechnerisch naechstgelegenen. Der Nenner wird
-    // auf MINDESTENS 1 gehalten statt strikt zu normalisieren: im eigentlichen
-    // Messbereich (Baender ueberlappen, Gewichtssumme >= 1) ergibt das einen
-    // echten gewichteten Mittelwert wie zuvor; weit ausserhalb ALLER Baender
-    // (Gewichtssumme -> 0) laesst es R(wl) dagegen glatt gegen 0 auslaufen,
-    // statt sich beliebig auf den naechstgelegenen Bandwert zu versteifen --
-    // fuer die CIE-Integration ohnehin der einzig relevante Fall dort: die
-    // Normbeobachter-Kurven selbst sind an den Raendern von 380-730nm schon
-    // vernachlaessigbar klein, R(wl) spielt dort fuer X/Y/Z keine Rolle mehr.
+    // bei, nicht nur die beiden rechnerisch naechstgelegenen. Strikt
+    // normalisiert (Division durch die Gewichtssumme): R(wl) ist damit an
+    // JEDER Stuetzstelle ein echter gewichteter Mittelwert der Bandwerte, und
+    // ein konstantes Spektrum (R=c in allen Baendern) bleibt ueberall exakt c
+    // -- ein ideales Grau ergibt a*=b*=0. Ausserhalb der Baender haelt das den
+    // Wert des naechstgelegenen Bandes, statt gegen 0 abzufallen. Frueher
+    // wurde der Nenner auf mindestens 1 gehalten; das zog R an den Raendern
+    // (v. a. 650-700nm ohne F8, < 405nm) gegen 0 und verfaelschte die Farbe
+    // messbar (perfektes Weiss ohne Filter: a* -4,7; mit 700nm-Filter: b* +1,7),
+    // weil die Normbeobachter-Kurven dort noch nicht vernachlaessigbar sind.
     float weightedSum = 0.0f, weightTotal = 0.0f;
     for (int j = 0; j < n; j++) {
       float sigma = bands[j].fwhm_nm * FWHM_TO_SIGMA;
@@ -121,7 +122,24 @@ void spectrumToXYZ(const Band* bands, const float* values, int n,
       weightedSum += w * values[j];
       weightTotal += w;
     }
-    float R = weightedSum / fmaxf(weightTotal, 1.0f);
+    // Weit ausserhalb aller Baender werden die Gewichte winzig, ihr Verhaeltnis
+    // bleibt aber exakt -- deshalb KEINE Mindestschwelle (eine Schwelle wie
+    // 1e-12 setzte R z. B. im 650nm-Modus bei 730nm faelschlich auf 0). Nur
+    // wenn alle Gewichte auf exakt 0 unterlaufen, wird der Wert des
+    // naechstgelegenen Bandes gehalten.
+    float R;
+    if (weightTotal > 0.0f) {
+      R = weightedSum / weightTotal;
+    } else {
+      int nearest = -1;
+      float bestDist = 0.0f;
+      for (int j = 0; j < n; j++) {
+        if (bands[j].fwhm_nm <= 0.0f) continue;
+        float dist = fabsf(wl - bands[j].center_nm);
+        if (nearest < 0 || dist < bestDist) { nearest = j; bestDist = dist; }
+      }
+      R = (nearest >= 0) ? values[nearest] : 0.0f;
+    }
 
     float illum = CIE_D50_SPD[i];
     float xb = CIE_CMF[i][0], yb = CIE_CMF[i][1], zb = CIE_CMF[i][2];
