@@ -9,39 +9,39 @@ struct MeasurementRecord {
   char label[16];
   SampleKind kind = SampleKind::Regular;
   Measurement measurement;
-  // Kontext zum Messzeitpunkt -- nicht repraesentativ fuer die tatsaechliche
-  // LED-Temperatur (misst nur den ESP32-Die), aber ein greifbarer Hinweis bei
-  // spaeterer Auswertung, falls Messreihen unerklaerte Abweichungen zeigen.
-  float tempC = 0.0f;         // ESP32-interner Temperatursensor, Grad Celsius
-  uint32_t sessionMs = 0;     // millis() zum Messzeitpunkt (Laufzeit seit diesem Boot)
-  uint32_t uptimeS = 0;       // UptimeLogger::totalSeconds() zum Messzeitpunkt (LED-Alter, lebenslang)
-  OpticalSettings settings;  // Filter/Gain/ATIME/ASTEP zum Messzeitpunkt
+  // Context at measurement time -- not representative of the actual LED
+  // temperature (only measures the ESP32 die), but a tangible clue for later
+  // analysis if a series of measurements shows unexplained deviations.
+  float tempC = 0.0f;         // ESP32 internal temperature sensor, degrees Celsius
+  uint32_t sessionMs = 0;     // millis() at measurement time (runtime since this boot)
+  uint32_t uptimeS = 0;       // UptimeLogger::totalSeconds() at measurement time (LED age, lifetime)
+  OpticalSettings settings;  // filter/gain/ATIME/ASTEP at measurement time
 
-  // Messmodus + Praezisions-Telemetrie (siehe Spectrometer.h::MeasurementTelemetry).
-  // sampleCount ist bei Precision::Single immer 1. relSemWorst ist NAN, wenn
-  // kein relSEM berechnet wurde (Precision::Single, oder Precision::Precise
-  // ohne Kanal oberhalb der Rauschgrenze) -- bewusst NICHT 0.0.
+  // Measurement mode + precision telemetry (see Spectrometer.h::MeasurementTelemetry).
+  // sampleCount is always 1 for Precision::Single. relSemWorst is NAN when no
+  // relSEM was computed (Precision::Single, or Precision::Precise with no
+  // channel above the noise floor) -- deliberately NOT 0.0.
   Precision precision = Precision::Single;
   uint8_t sampleCount = 1;
   float relSemWorst = NAN;
 
-  // Absoluter Standardfehler des Mittelwerts JE KANAL (siehe
-  // MeasurementTelemetry::semPerChannel) -- leer, wenn nicht ermittelt
-  // (Precision::Single, oder eine Zeile von vor dieser Erweiterung). Damit
-  // stehen bei einer spaeteren Neuberechnung (Export, Diagnose) dieselben
-  // Unsicherheitsdaten zur Verfuegung wie live zum Messzeitpunkt, nicht nur
-  // der aggregierte relSemWorst.
+  // Absolute standard error of the mean PER CHANNEL (see
+  // MeasurementTelemetry::semPerChannel) -- empty if not determined
+  // (Precision::Single, or a row from before this extension). This means a
+  // later recomputation (export, diagnostics) has the same uncertainty data
+  // available as live at measurement time, not just the aggregated
+  // relSemWorst.
   Measurement semPerChannel;
 };
 
-// Persistiert die Messhistorie zeilenweise als CSV auf der (bisher
-// ungenutzten) "spiffs"-Partition via LittleFS -- physisch getrennt von
-// "nvs" (Kalibrierung) und "uptime". Jede Zeile ist eine minimale, verlustfreie
-// Rohdaten-Serialisierung (Label, Modus, rohe Measurement-Werte); Spectrum/
-// Lab/Hex werden wie bisher erst bei jedem Export frisch aus den ROHDATEN neu
-// berechnet (appendCsvRow() bleibt unveraendert) -- das entspricht genau dem
-// heutigen Verhalten, bei dem sich eine Neukalibrierung rueckwirkend auf alle
-// Historien-Zeilen im Export auswirkt.
+// Persists the measurement history row by row as CSV on the (previously
+// unused) "spiffs" partition via LittleFS -- physically separate from "nvs"
+// (calibration) and "uptime". Each row is a minimal, lossless raw-data
+// serialization (label, mode, raw Measurement values); spectrum/Lab/hex are,
+// as before, freshly recomputed from the RAW DATA on every export
+// (appendCsvRow() remains unchanged) -- this matches exactly today's
+// behavior, where a recalibration retroactively affects all history rows in
+// the export.
 class HistoryStore {
 public:
   bool begin();
@@ -52,7 +52,7 @@ public:
   using RecordVisitor = void (*)(const MeasurementRecord& rec, void* userData);
   void forEach(RecordVisitor visitor, void* userData) const;
 
-  // Kanalzahl der ersten gespeicherten Zeile, oder 0 falls leer/nicht gemountet.
+  // Channel count of the first stored row, or 0 if empty/not mounted.
   size_t firstRecordChannelCount() const;
 
 private:

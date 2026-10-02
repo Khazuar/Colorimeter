@@ -4,43 +4,43 @@
 #include "AppConfig.h"
 #include "TipCatalog.h"
 
-// Duenner NVS-Wrapper fuer die Dunkel-/Weiss-Kalibrierung, die Einstellungs-
-// Hierarchie (RootSettings) UND den Messspitzen-Katalog (TipCatalog). Gehoert
-// der Orchestrierung (main.cpp) -- der Spectrometer selbst fasst kein Flash
-// an. Persistiert jeweils als JSON-String (siehe CalibrationStore.cpp und
-// schema/settings.schema.json bzw. schema/tips.schema.json) statt als
-// Binaer-Blob -- robust gegenueber hinzukommenden/fehlenden Feldern,
-// Enum-Werte als Strings statt Zahlen-Index. Groesse der Rohwerte wird aus
-// dem gespeicherten Blob selbst ermittelt (getBytesLength), die
-// Orchestrierung muss also keine sensorspezifische Kanalanzahl kennen.
+// Thin NVS wrapper for the dark/white calibration, the settings hierarchy
+// (RootSettings) AND the measurement tip catalog (TipCatalog). Belongs to the
+// orchestration (main.cpp) -- the Spectrometer itself never touches flash.
+// Each is persisted as a JSON string (see CalibrationStore.cpp and
+// schema/settings.schema.json resp. schema/tips.schema.json) rather than as a
+// binary blob -- robust against fields being added/missing, enum values as
+// strings instead of a numeric index. The size of the raw values is
+// determined from the stored blob itself (getBytesLength), so the
+// orchestration does not need to know any sensor-specific channel count.
 class CalibrationStore {
 public:
-  void begin();  // prefs_.begin("colorim", false) + LittleFS.begin() (fuer loadTips/saveTips, siehe dort)
+  void begin();  // prefs_.begin("colorim", false) + LittleFS.begin() (for loadTips/saveTips, see there)
 
-  // false, falls nie gespeichert ODER JSON nicht lesbar (out/optical fallen
-  // dann auf ihre Defaults zurueck). outSem (absoluter Standardfehler je
-  // Kanal, siehe MeasurementTelemetry::semPerChannel) bleibt leer, wenn nie
-  // gespeichert (z.B. eine Referenz von vor dieser Erweiterung) -- kein
-  // Ladefehler, checkValidity() faellt dann auf 0 fuer diesen Anteil zurueck.
+  // false if never saved OR JSON not readable (out/optical then fall back to
+  // their defaults). outSem (absolute standard error per channel, see
+  // MeasurementTelemetry::semPerChannel) stays empty if never saved (e.g. a
+  // reference from before this extension) -- not a load error,
+  // checkValidity() then falls back to 0 for that part.
   bool loadDark(Measurement& out, Measurement& outSem, OpticalSettings& optical);
   bool loadWhite(Measurement& out, Measurement& outSem, OpticalSettings& optical);
 
-  // optical wird zusammen mit den Rohwerten gespeichert -- Referenz und die
-  // bei ihrer Aufnahme aktiven Einstellungen gehoeren untrennbar zusammen
-  // (siehe main.cpp::calibrationValidFor()).
+  // optical is saved together with the raw values -- the reference and the
+  // settings active while it was taken belong together inseparably (see
+  // main.cpp::calibrationValidFor()).
   void saveDark(const Measurement& v, const Measurement& sem, const OpticalSettings& optical);
   void saveWhite(const Measurement& v, const Measurement& sem, const OpticalSettings& optical);
 
-  // Die vollstaendige, aktuell im Settings-Baum gewaehlte Konfiguration --
-  // unabhaengig davon, was gerade als Dark/White-Referenz kalibriert ist.
-  // false, falls nie gespeichert ODER JSON nicht lesbar (out faellt dann auf
-  // die RootSettings-Defaults zurueck).
+  // The complete configuration currently selected in the settings tree --
+  // independent of what is currently calibrated as the dark/white reference.
+  // false if never saved OR JSON not readable (out then falls back to the
+  // RootSettings defaults).
   bool loadSettings(RootSettings& out);
   void saveSettings(const RootSettings& v);
 
-  // Der Messspitzen-Katalog (main.cpp::tipCatalog). false, falls nie
-  // gespeichert ODER JSON ungueltig (out wird dann ein LEERER Katalog --
-  // main.cpp::setup() bootstrapped in diesem Fall die allererste Spitze).
+  // The measurement tip catalog (main.cpp::tipCatalog). false if never saved
+  // OR JSON invalid (out then becomes an EMPTY catalog -- main.cpp::setup()
+  // bootstraps the very first tip in that case).
   bool loadTips(TipCatalog& out);
   void saveTips(const TipCatalog& v);
 

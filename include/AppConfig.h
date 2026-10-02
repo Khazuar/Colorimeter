@@ -1,7 +1,7 @@
 #pragma once
 #include <Adafruit_AS7341.h>
 #include <cstdint>
-#include "Spectrometer.h"  // FilterState (Teil von OpticalSettings, siehe unten)
+#include "Spectrometer.h"  // FilterState (part of OpticalSettings, see below)
 
 // ------------------------- I2C / Bus -------------------------
 static const uint8_t  SDA_PIN = 6;
@@ -14,64 +14,64 @@ static const uint8_t OLED_HEIGHT = 64;
 static const uint8_t OLED_ADDR   = 0x3C;
 
 // ------------------------- AS7341 Timing -------------------------
-// Nur noch Startwerte fuer den allerersten Boot (vorher fest verdrahtet) --
-// zur Laufzeit im Settings-Baum einstellbar, siehe SensorSettings unten.
+// Only startup values for the very first boot (previously hard-wired) --
+// configurable at runtime in the settings tree, see SensorSettings below.
 static const uint8_t       AS_ATIME = 100;
-static const uint16_t      AS_ASTEP = 999;                 // ~281 ms Integration bei diesem Startwert
-static const as7341_gain_t AS_GAIN  = AS7341_GAIN_512X;    // Weiss bleibt unter Vollausschlag
+static const uint16_t      AS_ASTEP = 999;                 // ~281 ms integration at this startup value
+static const as7341_gain_t AS_GAIN  = AS7341_GAIN_512X;    // white stays below full-scale
 
-// ------------------------- Taster -------------------------
+// ------------------------- Buttons -------------------------
 static const uint8_t  TRIGGER_PIN   = 3;
 static const uint8_t  MODE_PIN      = 9;
 static const uint32_t DEBOUNCE_MS   = 40;
 static const uint32_t LONG_PRESS_MS = 600;
 
-// Welcher Top-Level-Bildschirm gerade aktiv ist (per Mode-Taste lang
-// durchgeschaltet: Measure -> Calibration -> Export -> Settings -> Info -> Measure ...).
-// Reines UI-/Orchestrierungs-Konzept -- hat NICHTS mit der Sensor-Messqualitaet
-// zu tun (das ist Spectrometer::Precision) und NICHTS mit der Art eines
-// gespeicherten Messwerts (das ist SampleKind, siehe unten).
+// Which top-level screen is currently active (cycled through by long
+// pressing the mode button: Measure -> Calibration -> Export -> Settings -> Info -> Measure ...).
+// Pure UI/orchestration concept -- has NOTHING to do with sensor measurement
+// quality (that's Spectrometer::Precision) and NOTHING to do with the kind of
+// a stored measurement value (that's SampleKind, see below).
 //
-// Measure fasst ALLE physischen Messmodi (aktuell: Precise, Single) in einem
-// Top-Level-Eintrag zusammen, um die Hauptnavigation nicht mit jedem neuen,
-// selten genutzten Messmodus weiter wachsen zu lassen. Measure hat dafuer eine
-// eigene, zweistufige Sub-Navigation (main.cpp::MeasurePage): eine
-// Auswahl-Seite (Cursor per kurzem Mode-Druck ueber main.cpp::MEASUREMENT_MODES
-// bewegt, Trigger loest die gewaehlte Messung aus) und eine Ergebnis-Seite
-// (identisch zur bisherigen Fast/Precise-Ansicht, siehe DisplayViews.h; kurzer
-// Mode-Druck wechselt dort wie bisher die Ergebnis-Ansicht, langer Mode-Druck
-// kehrt zur Auswahl-Seite zurueck OHNE den Top-Level-DisplayMode zu wechseln --
-// siehe main.cpp::cycleMode()).
+// Measure combines ALL physical measurement modes (currently: Precise, Single)
+// into a single top-level entry, so that the main navigation doesn't keep
+// growing with every new, rarely used measurement mode. For this, Measure has
+// its own two-stage sub-navigation (main.cpp::MeasurePage): a selection page
+// (cursor moved via short mode-button press over main.cpp::MEASUREMENT_MODES,
+// trigger fires the selected measurement) and a result page (identical to the
+// previous Fast/Precise view, see DisplayViews.h; short mode-button press
+// switches the result view there as before, long mode-button press returns to
+// the selection page WITHOUT changing the top-level DisplayMode -- see
+// main.cpp::cycleMode()).
 //
-// Calibration fasst Weiss- und Dunkelreferenz in einem Bildschirm zusammen
-// (kurzer Mode-Druck wechselt in main.cpp zwischen main.cpp::CalibrationTarget
-// White/Dark, langer Trigger-Druck misst die jeweils gewaehlte Referenz immer
-// mit Precision::Precise). Export misst nicht physisch: Trigger sendet dort
-// stattdessen die Messhistorie per BLE. Settings misst nicht: Trigger rotiert
-// dort den Wert der aktuell gewaehlten Einstellung (z.B. FilterState), Mode
-// (kurz) wechselt, WELCHE Einstellung editiert wird. Info misst ueberhaupt
-// nicht (Trigger ist dort ein No-Op): reiner Statusbildschirm fuer
-// Betriebszeit/Messzaehler aus UptimeLogger.
+// Calibration combines white and dark reference in a single screen
+// (short mode-button press switches in main.cpp between main.cpp::CalibrationTarget
+// White/Dark, long trigger press always measures the currently selected reference
+// with Precision::Precise). Export doesn't measure physically: trigger instead
+// sends the measurement history over BLE there. Settings doesn't measure:
+// trigger there rotates the value of the currently selected setting (e.g.
+// FilterState), mode (short) switches WHICH setting is being edited. Info
+// doesn't measure at all (trigger is a no-op there): pure status screen for
+// uptime/measurement counter from UptimeLogger.
 enum class DisplayMode : uint8_t { Measure = 0, Calibration = 1, Export = 2, Settings = 3, Info = 4, COUNT = 5 };
 
-// Was ein gespeicherter/exportierter Messwert repraesentiert
-// (HistoryStore::MeasurementRecord) -- unabhaengig davon, mit welchem
-// DisplayMode/welcher Precision er aufgenommen wurde. Regular = normale
-// Precise/Single-Probe (aus dem Measure-DisplayMode); Dark/White =
-// Referenzaufnahmen aus dem Calibration-DisplayMode. Bewusst ein eigenes Enum
-// statt DisplayMode mitzubenutzen: welcher Bildschirm gerade aktiv ist und was
-// ein Messwert bedeutet sind zwei unabhaengige Fragen.
+// What a stored/exported measurement value represents
+// (HistoryStore::MeasurementRecord) -- independent of which
+// DisplayMode/Precision it was recorded with. Regular = normal
+// Precise/Single sample (from the Measure DisplayMode); Dark/White =
+// reference recordings from the Calibration DisplayMode. Deliberately a
+// separate enum instead of reusing DisplayMode: which screen is currently
+// active and what a measurement value means are two independent questions.
 enum class SampleKind : uint8_t { Regular = 0, Dark = 1, White = 2, COUNT = 3 };
 
-// Anzahl bekannter as7341_gain_t-Werte (0.5X..512X, siehe Adafruit_AS7341.h)
-// -- einzige Quelle fuer Bounds-Checks (HistoryStore::parseLine()) und die
-// Settings-Registry/Label-Tabelle (main.cpp).
+// Number of known as7341_gain_t values (0.5X..512X, see Adafruit_AS7341.h)
+// -- single source for bounds checks (HistoryStore::parseLine()) and the
+// settings registry/label table (main.cpp).
 static const uint8_t AS7341_GAIN_COUNT = 11;
 
-// Gain/ATIME/ASTEP als Block -- siehe schema/settings.schema.json ("sensor").
-// Wird UNVERAENDERT als Ganzes als Teil von OpticalSettings verwendet (siehe
-// dort). AS_ATIME/AS_ASTEP/AS_GAIN dienen hier nur noch als Startwerte fuer
-// den allerersten Boot.
+// Gain/ATIME/ASTEP as a block -- see schema/settings.schema.json ("sensor").
+// Used UNCHANGED as a whole as part of OpticalSettings (see there).
+// AS_ATIME/AS_ASTEP/AS_GAIN here only serve as startup values for the very
+// first boot.
 struct SensorSettings {
   as7341_gain_t gain = AS_GAIN;
   uint8_t atime = AS_ATIME;
@@ -82,17 +82,17 @@ struct SensorSettings {
   bool operator!=(const SensorSettings& o) const { return !(*this == o); }
 };
 
-// Alle Einstellungen, die den optischen Pfad des Geraets betreffen (Filter +
-// Sensor-Tuning) -- eine ECHTE thematische Gruppe (nicht nur zufaellig gleich
-// geformt wie RootSettings::optical, siehe dort). Wird UNVERAENDERT als
-// Ganzes an AS7341Spectrometer::applySettings()/main.cpp::calibrationValidFor()
-// uebergeben, pro Messung/Referenz eingefroren (siehe
+// All settings that concern the device's optical path (filter +
+// sensor tuning) -- a REAL thematic group (not just coincidentally shaped
+// like RootSettings::optical, see there). Used UNCHANGED as a whole, passed
+// to AS7341Spectrometer::applySettings()/main.cpp::calibrationValidFor(),
+// frozen per measurement/reference (see
 // HistoryStore::MeasurementRecord::settings, main.cpp darkRefSettings/
-// whiteRefSettings -- das sind Snapshots "womit wurde das gemessen") UND ist
-// genau das, was jede Messspitze im Katalog speichert (main.cpp/TipCatalog.h)
-// -- eine Spitze ist im Kern "ein benannter OpticalSettings-Stand". Selbst
-// KEIN Einstellungs-Knoten -- wird nie selbst editiert oder im Settings-Baum
-// navigiert, siehe RootSettings unten dafuer. Siehe schema/settings.schema.json
+// whiteRefSettings -- these are snapshots of "what was this measured with")
+// AND is exactly what every tip stores in the catalog (main.cpp/TipCatalog.h)
+// -- a tip is at its core "a named OpticalSettings state". Itself NOT a
+// settings node -- is never edited itself or navigated in the settings tree,
+// see RootSettings below for that. See schema/settings.schema.json
 // ("optical").
 struct OpticalSettings {
   FilterState filterState = FilterState::None;
@@ -103,20 +103,20 @@ struct OpticalSettings {
   bool operator!=(const OpticalSettings& o) const { return !(*this == o); }
 };
 
-// Die tatsaechliche Einstellungs-Hierarchie: UI-Baum-Wurzel UND das, was als
-// EIN JSON-Dokument persistiert wird (CalibrationStore::save/loadSettings()).
-// Siehe schema/settings.schema.json ("Settings") -- BEIDE (dieses Struct und
-// die Schema-Datei) bei Aenderungen zusammen pflegen. Gruppiert aktuell genau
-// eine thematische Gruppe (optical); kuenftige, andersartige Einstellungen
-// (z.B. Sprache, Bluetooth-Name) werden hier als weitere, EIGENE
-// Geschwisterfelder ergaenzt -- NICHT in optical hineingemischt.
+// The actual settings hierarchy: UI tree root AND what gets persisted as
+// ONE JSON document (CalibrationStore::save/loadSettings()). See
+// schema/settings.schema.json ("Settings") -- maintain BOTH (this struct and
+// the schema file) together when making changes. Currently groups exactly
+// one thematic group (optical); future, different-natured settings (e.g.
+// language, Bluetooth name) will be added here as additional, SEPARATE
+// sibling fields -- NOT mixed into optical.
 struct RootSettings {
   OpticalSettings optical;
   bool operator==(const RootSettings& o) const { return optical == o.optical; }
   bool operator!=(const RootSettings& o) const { return !(*this == o); }
 };
 
-// BLE-Export (Nordic UART Service) -- Geraetename ist app-weit relevant (main.cpp
-// startet/stoppt BleExporter damit); Chunk-Groesse/MTU/Delays bleiben rein interne
-// Implementierungsdetails von BleExporter.cpp.
+// BLE export (Nordic UART Service) -- device name is relevant app-wide (main.cpp
+// starts/stops BleExporter with it); chunk size/MTU/delays remain purely internal
+// implementation details of BleExporter.cpp.
 static constexpr char BLE_DEVICE_NAME[] = "Colorimeter";

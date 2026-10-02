@@ -2,16 +2,16 @@
 #include <cstdint>
 #include <Preferences.h>
 
-// Kumulierte Betriebszeit (seit je, ueber Reboots/Stromausfaelle hinweg) in
-// Sekunden, persistiert auf einer DEDIZIERTEN NVS-Partition ("uptime", siehe
-// partitions.csv) -- getrennt von der Kalibrierungs-Partition, damit die
-// haeufigen Schreibvorgaenge hier nicht deren Flash-Sektor mitverschleissen.
-// Committed hoechstens 1x/Minute, unabhaengig davon wie oft loop() laeuft.
+// Cumulative operating time (ever since, across reboots/power losses) in
+// seconds, persisted on a DEDICATED NVS partition ("uptime", see
+// partitions.csv) -- separate from the calibration partition, so that the
+// frequent writes here don't also wear out its flash sector. Committed at
+// most once per minute, regardless of how often loop() runs.
 //
-// Traegt ausserdem einen lebenslangen Messzaehler (jede erfolgreiche
-// performMeasurement(), unabhaengig vom Modus) auf derselben Partition --
-// selbes "haeufig geschriebene Betriebstelemetrie"-Profil wie die Betriebszeit,
-// daher bewusst kein eigenes Modul/keine eigene Partition dafuer.
+// Also carries a lifetime measurement counter (every successful
+// performMeasurement(), regardless of mode) on the same partition -- same
+// "frequently written operational telemetry" profile as the uptime, hence
+// deliberately no separate module/partition for it.
 class UptimeLogger {
 public:
   void begin();

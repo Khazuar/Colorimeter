@@ -1,28 +1,28 @@
 """
-AS7341 Farb-Pipeline: Rohcounts -> Reflexion -> XYZ -> Lab.
+AS7341 color pipeline: raw counts -> reflectance -> XYZ -> Lab.
 
-Bootstrap OHNE Farbtarget: statt einer erratenen ams-Matrix wird das Spektrum
-aus den 8 VIS-Kanaelen rekonstruiert und gegen D50 + CIE-1931-2deg integriert.
-Das ist genau die "Spektralrekonstruktion", die ams als Alternative zur Matrix
-nennt - und es braucht keine geheimen Koeffizienten.
+Bootstrap WITHOUT a color target: instead of a guessed ams matrix, the spectrum
+is reconstructed from the 8 VIS channels and integrated against D50 + CIE 1931
+2-degree. This is exactly the "spectral reconstruction" that ams names as an
+alternative to the matrix - and it needs no secret coefficients.
 
-Sobald du bekannte Referenzen (Farbfelder mit Soll-Lab) hast, ersetzt du den
-Bootstrap durch fit_matrix() -> dann wird die aktuelle LED automatisch mit
-einkalibriert.
+As soon as you have known references (color patches with target Lab values),
+replace the bootstrap with fit_matrix() -> then the current LED is
+automatically calibrated in as well.
 
-Abhaengigkeiten:  pip install colour-science pandas numpy
-CSV-Format (aus der Firmware):
+Dependencies:  pip install colour-science pandas numpy
+CSV format (from the firmware):
     label,F1_415nm,F2_445nm,F3_480nm,F4_515nm,F5_555nm,F6_590nm,F7_630nm,F8_680nm,Clear,NIR_910nm
-    dark,...      <- Dunkelfalle
-    white,...     <- Weissreferenz
-    sample_01,... <- Proben
+    dark,...      <- dark trap
+    white,...     <- white reference
+    sample_01,... <- samples
 """
 
 import numpy as np
 import pandas as pd
 import colour
 
-# --- AS7341 VIS-Kanaele: Spaltenname -> Mittenwellenlaenge (nm) ---
+# --- AS7341 VIS channels: column name -> center wavelength (nm) ---
 VIS = {
     "F1_415nm": 415, "F2_445nm": 445, "F3_480nm": 480, "F4_515nm": 515,
     "F5_555nm": 555, "F6_590nm": 590, "F7_630nm": 630, "F8_680nm": 680,
@@ -33,11 +33,11 @@ CENTERS  = np.array(list(VIS.values()), dtype=float)
 CMFS   = colour.MSDS_CMFS["CIE 1931 2 Degree Standard Observer"]
 ILLUM  = colour.SDS_ILLUMINANTS["D50"]
 WP_XY  = colour.CCS_ILLUMINANTS["CIE 1931 2 Degree Standard Observer"]["D50"]
-GRID   = np.arange(380, 731, 1.0)   # Rekonstruktions-Raster
+GRID   = np.arange(380, 731, 1.0)   # reconstruction grid
 
 
 # ---------------------------------------------------------------------------
-# 1) Einlesen + Dunkel/Weiss-Normierung
+# 1) Reading + dark/white normalization
 # ---------------------------------------------------------------------------
 def load(csv_path):
     df = pd.read_csv(csv_path, comment="#")
@@ -46,7 +46,7 @@ def load(csv_path):
 
 
 def reference_vectors(df):
-    """Mittelt alle dark- bzw. white-Zeilen zu je einem Vektor (alle Kanaele)."""
+    """Averages all dark and white rows respectively into one vector each (all channels)."""
     chan = VIS_COLS + ["Clear", "NIR_910nm"]
     dark  = df[df["label"] == "dark"][chan].mean().values
     white = df[df["label"] == "white"][chan].mean().values
@@ -56,7 +56,7 @@ def reference_vectors(df):
 
 
 def reflectance(row_vals, dark, white):
-    """Kanalweise Reflexion R_i = (S-D)/(W-D), auf >=0 geklemmt."""
+    """Per-channel reflectance R_i = (S-D)/(W-D), clamped to >=0."""
     denom = (white - dark)
     denom[denom == 0] = np.nan
     R = (row_vals - dark) / denom
@@ -64,16 +64,16 @@ def reflectance(row_vals, dark, white):
 
 
 # ---------------------------------------------------------------------------
-# 2) Bootstrap: 8 VIS-Reflexionen -> Spektrum -> XYZ -> Lab
+# 2) Bootstrap: 8 VIS reflectances -> spectrum -> XYZ -> Lab
 # ---------------------------------------------------------------------------
 def vis_reflectance_to_XYZ(R_vis):
-    """R_vis: 8 Reflexionswerte an den Bandmitten -> XYZ (Y=100 fuer Weiss)."""
-    # lineare Interpolation zwischen den Bandmitten, flache Extrapolation aussen
+    """R_vis: 8 reflectance values at the band centers -> XYZ (Y=100 for white)."""
+    # linear interpolation between the band centers, flat extrapolation outside
     R_grid = np.interp(GRID, CENTERS, R_vis)
     sd = colour.SpectralDistribution(dict(zip(GRID, R_grid)))
-    # Integration-Methode ist robust gegen beliebige Raster (kein E308-Zwang)
+    # Integration method is robust against arbitrary grids (no E308 requirement)
     XYZ = colour.sd_to_XYZ(sd, CMFS, ILLUM, method="Integration")
-    return XYZ  # Skala: perfekter Diffusor -> Y=100
+    return XYZ  # scale: perfect diffuser -> Y=100
 
 
 def XYZ_to_Lab(XYZ):
@@ -86,15 +86,15 @@ def XYZ_to_sRGB255(XYZ):
 
 
 # ---------------------------------------------------------------------------
-# 3) Spaeter: eigene Matrix fitten (wenn Referenzen vorhanden)
+# 3) Later: fit your own matrix (once references are available)
 # ---------------------------------------------------------------------------
 def fit_matrix(R, XYZ_ref):
     """
-    R:       (N,8) Reflexionsvektoren deiner Referenzfelder
-    XYZ_ref: (N,3) bekannte XYZ (Y=100-Skala) derselben Felder
-    liefert  M (9,3):  XYZ ~ [R, 1] @ M   (mit Bias-Term)
-    Fuer mehr Genauigkeit: R vorher um Wurzel-Polynom-Terme erweitern
-    (Finlayson root-polynomial) und dann genauso linear loesen.
+    R:       (N,8) reflectance vectors of your reference patches
+    XYZ_ref: (N,3) known XYZ (Y=100 scale) of the same patches
+    returns  M (9,3):  XYZ ~ [R, 1] @ M   (with bias term)
+    For more accuracy: extend R beforehand with root-polynomial terms
+    (Finlayson root-polynomial) and then solve it the same way linearly.
     """
     A = np.hstack([R, np.ones((len(R), 1))])
     M, *_ = np.linalg.lstsq(A, XYZ_ref, rcond=None)
@@ -113,7 +113,7 @@ def delta_E_report(Lab_pred, Lab_ref):
 
 
 # ---------------------------------------------------------------------------
-# Ablauf
+# Process flow
 # ---------------------------------------------------------------------------
 def process(csv_path):
     df = load(csv_path)
@@ -121,7 +121,7 @@ def process(csv_path):
     idx_nir   = chan.index("NIR_910nm")
     idx_clear = chan.index("Clear")
 
-    # Diagnose: interner Streulicht-/NIR-Rest der Weissreferenz (Info, kein Farb-Input)
+    # Diagnostic: internal stray-light/NIR residual of the white reference (info only, not a color input)
     print(f"# Weiss-NIR/Clear-Verhaeltnis: {white[idx_nir]/white[idx_clear]:.3f} "
           f"(hoch -> NIR-Leckage/IR-Anteil pruefen)\n")
 
@@ -130,8 +130,8 @@ def process(csv_path):
         if r["label"] in ("dark", "white"):
             continue
         vals = r[chan].values.astype(float)
-        R = reflectance(vals, dark, white)          # alle Kanaele
-        R_vis = R[[chan.index(c) for c in VIS_COLS]]  # nur die 8 VIS
+        R = reflectance(vals, dark, white)          # all channels
+        R_vis = R[[chan.index(c) for c in VIS_COLS]]  # only the 8 VIS
         XYZ = vis_reflectance_to_XYZ(R_vis)
         L, a, b = XYZ_to_Lab(XYZ)
         rgb = XYZ_to_sRGB255(XYZ).astype(int)

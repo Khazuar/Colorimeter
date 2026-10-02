@@ -5,8 +5,8 @@
 #include <cstdio>
 #include <cstring>
 
-// Display kann nicht sinnvoll mehr Baender als das anzeigen -- reine
-// Darstellungsgrenze fuer die Balkenbreite, keine sensorspezifische Annahme.
+// The display cannot meaningfully show more bands than this -- a pure
+// rendering limit for the bar width, not a sensor-specific assumption.
 static const size_t MAX_DISPLAYABLE_BANDS = 16;
 
 static void drawModeCorner(Adafruit_SSD1306& d, const char* modeLabel) {
@@ -24,17 +24,17 @@ static void renderNotCalibrated(Adafruit_SSD1306& d) {
   d.println("dann Trigger");
 }
 
-// Anders als "nicht kalibriert": Kalibrierung liegt vor, es wurde nur seit
-// dem letzten Moduswechsel (oder Boot) noch nicht in diesem Modus gemessen.
+// Unlike "nicht kalibriert": calibration is available, it just hasn't been
+// measured in this mode yet since the last mode change (or boot).
 static void renderNoMeasurementYet(Adafruit_SSD1306& d) {
   d.setCursor(0, 0);
   d.println("keine Messung");
   d.println("Trigger druecken");
 }
 
-// Ersetzt die fruehere LabHex-View: Label, L*/a*/b*, Chroma/Bunttonwinkel
-// (C*/h, siehe labToLCh() -- dieselbe Information wie a*/b*, nur zylindrisch
-// und oft anschaulicher) und Hex-Code, alles auf einem Screen.
+// Replaces the former LabHex view: label, L*/a*/b*, chroma/hue angle
+// (C*/h, see labToLCh() -- the same information as a*/b*, just cylindrical
+// and often more intuitive) and hex code, all on one screen.
 static void renderColorInfo(Adafruit_SSD1306& d, const ViewContext& ctx) {
   d.clearDisplay();
   d.setTextColor(SSD1306_WHITE);
@@ -72,17 +72,17 @@ static void renderColorInfo(Adafruit_SSD1306& d, const ViewContext& ctx) {
   d.display();
 }
 
-// Druckt 'text' um zusaetzliche 90 Grad gegen den Uhrzeigersinn gedreht, aus
-// Sicht der bereits ueber Rotation 2 montagekorrigierten Anzeige (siehe
-// main.cpp::setup(), display.setRotation(2)). leftX/bottomY sind linke/untere
-// Kante der resultierenden Boundingbox in normalen (aufrechten) Bildschirm-
-// koordinaten (0..127 / 0..63).
+// Prints 'text' rotated an additional 90 degrees counterclockwise, as seen
+// from the display already mounting-corrected via Rotation 2 (see
+// main.cpp::setup(), display.setRotation(2)). leftX/bottomY are the
+// left/bottom edge of the resulting bounding box in normal (upright) screen
+// coordinates (0..127 / 0..63).
 //
-// Herleitung: Rotation 1 liefert, aus Sicht der bereits um 180 Grad montage-
-// korrigierten Rotation-2-Ansicht, exakt eine zusaetzliche 90-Grad-CCW-Drehung
-// (durchgerechnet ueber die in Adafruit_GFX fest verdrahteten Rotations-
-// Transformationen). Die daraus folgende Umrechnung von aufrechter Anker-
-// position zu den in Rotation 1 zu setzenden Cursor-Koordinaten ist:
+// Derivation: Rotation 1 produces, as seen from the already 180-degree
+// mounting-corrected Rotation-2 view, exactly one additional 90-degree CCW
+// rotation (worked out via the rotation transformations hard-wired into
+// Adafruit_GFX). The resulting conversion from an upright anchor position
+// to the cursor coordinates to be set in Rotation 1 is:
 // cx = (OLED_HEIGHT-1) - bottomY, cy = leftX.
 static void drawRotatedLabel(Adafruit_SSD1306& d, const char* text, int leftX, int bottomY, uint16_t color) {
   d.setRotation(1);
@@ -90,15 +90,16 @@ static void drawRotatedLabel(Adafruit_SSD1306& d, const char* text, int leftX, i
   d.setTextColor(color);
   d.setCursor((OLED_HEIGHT - 1) - bottomY, leftX);
   d.print(text);
-  d.setRotation(2);  // zurueck zur normalen, montagekorrigierten Ausrichtung
+  d.setRotation(2);  // back to the normal, mounting-corrected orientation
 }
 
-// Nutzt getSpectrum() (8 normierte VIS-Reflexionswerte) -- Clear/NIR/rohe
-// Measurement-Werte sind hier nicht relevant (siehe Spectrometer.h). Kein
-// Zahlen-Tabellenbereich -- Bandzentrum und Wert (als Prozent) stehen
-// gedreht direkt unter/im Balken, damit moeglichst viel Hoehe fuer die
-// Balken selbst bleibt. White/Dark-Referenzmessungen laufen nicht mehr ueber
-// diese View (eigener Screen in main.cpp), daher hier kein Modus-Sonderfall.
+// Uses getSpectrum() (8 normalized VIS reflectance values) -- Clear/NIR/raw
+// Measurement values are not relevant here (see Spectrometer.h). No numeric
+// table area -- band center and value (as percent) are placed rotated
+// directly below/inside the bar, so that as much height as possible remains
+// for the bars themselves. White/dark reference measurements no longer run
+// through this view (own screen in main.cpp), so there is no mode special
+// case here.
 static void renderSpectrum(Adafruit_SSD1306& d, const ViewContext& ctx) {
   d.clearDisplay();
   d.setTextColor(SSD1306_WHITE);
@@ -112,9 +113,8 @@ static void renderSpectrum(Adafruit_SSD1306& d, const ViewContext& ctx) {
     size_t n = spec.values.size();
     if (n > MAX_DISPLAYABLE_BANDS) n = MAX_DISPLAYABLE_BANDS;
 
-    // Wellenlaengen-Labels vorab formatieren, um deren Breite zu kennen --
-    // im gedrehten Zustand wird daraus die Hoehe, die fuer den Balkenbereich
-    // reserviert werden muss.
+    // Pre-format the wavelength labels to know their width -- in the rotated
+    // state this becomes the height that must be reserved for the bar area.
     char wlText[MAX_DISPLAYABLE_BANDS][6];
     int maxWlWidth = 0;
     for (size_t i = 0; i < n; i++) {
@@ -125,10 +125,10 @@ static void renderSpectrum(Adafruit_SSD1306& d, const ViewContext& ctx) {
 
     const int gap = 1;
     int barAreaH = OLED_HEIGHT - maxWlWidth - gap;
-    if (barAreaH < 8) barAreaH = 8;  // Sicherheitsnetz bei extrem langen Labels
+    if (barAreaH < 8) barAreaH = 8;  // safety net for extremely long labels
 
-    // Referenzlinie bei Reflexion=1.0 (Weiss), aber auch groesser skalieren
-    // falls ein Kanal darueber liegt.
+    // Reference line at reflectance=1.0 (white), but also scale larger if a
+    // channel exceeds it.
     float maxV = 1.0f;
     for (size_t i = 0; i < n; i++) if (spec.values[i] > maxV) maxV = spec.values[i];
 
@@ -143,25 +143,25 @@ static void renderSpectrum(Adafruit_SSD1306& d, const ViewContext& ctx) {
       int barTopY = barAreaH - h;
       if (h > 0) d.fillRect(barX, barTopY, barW > 2 ? barW - 2 : barW, h, SSD1306_WHITE);
 
-      int labelLeftX = barX + (barW - 8) / 2;  // 8px = Texthoehe bei textSize 1
+      int labelLeftX = barX + (barW - 8) / 2;  // 8px = text height at textSize 1
 
-      // Bandzentrum, zentriert unter dem Balken, gedreht.
+      // Band center, centered below the bar, rotated.
       drawRotatedLabel(d, wlText[i], labelLeftX, OLED_HEIGHT - 1, SSD1306_WHITE);
 
-      // Wert als Prozent (Reflexion ist ein Verhaeltnis, "52%" ist genauso
-      // kurz wie ".52" und eindeutiger lesbar): im Balken, wenn er gross
-      // genug ist (>50%), sonst darueber -- ebenfalls gedreht.
+      // Value as percent (reflectance is a ratio, "52%" is just as short as
+      // ".52" and reads more unambiguously): inside the bar if it is large
+      // enough (>50%), otherwise above it -- also rotated.
       char valText[6];
       snprintf(valText, sizeof(valText), "%d%%", (int)lroundf(spec.values[i] * 100.0f));
       int valW = (int)strlen(valText) * 6;
 
       if (spec.values[i] > 0.5f) {
         int bottomY = barTopY + margin + valW - 1;
-        if (bottomY > barAreaH - 1) bottomY = barAreaH - 1;  // Sicherheitsnetz
+        if (bottomY > barAreaH - 1) bottomY = barAreaH - 1;  // safety net
         drawRotatedLabel(d, valText, labelLeftX, bottomY, SSD1306_BLACK);
       } else {
         int bottomY = barTopY - margin;
-        if (bottomY - valW + 1 < 0) bottomY = valW - 1;  // Sicherheitsnetz
+        if (bottomY - valW + 1 < 0) bottomY = valW - 1;  // safety net
         drawRotatedLabel(d, valText, labelLeftX, bottomY, SSD1306_WHITE);
       }
     }

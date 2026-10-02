@@ -3,27 +3,27 @@
 #include <cstdint>
 #include "Spectrometer.h"
 
-// Views arbeiten nur gegen die abstrakte Spectrometer&-Referenz plus vom
-// Aufrufer bereitgestellten Kontext -- bewusst KEIN Zugriff auf AS7341-
-// spezifische Interna (kein #include "AS7341Spectrometer.h" hier), damit
-// dieselben Views unveraendert mit einem zukuenftigen AS7343Spectrometer
-// funktionieren. White/Dark-Referenzmessungen laufen NICHT mehr ueber diese
-// Views (eigener Screen in main.cpp, siehe renderReferenceStatus()) -- hier
-// gibt es daher auch keinen Modus-Sonderfall mehr.
+// Views work only against the abstract Spectrometer& reference plus the
+// context provided by the caller -- deliberately NO access to AS7341-
+// specific internals (no #include "AS7341Spectrometer.h" here), so that
+// the same views work unchanged with a future AS7343Spectrometer. White/
+// dark reference measurements NO LONGER run through these views (own
+// screen in main.cpp, see renderReferenceStatus()) -- so there is also no
+// mode special case here anymore.
 enum class DisplayView : uint8_t { ColorInfo = 0, Spectrum = 1, COUNT = 2 };
 
 struct ViewContext {
   Spectrometer& spectrometer;
-  const Measurement& measurement;       // letzte Messung (leer, falls noch keine erfolgt ist)
+  const Measurement& measurement;       // last measurement (empty if none has occurred yet)
   const Measurement& whiteReference;
   const Measurement& darkReference;
-  bool calibrated;                      // von der Orchestrierung getrackt
-  const char* modeLabel;                // "S"/"P"/"W"/"D"/"E" fuer die Ecken-Anzeige
-  const char* lastLabel;                // z.B. "sample_03", "" falls noch keine Messung
-  // Filter, der zum Zeitpunkt VON 'measurement' tatsaechlich eingesetzt war
-  // (NICHT notwendigerweise der aktuell im Settings-Modus gewaehlte) -- siehe
-  // main.cpp::renderCurrentView() fuer die Begruendung dieser Asymmetrie
-  // gegenueber whiteReference/darkReference.
+  bool calibrated;                      // tracked by the orchestration
+  const char* modeLabel;                // "S"/"P"/"W"/"D"/"E" for the corner display
+  const char* lastLabel;                // e.g. "sample_03", "" if no measurement yet
+  // Filter that was actually in use at the time OF 'measurement' (NOT
+  // necessarily the one currently selected in Settings mode) -- see
+  // main.cpp::renderCurrentView() for the rationale behind this asymmetry
+  // relative to whiteReference/darkReference.
   FilterState filterState;
 };
 

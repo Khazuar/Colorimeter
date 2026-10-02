@@ -6,47 +6,46 @@
 class BLEServer;
 class BLECharacteristic;
 
-// Nordic-UART-Service-BLE-Export. Vorwaertsdeklarationen oben halten die
-// vollen BLE-Header aus main.cpp heraus (nur BleExporter.cpp braucht sie) --
-// analog dazu, wie DisplayViews.h nie AS7341Spectrometer.h mitzieht.
+// Nordic UART Service BLE export. The forward declarations above keep the
+// full BLE headers out of main.cpp (only BleExporter.cpp needs them) --
+// analogous to how DisplayViews.h never pulls in AS7341Spectrometer.h.
 class BleExporter {
 public:
   using ProgressCallback = void (*)(size_t sentBytes, size_t totalBytes);
 
-  void begin(const char* deviceName);  // idempotent: no-op falls schon aktiv
-  void end();                          // idempotent: no-op falls nicht aktiv
-  bool isActive() const { return advertising_; }  // begin() wurde aufgerufen, end() noch nicht
+  void begin(const char* deviceName);  // idempotent: no-op if already active
+  void end();                          // idempotent: no-op if not active
+  bool isActive() const { return advertising_; }  // begin() was called, end() not yet
   bool isConnected() const { return connected_; }
 
-  // Liefert true GENAU EINMAL nach einem Verbindungswechsel (connect ODER
-  // disconnect) seit dem letzten Aufruf, danach false bis zum naechsten
-  // Wechsel -- Pull statt Push (main.cpp wird nie direkt aus dem Bluedroid-
-  // Callback-Kontext heraus aufgerufen), analog zu isConnected()/isActive().
-  // main.cpp nutzt das, um den Export-Screen GENAU DANN neu zu zeichnen, wenn
-  // sich der (asynchron im BLE-Stack geaenderte) Verbindungsstatus tatsaechlich
-  // geaendert hat, statt ihn blind periodisch zu pollen.
+  // Returns true EXACTLY ONCE after a connection change (connect OR
+  // disconnect) since the last call, then false until the next change --
+  // pull instead of push (main.cpp is never called directly from the
+  // Bluedroid callback context), analogous to isConnected()/isActive().
+  // main.cpp uses this to redraw the export screen EXACTLY WHEN the
+  // (asynchronously changed, within the BLE stack) connection status has
+  // actually changed, instead of blindly polling it periodically.
   bool takeConnectionChanged();
 
-  // Sendet 'payload' vollstaendig, in an das ausgehandelte MTU angepassten
-  // Haeppchen mit kurzer Pause dazwischen (sonst Stau im BLE-Stack). Gibt
-  // sofort false zurueck, falls nicht verbunden; bricht ab (false), falls
-  // die Verbindung waehrend des Sendens verloren geht.
+  // Sends 'payload' completely, in chunks sized to the negotiated MTU with a
+  // short pause in between (otherwise congestion in the BLE stack). Returns
+  // false immediately if not connected; aborts (false) if the connection is
+  // lost while sending.
   bool send(const std::string& payload, ProgressCallback onProgress = nullptr);
 
-  // Nicht-blockierende Haushaltsarbeit (Wiederaufnahme der Werbung nach
-  // Verbindungsabbruch); einmal pro loop()-Durchlauf aufrufen, billiges
-  // No-op wenn nicht aktiv.
+  // Non-blocking housekeeping (resuming advertising after a disconnect);
+  // call once per loop() iteration, cheap no-op when not active.
   void loop();
 
 private:
   BLEServer* server_ = nullptr;
   BLECharacteristic* txChar_ = nullptr;
-  // initialized_ wird NUR beim allerersten begin() gesetzt und nie wieder
-  // zurueckgesetzt: BLEDevice::init()/deinit() wiederholt aufzurufen ist ein
-  // bekanntes Problem im ESP32-Bluedroid-Stack und fuehrt reproduzierbar zum
-  // Haengenbleiben beim zweiten init(). end() ruft deshalb bewusst nie
-  // deinit() auf, sondern stoppt nur die Werbung + trennt eine bestehende
-  // Verbindung -- der Stack bleibt danach im Hintergrund resident.
+  // initialized_ is set ONLY on the very first begin() and never reset
+  // again: repeatedly calling BLEDevice::init()/deinit() is a known problem
+  // in the ESP32 Bluedroid stack and reproducibly causes it to hang on the
+  // second init(). end() therefore deliberately never calls deinit(), but
+  // only stops advertising + disconnects an existing connection -- the
+  // stack remains resident in the background afterward.
   bool initialized_ = false;
   bool advertising_ = false;
   volatile bool connected_ = false;

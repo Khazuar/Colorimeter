@@ -1,8 +1,8 @@
 #include "ColorimetryTables.h"
 #include <cmath>
 
-// Generiert mit colour-science (CIE 1931 2 Degree Standard Observer, D50),
-// 5nm-Raster 380-730nm. Siehe ColorimetryTables.h fuer die Quelle.
+// Generated with colour-science (CIE 1931 2 Degree Standard Observer, D50),
+// 5nm grid 380-730nm. See ColorimetryTables.h for the source.
 const float CIE_CMF[CIE_N_WL][3] = {
   { 0.001368f, 0.000039f, 0.006450f }, // 380nm
   { 0.002236f, 0.000064f, 0.010550f }, // 385nm
@@ -89,8 +89,8 @@ const float CIE_D50_SPD[CIE_N_WL] = {
   91.604000f, 92.246000f, 92.889000f, 84.872000f, 76.854000f, 81.683000f, 86.511000f,
 };
 
-// FWHM (volle Breite bei halbem Maximum) einer Normalverteilung ->
-// Standardabweichung: FWHM = 2*sqrt(2*ln2)*sigma.
+// FWHM (full width at half maximum) of a normal distribution ->
+// standard deviation: FWHM = 2*sqrt(2*ln2)*sigma.
 static const float FWHM_TO_SIGMA = 1.0f / 2.35482f;
 
 void spectrumToXYZ(const Band* bands, const float* values, int n,
@@ -100,19 +100,20 @@ void spectrumToXYZ(const Band* bands, const float* values, int n,
   for (int i = 0; i < CIE_N_WL; i++) {
     float wl = (float)(CIE_WL_MIN + i * CIE_WL_STEP);
 
-    // Gauss-gewichtete Summe ueber alle Baender (siehe Header-Kommentar) statt
-    // linearer Interpolation zwischen Bandmitten -- jedes Band traegt gemaess
-    // seiner eigenen (nahezu gaussfoermigen) Empfindlichkeitskurve zu R(wl)
-    // bei, nicht nur die beiden rechnerisch naechstgelegenen. Strikt
-    // normalisiert (Division durch die Gewichtssumme): R(wl) ist damit an
-    // JEDER Stuetzstelle ein echter gewichteter Mittelwert der Bandwerte, und
-    // ein konstantes Spektrum (R=c in allen Baendern) bleibt ueberall exakt c
-    // -- ein ideales Grau ergibt a*=b*=0. Ausserhalb der Baender haelt das den
-    // Wert des naechstgelegenen Bandes, statt gegen 0 abzufallen. Frueher
-    // wurde der Nenner auf mindestens 1 gehalten; das zog R an den Raendern
-    // (v. a. 650-700nm ohne F8, < 405nm) gegen 0 und verfaelschte die Farbe
-    // messbar (perfektes Weiss ohne Filter: a* -4,7; mit 700nm-Filter: b* +1,7),
-    // weil die Normbeobachter-Kurven dort noch nicht vernachlaessigbar sind.
+    // Gaussian-weighted sum over all bands (see header comment) instead of
+    // linear interpolation between band centers -- each band contributes to R(wl)
+    // according to its own (nearly Gaussian) sensitivity curve,
+    // not just the two numerically nearest ones. Strictly
+    // normalized (division by the sum of weights): R(wl) is therefore at
+    // EVERY sample point a true weighted average of the band values, and
+    // a constant spectrum (R=c in all bands) stays exactly c everywhere
+    // -- an ideal gray yields a*=b*=0. Outside the bands this holds the
+    // value of the nearest band instead of decaying toward 0. Previously
+    // the denominator was floored at a minimum of 1; that pulled R toward 0 at
+    // the edges (especially 650-700nm without F8, < 405nm) and measurably
+    // distorted the color (perfect white with no filter: a* -4.7; with the
+    // 700nm filter: b* +1.7), because the standard observer curves are not
+    // yet negligible there.
     float weightedSum = 0.0f, weightTotal = 0.0f;
     for (int j = 0; j < n; j++) {
       float sigma = bands[j].fwhm_nm * FWHM_TO_SIGMA;
@@ -122,11 +123,11 @@ void spectrumToXYZ(const Band* bands, const float* values, int n,
       weightedSum += w * values[j];
       weightTotal += w;
     }
-    // Weit ausserhalb aller Baender werden die Gewichte winzig, ihr Verhaeltnis
-    // bleibt aber exakt -- deshalb KEINE Mindestschwelle (eine Schwelle wie
-    // 1e-12 setzte R z. B. im 650nm-Modus bei 730nm faelschlich auf 0). Nur
-    // wenn alle Gewichte auf exakt 0 unterlaufen, wird der Wert des
-    // naechstgelegenen Bandes gehalten.
+    // Far outside all bands the weights become tiny, but their ratio
+    // remains exact -- hence NO minimum threshold (a threshold like
+    // 1e-12 would e.g. incorrectly set R to 0 at 730nm in 650nm mode). Only
+    // when all weights underflow to exactly 0 is the value of the
+    // nearest band held.
     float R;
     if (weightTotal > 0.0f) {
       R = weightedSum / weightTotal;
@@ -148,7 +149,7 @@ void spectrumToXYZ(const Band* bands, const float* values, int n,
     Z += R * illum * zb;
     k += illum * yb;
   }
-  float scale = 100.0f / k;   // perfekter Diffusor (R=1 ueberall) -> Y=100
+  float scale = 100.0f / k;   // perfect diffuser (R=1 everywhere) -> Y=100
   X *= scale; Y *= scale; Z *= scale;
 }
 
@@ -181,8 +182,8 @@ static inline float srgbEncode(float c) {
   return (c <= 0.0031308f) ? 12.92f * c : 1.055f * powf(c, 1.0f / 2.4f) - 0.055f;
 }
 
-// XYZ(D50, Y=1-Skala) -> linear sRGB, Bradford-adaptierte Matrix (verifiziert
-// per colour-science: D50-Weiss bildet auf [1,1,1] linear-RGB ab).
+// XYZ(D50, Y=1 scale) -> linear sRGB, Bradford-adapted matrix (verified
+// via colour-science: D50 white maps to [1,1,1] linear RGB).
 void xyzToSRGB255(float X, float Y, float Z, uint8_t& r, uint8_t& g, uint8_t& b) {
   float Xr = X / 100.0f, Yr = Y / 100.0f, Zr = Z / 100.0f;
   float rl =  3.1337773f * Xr - 1.6171927f * Yr - 0.4906675f * Zr;

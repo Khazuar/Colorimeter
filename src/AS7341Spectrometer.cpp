@@ -4,9 +4,9 @@
 #include <Arduino.h>
 #include <cmath>
 
-// Debug-/Analysezwecke: Klartext-Label je Measurement-Element, in derselben
-// Reihenfolge wie performMeasurement() sie liefert (F1..F8, Clear, NIR).
-// NICHT von generischem Code nutzen, um den Measurement-Inhalt zu interpretieren.
+// Debug/analysis purposes: plain-text label per Measurement element, in the
+// same order performMeasurement() delivers them (F1..F8, Clear, NIR).
+// Do NOT use from generic code to interpret the Measurement content.
 const char* const AS7341Spectrometer::MEASUREMENT_LABELS[AS7341Spectrometer::N_CH] = {
   "F1_415nm", "F2_445nm", "F3_480nm", "F4_515nm",
   "F5_555nm", "F6_590nm", "F7_630nm", "F8_680nm",
@@ -23,65 +23,68 @@ void AS7341Spectrometer::applySettings(const OpticalSettings& settings) {
   as7341_.setGain(settings.sensor.gain);
 }
 
-// Alle Konstanten hier sind ein bewusst einfacher Startpunkt, keine fertig
-// getunte Loesung -- siehe Plan/Kontext: welche Stoppschwelle tatsaechlich
-// <1 DeltaE Messgenauigkeit liefert, muss noch empirisch getestet werden.
+// All constants here are a deliberately simple starting point, not a
+// fully-tuned solution -- see plan/context: which stop threshold actually
+// delivers <1 DeltaE measurement accuracy still needs to be tested empirically.
 static const uint8_t SINGLE_SAMPLES         = 1;
-// n=4 hatte ~41% relative Unsicherheit der SD-Schaetzung selbst
-// (1/sqrt(2*(n-1))) -- der allererste converged()-Check konnte dadurch rein
-// zufaellig zu frueh positiv ausfallen. n=8 (~27%) ist spuerbar robuster,
-// weiteres Erhoehen bringt abnehmenden Ertrag -- TODO tunen.
+// n=4 had ~41% relative uncertainty of the SD estimate itself
+// (1/sqrt(2*(n-1))) -- the very first converged() check could therefore turn
+// positive purely by chance too early. n=8 (~27%) is noticeably more robust,
+// increasing it further brings diminishing returns -- TODO tune.
 static const uint8_t PRECISE_MIN_SAMPLES    = 8;
-static const uint8_t PRECISE_MAX_SAMPLES    = 32;    // Cap, ersetzt frueheres festes N_AVG=16
-static const float   PRECISE_TARGET_REL_SEM = 0.01f; // 1% rel. Standardfehler d. Mittelwerts -- TODO tunen
+static const uint8_t PRECISE_MAX_SAMPLES    = 32;    // cap, replaces the former fixed N_AVG=16
+static const float   PRECISE_TARGET_REL_SEM = 0.01f; // 1% relative standard error of the mean -- TODO tune
 
-// Fuer checkValidity()/normalize() (siehe dort). ADC-Vollausschlag laut
-// AS7341-Datenblatt: (ATIME+1)*(ASTEP+1), gedeckelt auf die 16 Bit des
-// Datenregisters (65535). Bei kurzen Integrationszeiten liegt der
-// Vollausschlag also deutlich UNTER 65535 (z. B. ATIME 150/ASTEP 100 ->
-// 15251) -- eine feste 65535-Schwelle wuerde Klippen dort nie erkennen.
-// SATURATION_LIMIT_FRAC exakt wie beim frueheren Belichtungs-Assistenten-
-// Entwurf. ASTEP_TIME_MS laut Datenblatt/Adafruit_AS7341::toBasicCounts().
+// For checkValidity()/normalize() (see there). ADC full-scale per the
+// AS7341 datasheet: (ATIME+1)*(ASTEP+1), capped at the 16 bits of the
+// data register (65535). With short integration times, the
+// full-scale value is therefore well BELOW 65535 (e.g. ATIME 150/ASTEP 100 ->
+// 15251) -- a fixed 65535 threshold would never detect clipping there.
+// SATURATION_LIMIT_FRAC exactly as in the earlier exposure-assistant
+// design. ASTEP_TIME_MS per the datasheet/Adafruit_AS7341::toBasicCounts().
 static const float    SATURATION_LIMIT_FRAC = 0.80f;
 static const float    ASTEP_TIME_MS         = 0.00278f;
-// Reihenfolge == as7341_gain_t (siehe Adafruit_AS7341.h), wie GAIN_LABELS in
+// Order == as7341_gain_t (see Adafruit_AS7341.h), like GAIN_LABELS in
 // SettingsCodec.cpp.
 static const float GAIN_MULTIPLIERS[AS7341_GAIN_COUNT] = {
   0.5f, 1.0f, 2.0f, 4.0f, 8.0f, 16.0f, 32.0f, 64.0f, 128.0f, 256.0f, 512.0f
 };
-// Kanaele mit einem Mittelwert darunter zaehlen nicht zur Konvergenzpruefung,
-// werden aber ueber anyChannelUnmeasurable an performMeasurement() gemeldet,
-// damit ein nicht messbarer Kanal nicht stillschweigend zu einer beschoenigten
-// Praezisionsangabe fuehrt (siehe unten). Die Konstante selbst ist jetzt im
-// Header oeffentlich (AS7341Spectrometer::NOISE_FLOOR_COUNTS), weil auch
-// checkValidity() sie braucht -- hier nur ein kurzer Alias.
+// Channels with a mean below this value do not count toward the convergence
+// check, but are reported to performMeasurement() via anyChannelUnmeasurable
+// so that an unmeasurable channel does not silently lead to a flattering
+// precision figure (see below). The constant itself now lives publicly in the
+// header (AS7341Spectrometer::NOISE_FLOOR_COUNTS) because checkValidity()
+// needs it too -- here just a short alias.
 static constexpr float NOISE_FLOOR_COUNTS = AS7341Spectrometer::NOISE_FLOOR_COUNTS;
 
-// Schlechtester relativer Standardfehler des Mittelwerts ueber alle Kanaele mit
-// Signal oberhalb NOISE_FLOOR_COUNTS (sonst dominiert das Rauschen sehr dunkler
-// Kanaele den relativen Fehler, ohne etwas ueber die Messqualitaet auszusagen).
-// worstOut beschreibt also weiterhin NUR die messbaren Kanaele -- anyChannelUnmeasurable
-// macht sichtbar, wenn das nicht ALLE Kanaele waren, damit ein Aufrufer diese
-// Teilinformation nicht faelschlich als vollstaendige Praezisionsaussage fuer
-// die GESAMTE Messung missversteht (z.B. eine bunte Probe, bei der nur ein
-// einzelnes, stark absorbierendes Band unter der Rauschgrenze bleibt --
-// vorher wurde dieser Kanal einfach ignoriert, was das Ergebnis optimistischer
-// aussehen liess, als es war). Das Stopp-/Akzeptanzkriterium selbst bleibt
-// bewusst NUR von den messbaren Kanaelen abhaengig (siehe Rueckgabewert unten)
-// -- ein nicht messbarer Kanal soll die Konvergenz nicht verhindern, denn mehr
-// Samples wuerden seinen Mittelwert ohnehin nicht anheben (sonst waere z.B.
-// eine schwarze Probe im Precise-Modus nie mehr messbar). Die eigentliche
-// Korrektur (den berichteten relSEM-Wert bei anyChannelUnmeasurable auf NAN zu
-// setzen, statt eine beschoenigte Zahl aus nur den guten Kanaelen zu melden)
-// passiert daher NICHT hier, sondern in performMeasurement().
+// Worst relative standard error of the mean across all channels with
+// signal above NOISE_FLOOR_COUNTS (otherwise the noise of very dark
+// channels would dominate the relative error without saying anything about
+// measurement quality). worstOut therefore continues to describe ONLY the
+// measurable channels -- anyChannelUnmeasurable makes it visible when that
+// was NOT all channels, so that a caller does not mistake this partial
+// information for a complete precision statement about the ENTIRE
+// measurement (e.g. a colorful sample where only a single, strongly
+// absorbing band stays below the noise floor -- previously this channel was
+// simply ignored, which made the result look more optimistic than it
+// actually was). The stop/acceptance criterion itself deliberately remains
+// dependent ONLY on the measurable channels (see the return value below)
+// -- an unmeasurable channel should not prevent convergence, since more
+// samples would not raise its mean anyway (otherwise e.g. a black sample
+// could never be measured at all in Precise mode). The actual
+// correction (setting the reported relSEM value to NAN when
+// anyChannelUnmeasurable, instead of reporting a flattering number derived
+// from only the good channels) therefore does NOT happen here, but in
+// performMeasurement().
 //
-// anyChannelEvaluated meldet, ob ueberhaupt ein Kanal oberhalb der
-// Rauschgrenze lag -- worstOut ist bedeutungslos, wenn nicht (bleibt bei
-// seinem Initialwert 0.0). performMeasurement() behandelt diesen Fall (z.B.
-// sehr dunkle Probe/Dunkelmessung) explizit separat, siehe dort. worstOut
-// wird zusaetzlich zum Rueckgabewert (dem Konvergenz-Ja/Nein) durchgereicht,
-// damit performMeasurement() den erreichten Wert als Telemetrie (relSemWorst)
-// mitgeben kann, statt ihn wie bisher nach der Ja/Nein-Entscheidung zu verwerfen.
+// anyChannelEvaluated reports whether any channel at all was above the
+// noise floor -- worstOut is meaningless if not (it stays at
+// its initial value of 0.0). performMeasurement() handles this case (e.g.
+// a very dark sample/dark measurement) explicitly and separately, see there.
+// worstOut is passed through in addition to the return value (the
+// convergence yes/no), so that performMeasurement() can pass on the value
+// achieved as telemetry (relSemWorst), instead of discarding it after the
+// yes/no decision as before.
 static bool converged(const uint16_t buf[][AS7341Spectrometer::N_CH], uint8_t taken,
                        bool& anyChannelEvaluated, bool& anyChannelUnmeasurable, float& worstOut) {
   float worst = 0.0f;
@@ -107,11 +110,11 @@ static bool converged(const uint16_t buf[][AS7341Spectrometer::N_CH], uint8_t ta
   return anyChannelEvaluated && (worst <= PRECISE_TARGET_REL_SEM);
 }
 
-// Kleiner Helfer statt Aggregat-Initialisierung: MeasurementTelemetry hat
-// In-Class-Default-Initialisierer (fuer status/sampleCount/relSemWorst), was
-// den Typ unter dem hier verwendeten C++-Standard (vor C++14) zu keinem
-// Aggregat mehr macht -- "MeasurementTelemetry{a,b,c}" wuerde daher nicht
-// kompilieren (kein passender Konstruktor).
+// Small helper instead of aggregate initialization: MeasurementTelemetry has
+// in-class default initializers (for status/sampleCount/relSemWorst), which
+// makes the type no longer an aggregate under the C++ standard used here
+// (pre-C++14) -- "MeasurementTelemetry{a,b,c}" would therefore not
+// compile (no matching constructor).
 static void setTelemetry(MeasurementTelemetry* out, MeasurementStatus status, uint8_t sampleCount, float relSemWorst) {
   if (!out) return;
   out->status = status;
@@ -124,22 +127,22 @@ Measurement AS7341Spectrometer::performMeasurement(Precision precision, Progress
   uint8_t maxSamples = (precision == Precision::Single) ? SINGLE_SAMPLES : PRECISE_MAX_SAMPLES;
   uint8_t minSamples = (precision == Precision::Single) ? SINGLE_SAMPLES : PRECISE_MIN_SAMPLES;
 
-  // Loest die AS7341-Rohkanal-Reihenfolge auf. readAllChannels() macht intern
-  // zwei Integrationszyklen mit unterschiedlicher SMUX-Konfiguration (siehe
+  // Resolves the AS7341 raw channel order. readAllChannels() internally does
+  // two integration cycles with different SMUX configurations (see
   // Adafruit_AS7341::setup_F1F4_Clear_NIR()/setup_F5F8_Clear_NIR()):
-  //   Zyklus 1 (Slot 0-5):  F1, F2, F3, F4, Clear, NIR
-  //   Zyklus 2 (Slot 6-11): F5, F6, F7, F8, Clear, NIR
-  // Slot 4/5 sind ein erstes (ueberzaehliges) Clear/NIR-Messpaar -- wir
-  // ignorieren es und nehmen stattdessen das zweite Paar aus Slot 10/11.
-  // Einzige Stelle im ganzen Code, die diese Reihenfolge wissen muss.
+  //   Cycle 1 (slot 0-5):  F1, F2, F3, F4, Clear, NIR
+  //   Cycle 2 (slot 6-11): F5, F6, F7, F8, Clear, NIR
+  // Slot 4/5 are a first (surplus) Clear/NIR measurement pair -- we
+  // ignore it and instead take the second pair from slot 10/11.
+  // The only place in the entire code that needs to know this order.
   static const uint8_t SRC_IDX[N_CH] = { 0, 1, 2, 3, 6, 7, 8, 9, 10, 11 };
 
-  static uint16_t buf[PRECISE_MAX_SAMPLES][N_CH];  // ~640B, static um Stack zu schonen
+  static uint16_t buf[PRECISE_MAX_SAMPLES][N_CH];  // ~640B, static to spare the stack
   uint8_t taken = 0;
   uint8_t consecutiveConverged = 0;
-  bool stoppedShortNoSignal = false;  // siehe "kein Kanal evaluiert"-Kurzschluss unten
-  float lastRelSemWorst = NAN;  // nur bei Precision::Precise UND mind. einem evaluierten Kanal gesetzt
-  bool lastAnyUnmeasurable = false;  // mind. 1 (aber nicht alle) Kanaele unterhalb der Rauschgrenze -- siehe converged()
+  bool stoppedShortNoSignal = false;  // see "no channel evaluated" short-circuit below
+  float lastRelSemWorst = NAN;  // only set with Precision::Precise AND at least one evaluated channel
+  bool lastAnyUnmeasurable = false;  // at least 1 (but not all) channels below the noise floor -- see converged()
 
   for (uint8_t n = 0; n < maxSamples; n++) {
     if (onProgress) onProgress(taken, maxSamples);
@@ -154,25 +157,25 @@ Measurement AS7341Spectrometer::performMeasurement(Precision precision, Progress
       float relSemWorst;
       bool isConverged = converged(buf, taken, anyChannelEvaluated, anyChannelUnmeasurable, relSemWorst);
       if (!anyChannelEvaluated) {
-        // Bewusste Kurzschluss-Entscheidung: kein Kanal hat Signal oberhalb
-        // der Rauschgrenze (z.B. sehr dunkle Probe/Dunkelmessung) -- die
-        // relative Praezisionsschwelle ist fuer Kanaele ohne Signal nicht
-        // aussagekraeftig, mehr Samples aendern daran systematisch nichts.
-        // Deshalb sofortiger Abbruch bei minSamples, ohne die sonst uebliche
-        // 2-von-2-Bestaetigung (siehe unten) abzuwarten. lastRelSemWorst
-        // bleibt bewusst NAN -- es wurde nie ein echter Wert berechnet.
+        // Deliberate short-circuit decision: no channel has signal above
+        // the noise floor (e.g. a very dark sample/dark measurement) -- the
+        // relative precision threshold is not meaningful for channels without
+        // signal, more samples would systematically change nothing about that.
+        // Hence an immediate stop at minSamples, without waiting for the
+        // usual 2-of-2 confirmation (see below). lastRelSemWorst
+        // deliberately stays NAN -- no real value was ever computed.
         stoppedShortNoSignal = true;
         break;
       }
       lastRelSemWorst = relSemWorst;
       lastAnyUnmeasurable = anyChannelUnmeasurable;
       if (isConverged) {
-        // Zwei aufeinanderfolgende Treffer verlangt statt nur einem --
-        // mildert "optional stopping"-Bias ab (ein einzelner zufaellig
-        // guenstiger Zwischenwert wuerde die Messung sonst vorzeitig
-        // optimistisch verzerrt beenden). Bei Cap 32 ist der praktische
-        // Schaden eines einzelnen Treffers begrenzt, die Korrektur ist aber
-        // billig genug, um sie trotzdem mitzunehmen -- TODO tunen.
+        // Requires two consecutive hits instead of just one --
+        // mitigates "optional stopping" bias (a single randomly
+        // favorable intermediate value would otherwise end the measurement
+        // prematurely with an overly optimistic bias). With a cap of 32, the
+        // practical harm of a single hit is limited, but the correction is
+        // cheap enough to include anyway -- TODO tune.
         consecutiveConverged++;
         if (consecutiveConverged >= 2) break;
       } else {
@@ -183,7 +186,7 @@ Measurement AS7341Spectrometer::performMeasurement(Precision precision, Progress
   if (onProgress) onProgress(taken, maxSamples);
 
   if (taken == 0) {
-    // Sensor liefert ueberhaupt keine gueltigen Daten -- Hardware-Fehler.
+    // Sensor delivers no valid data at all -- hardware fault.
     setTelemetry(outTelemetry, MeasurementStatus::SensorError, 0, NAN);
     return Measurement();
   }
@@ -192,26 +195,25 @@ Measurement AS7341Spectrometer::performMeasurement(Precision precision, Progress
                         || stoppedShortNoSignal
                         || (consecutiveConverged >= 2);
   if (!converged_enough) {
-    // maxSamples ausgeschoepft, ohne dass die Zielpraezision (zwei
-    // aufeinanderfolgende converged()-Treffer) bestaetigt wurde -- z.B. eine
-    // andauernde Stoerung waehrend der Messung (Geraet wird bewegt). Explizit
-    // vom Sensorfehler-Fall oben unterscheidbar, siehe MeasurementStatus.
-    // sampleCount/relSemWorst werden trotzdem mitgegeben (Diagnosewert), auch
-    // wenn das Measurement selbst verworfen wird.
+    // maxSamples exhausted without confirming the target precision (two
+    // consecutive converged() hits) -- e.g. an ongoing disturbance during
+    // the measurement (the device is being moved). Explicitly
+    // distinguishable from the sensor-fault case above, see MeasurementStatus.
+    // sampleCount/relSemWorst are still passed along (diagnostic value), even
+    // though the Measurement itself is discarded.
     setTelemetry(outTelemetry, MeasurementStatus::NotConverged, taken, lastRelSemWorst);
     return Measurement();
   }
 
-  // Precision::Single berechnet nie ein relSEM (der obige Konvergenz-Zweig
-  // laeuft dort gar nicht) -- lastRelSemWorst bleibt dann korrekt NAN.
+  // Precision::Single never computes a relSEM (the convergence branch above
+  // does not run there at all) -- lastRelSemWorst then correctly stays NAN.
   //
-  // Ein nicht messbarer Kanal (unterhalb der Rauschgrenze) darf die
-  // berichtete Praezision nicht beschoenigen -- die Messung selbst bleibt
-  // gueltig (wird weiterhin zurueckgegeben/gespeichert, z.B. fuer eine
-  // schwarze oder stark absorbierende Probe), aber ohne eine Zahl, die
-  // faelschlich Praezision fuer einen gar nicht beurteilten Kanal
-  // unterstellt. Gleiche NAN-Konvention wie beim bereits bestehenden
-  // "komplett dunkle Probe"-Fall oben (stoppedShortNoSignal).
+  // An unmeasurable channel (below the noise floor) must not flatter the
+  // reported precision -- the measurement itself remains valid (it is still
+  // returned/stored, e.g. for a black or strongly absorbing sample), but
+  // without a number that falsely implies precision for a channel that was
+  // never actually assessed. Same NAN convention as the already existing
+  // "completely dark sample" case above (stoppedShortNoSignal).
   float reportedRelSemWorst = lastRelSemWorst;
   if (lastAnyUnmeasurable) {
     Serial.println("# Hinweis: mindestens ein Kanal blieb unterhalb der Rauschgrenze -- relSEM daher nicht ausgewiesen");
@@ -219,10 +221,10 @@ Measurement AS7341Spectrometer::performMeasurement(Precision precision, Progress
   }
   setTelemetry(outTelemetry, MeasurementStatus::Ok, taken, reportedRelSemWorst);
 
-  // Schlichter Mittelwert ueber alle gesammelten Samples -- keine
-  // Ausreisser-Trimmung mehr (siehe Kontext: die adaptive Stichprobenziehung
-  // selbst daempft kurze Stoerungen bereits, ohne die von converged()
-  // zertifizierte Praezision auf ungetrimmten Daten zu unterlaufen).
+  // Plain mean over all collected samples -- no more
+  // outlier trimming (see context: the adaptive sampling itself
+  // already dampens short disturbances, without undermining the precision
+  // certified by converged() on untrimmed data).
   Measurement m(N_CH);
   for (uint8_t ch = 0; ch < N_CH; ch++) {
     uint32_t sum = 0;
@@ -230,11 +232,11 @@ Measurement AS7341Spectrometer::performMeasurement(Precision precision, Progress
     m[ch] = (float)sum / (float)taken;
   }
 
-  // Absoluter Standardfehler des Mittelwerts JE KANAL (siehe
-  // MeasurementTelemetry::semPerChannel) -- ungefiltert, bewusst OHNE die
-  // NOISE_FLOOR_COUNTS-Ausnahme von converged() (die entscheidet nur ueber
-  // den Abbruch der Sample-Schleife, nicht ueber die Verwertbarkeit der
-  // Daten). Nur ab 2 Samples berechenbar (Precision::Single nimmt genau 1).
+  // Absolute standard error of the mean PER CHANNEL (see
+  // MeasurementTelemetry::semPerChannel) -- unfiltered, deliberately WITHOUT the
+  // NOISE_FLOOR_COUNTS exception from converged() (which only decides on
+  // stopping the sample loop, not on the usability of the
+  // data). Only computable from 2 samples onward (Precision::Single takes exactly 1).
   if (outTelemetry && taken >= 2) {
     outTelemetry->semPerChannel.assign(N_CH, 0.0f);
     for (uint8_t ch = 0; ch < N_CH; ch++) {
@@ -247,23 +249,23 @@ Measurement AS7341Spectrometer::performMeasurement(Precision precision, Progress
   return m;
 }
 
-// Optisches Uebersprechen: NIR-Licht beeinflusst die VIS-Kanaele
-// unterschiedlich stark -- WELCHE Kanaele ueberhaupt auswertbar sind und mit
-// welchem Faktor sie korrigiert werden muessen, haengt vom eingesetzten
-// IR-Cut-Filter ab (empirisch bestimmt per Vergleichsmessungen derselben
-// Proben mit/ohne 650nm- bzw. 700nm-Filter). channelIndex verweist auf den
-// zugehoerigen rohen F1..F8-Slot (0..7) -- die Rohkanal-Erfassung selbst
-// bleibt davon unberuehrt.
+// Optical crosstalk: NIR light affects the VIS channels to varying
+// degrees -- WHICH channels are evaluable at all and with what
+// factor they need to be corrected depends on the IR-cut filter in
+// use (empirically determined via comparison measurements of the same
+// samples with/without the 650nm or 700nm filter). channelIndex refers to the
+// associated raw F1..F8 slot (0..7) -- the raw channel acquisition itself
+// remains unaffected by this.
 struct VisBandDef {
   uint8_t channelIndex;
   float center_nm;
   float fwhm_nm;
   float nirFactor;
-  float nirFactorErr;  // Unsicherheit von nirFactor -- Basis von Spectrum::valueErrors
+  float nirFactorErr;  // uncertainty of nirFactor -- basis of Spectrum::valueErrors
 };
 
-// Kein Filter: F1-F7 korrigierbar, F8 hat einen Korrekturfaktor unbekannter
-// Groesse -> komplett weggelassen statt unkorrigiert auszugeben.
+// No filter: F1-F7 correctable, F8 has a correction factor of unknown
+// magnitude -> omitted entirely instead of being output uncorrected.
 static const VisBandDef BANDS_NONE[] = {
   { 0, 415.0f, 26.0f, 0.355f, 0.060f },  // F1
   { 1, 445.0f, 30.0f, 0.109f, 0.019f },  // F2
@@ -274,10 +276,10 @@ static const VisBandDef BANDS_NONE[] = {
   { 6, 630.0f, 50.0f, 0.0f,   0.0f   },  // F7
 };
 
-// 700nm-Filter: F1-F7 mit praeziseren Faktoren; F8 UMDEFINIERT als eigenes
-// 674nm/45nm-Band statt als "abgeschnittener 680nm/52nm-Kanal" verworfen --
-// der 700nm-Cut-Filter macht diesen engeren, effektiv genutzten
-// Empfindlichkeitsbereich per Konstruktion NIR-frei (daher Faktor 0).
+// 700nm filter: F1-F7 with more precise factors; F8 REDEFINED as its own
+// 674nm/45nm band instead of being discarded as a "truncated 680nm/52nm
+// channel" -- the 700nm cut filter makes this narrower, effectively used
+// sensitivity range NIR-free by construction (hence factor 0).
 static const VisBandDef BANDS_700NM[] = {
   { 0, 415.0f, 26.0f, 0.125f, 0.045f },  // F1
   { 1, 445.0f, 30.0f, 0.032f, 0.017f },  // F2
@@ -286,16 +288,16 @@ static const VisBandDef BANDS_700NM[] = {
   { 4, 555.0f, 39.0f, 0.026f, 0.014f },  // F5
   { 5, 590.0f, 40.0f, 0.0f,   0.14f  },  // F6
   { 6, 630.0f, 50.0f, 0.0f,   0.07f  },  // F7
-  { 7, 674.0f, 45.0f, 0.0f,   0.03f  },  // F8, umdefiniert, NIR-frei per Konstruktion, Unsicherheit geometrisch bedingt (keine saubere Sigmoid Form)
+  { 7, 674.0f, 45.0f, 0.0f,   0.03f  },  // F8, redefined, NIR-free by construction, uncertainty geometrically determined (no clean sigmoid shape)
 };
 
-// 650nm-Filter: blockt bereits ab 650nm -> F1-F6 per Konstruktion NIR-frei
-// (Faktor 0), F7/F8 entfallen (der Filter schneidet bereits in ihren
-// eigentlichen Empfindlichkeitsbereich, "nicht nutzbar").
-// Die Unsicherheit "0.0f" ist eine Annahme, die nicht weiter geprüft wurde. 
-// Es fehlt an verfügbaren Methoden, diese Unsicherheit zu charakterisieren. 
-// Ziemlich sicher ist der verbleibende "echte" NIR-Anteil aber vernachlässigbar. 
-// Verbleibender Roh-Anzeigewert ist durch VIZ-Übersprechen in den NIR-Kanal bedingt.
+// 650nm filter: already blocks from 650nm onward -> F1-F6 NIR-free by
+// construction (factor 0), F7/F8 are dropped (the filter already cuts into
+// their actual sensitivity range, "not usable").
+// The uncertainty "0.0f" is an assumption that has not been further checked.
+// There is a lack of available methods to characterize this uncertainty.
+// However, the remaining "true" NIR component is fairly certainly negligible.
+// The remaining raw display value is caused by VIS crosstalk into the NIR channel.
 static const VisBandDef BANDS_650NM[] = {
   { 0, 415.0f, 26.0f, 0.0f, 0.0f },  // F1
   { 1, 445.0f, 30.0f, 0.0f, 0.0f },  // F2
@@ -331,22 +333,22 @@ uint8_t AS7341Spectrometer::relevantChannels(FilterState fs, uint8_t outIdx[N_CH
   return count;
 }
 
-// ADC-Quantisierung (+-0.5 LSB) ist unabhaengig von Gain/Integrationszeit --
-// ein Kanal braucht trotzdem einen kleinen absoluten Mindestwert, sonst
-// dominiert reines Rundungsrauschen, selbst bei exzellentem relativen SEM.
-// Bewusst viel kleiner als NOISE_FLOOR_COUNTS(=50) -- die eigentliche "ist
-// das ueberhaupt Signal"-Frage uebernimmt jetzt SEPARATION_Z_THRESHOLD.
-// TODO tunen.
+// ADC quantization (+-0.5 LSB) is independent of gain/integration time --
+// a channel still needs a small absolute minimum value, otherwise pure
+// rounding noise dominates, even with an excellent relative SEM.
+// Deliberately much smaller than NOISE_FLOOR_COUNTS(=50) -- the actual "is
+// this signal at all" question is now handled by SEPARATION_Z_THRESHOLD.
+// TODO tune.
 static const float MIN_QUANTIZATION_COUNTS = 10.0f;
 
-// Limit-of-Detection-Test (IUPAC-Konvention: Signal > Blindwert-Mittelwert +
-// 3*Blindwert-Streuung), hier auf zwei unabhaengige Mittelwerte (Weiss,
-// Dunkel) mit je eigenem Standardfehler des Mittelwerts (SEM) angewandt: die
-// Differenz muss die KOMBINIERTE (quadratisch addierte) Unsicherheit beider
-// um das 3-fache uebersteigen. Gleiche Schwelle wie
-// TipCatalog.cpp::PLAUSIBILITY_Z_THRESHOLD (dort: Ausreisser-Erkennung unter
-// Fingerabdruecken) -- andere Anwendung, dieselbe Standardheuristik fuer
-// "statistisch signifikant verschieden".
+// Limit-of-Detection test (IUPAC convention: signal > blank mean +
+// 3 * blank spread), applied here to two independent means (white,
+// dark) each with its own standard error of the mean (SEM): the
+// difference must exceed the COMBINED (added in quadrature) uncertainty of
+// both by a factor of 3. Same threshold as
+// TipCatalog.cpp::PLAUSIBILITY_Z_THRESHOLD (there: outlier detection among
+// fingerprints) -- different application, same standard heuristic for
+// "statistically significantly different".
 static const float SEPARATION_Z_THRESHOLD = 3.0f;
 
 MeasurementValidity AS7341Spectrometer::checkValidity(const Measurement& raw, const Measurement& rawSem,
@@ -361,9 +363,9 @@ MeasurementValidity AS7341Spectrometer::checkValidity(const Measurement& raw, co
     if (raw[c] > satLimit) result.anyClipping = true;
   }
 
-  // Ohne Dunkelreferenz (z.B. noch nie gemessen) ist die Trennschaerfe-Pruefung
-  // unten nicht durchfuehrbar -- entfaellt dann einfach, die Quantisierungs-
-  // Untergrenze bleibt trotzdem in Kraft.
+  // Without a dark reference (e.g. never measured yet) the separation check
+  // below cannot be performed -- it is simply skipped then, the quantization
+  // lower bound still remains in effect.
   bool haveDark = (darkMean.size() == N_CH);
 
   uint8_t relIdx[N_CH];
@@ -400,8 +402,8 @@ void AS7341Spectrometer::computeReflectance(const Measurement& measurement,
   bool haveCal = (whiteReference.size() == N_CH && darkReference.size() == N_CH);
   bool haveMeasurement = (measurement.size() == N_CH);
 
-  // Gleiche Formel fuer VIS-Kanaele und NIR -- kein oberes Clamping,
-  // spiegelt data/colorimeter.py.
+  // Same formula for VIS channels and NIR -- no upper clamping,
+  // mirrors data/colorimeter.py.
   auto reflectance = [&](uint8_t ch) -> float {
     if (!haveCal || !haveMeasurement) return 0.0f;
     float denom = whiteReference[ch] - darkReference[ch];
@@ -427,14 +429,14 @@ void AS7341Spectrometer::computeReflectance(const Measurement& measurement,
     float rawR = reflectance(def.channelIndex);
     auto correct = [&](float factor) -> float {
       float r = (rawR - factor * R_nir) / (1.0f - factor);
-      return (r < 0.0f) ? 0.0f : r;  // erneut clampen -- die NIR-Korrektur kann ins Negative ziehen
+      return (r < 0.0f) ? 0.0f : r;  // clamp again -- the NIR correction can pull into negative values
     };
     out.values[i] = correct(def.nirFactor);
 
-    // Fehler-Range: halbe Spannweite der Korrektur bei +-1 Sigma des Faktors
-    // -- eine einfache numerische Sensitivitaetsabschaetzung statt einer
-    // analytisch hergeleiteten Ableitung; bei ohnehin nur grob bekannten
-    // Unsicherheiten ausreichend und weniger fehleranfaellig.
+    // Error range: half the span of the correction at +-1 sigma of the factor
+    // -- a simple numerical sensitivity estimate instead of an
+    // analytically derived derivative; sufficient and less error-prone
+    // given uncertainties that are only roughly known anyway.
     out.valueErrors[i] = (def.nirFactorErr > 0.0f)
         ? fabsf(correct(def.nirFactor + def.nirFactorErr) - correct(def.nirFactor - def.nirFactorErr)) / 2.0f
         : 0.0f;

@@ -7,13 +7,14 @@ void DigitEditor::begin(uint8_t digitCount, const uint8_t* cycleLen, uint32_t in
   for (uint8_t i = 0; i < digitCount_; i++) cycleLen_[i] = cycleLen[i];
 
   if (digitCount_ == 1) {
-    // Einstellig (enum-artig): die "Ziffer" ist der Wert direkt, kein
-    // Dezimal-Digit -- cycleLen[0] darf > 9 sein (z.B. 11 Gain-Stufen).
+    // Single-digit (enum-like): the "digit" is the value directly, not a
+    // decimal digit -- cycleLen[0] may be > 9 (e.g. 11 gain levels).
     digits_[0] = (uint8_t)initialValue;
   } else {
-    // Mehrstellig: echte Dezimalzerlegung, jede Position ist ein Digit 0-9
-    // (cycleLen[i]==10), ausser ggf. der fuehrenden Position (enger begrenzt
-    // durch den Wertebereich -- vom Aufrufer in cycleLen[0] vorgegeben).
+    // Multi-digit: genuine decimal decomposition, each position is a digit
+    // 0-9 (cycleLen[i]==10), except possibly the leading position (more
+    // tightly limited by the value range -- given by the caller in
+    // cycleLen[0]).
     uint32_t remaining = initialValue;
     for (int8_t pos = (int8_t)digitCount_ - 1; pos >= 0; pos--) {
       digits_[pos] = (uint8_t)(remaining % 10);
@@ -36,13 +37,13 @@ void DigitEditor::decrementCurrentDigit() {
 }
 
 bool DigitEditor::advanceDigit() {
-  if (cursor_ + 1 >= digitCount_) return true;  // war schon auf der letzten Ziffer -- fertig
+  if (cursor_ + 1 >= digitCount_) return true;  // was already on the last digit -- done
   cursor_++;
   return false;
 }
 
 bool DigitEditor::retreatDigit() {
-  if (cursor_ == 0) return true;  // war schon auf der ersten Ziffer -- fertig
+  if (cursor_ == 0) return true;  // was already on the first digit -- done
   cursor_--;
   return false;
 }

@@ -6,19 +6,19 @@
 #include <BLE2902.h>
 #include <algorithm>
 
-// Nordic UART Service -- weit verbreiteter BLE-Quasi-Standard, den viele
-// generische BLE-Terminal-Apps (z.B. "Serial Bluetooth Terminal") bereits
-// ohne eigene App-Entwicklung unterstuetzen.
+// Nordic UART Service -- a widely used BLE quasi-standard that many generic
+// BLE terminal apps (e.g. "Serial Bluetooth Terminal") already support
+// without any dedicated app development.
 static const char* NUS_SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
-static const char* NUS_CHAR_TX_UUID = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"; // notify, Geraet->Handy
-static const char* NUS_CHAR_RX_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"; // write, ungenutzt,
-                                                                               // nur fuer App-Kompatibilitaet
+static const char* NUS_CHAR_TX_UUID = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"; // notify, device->phone
+static const char* NUS_CHAR_RX_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"; // write, unused,
+                                                                               // only for app compatibility
 
-static const uint16_t BLE_PREFERRED_MTU       = 247;  // angefragt; unverhandelt sind es nur 23
-static const size_t   BLE_CHUNK_FALLBACK      = 20;   // 23 - 3 Byte ATT-Header, immer sicher
-static const size_t   BLE_CHUNK_MAX           = 200;  // Deckel, falls Peer ein sehr grosses MTU meldet
-static const uint32_t BLE_CHUNK_DELAY_MS      = 10;   // sonst Stau im BLE-Stack (siehe BLE_uart-Beispiel)
-static const uint32_t BLE_RESUME_ADV_DELAY_MS = 500;  // Stack Zeit geben, sich nach Trennung zu beruhigen
+static const uint16_t BLE_PREFERRED_MTU       = 247;  // requested; unnegotiated it's only 23
+static const size_t   BLE_CHUNK_FALLBACK      = 20;   // 23 - 3 byte ATT header, always safe
+static const size_t   BLE_CHUNK_MAX           = 200;  // cap, in case the peer reports a very large MTU
+static const uint32_t BLE_CHUNK_DELAY_MS      = 10;   // otherwise congestion in the BLE stack (see BLE_uart example)
+static const uint32_t BLE_RESUME_ADV_DELAY_MS = 500;  // give the stack time to settle after a disconnect
 
 class BleServerCallbacksImpl : public BLEServerCallbacks {
 public:
@@ -41,9 +41,9 @@ private:
   BleExporter& owner_;
 };
 
-// RX-Kanal wird nicht ausgewertet (wir brauchen keine Eingabe vom Handy),
-// muss aber existieren, damit generische BLE-Terminal-Apps das Geraet als
-// "UART-kompatibel" erkennen.
+// RX channel is not evaluated (we don't need any input from the phone), but
+// must exist so that generic BLE terminal apps recognize the device as
+// "UART-compatible".
 class NoopRxCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic*) override {}
 };
@@ -54,10 +54,10 @@ void BleExporter::begin(const char* deviceName) {
   if (!initialized_) {
     BLEDevice::init(deviceName);
     BLEDevice::setMTU(BLE_PREFERRED_MTU);
-    // Thermik + bewusst kurze Reichweite (~2-5m): Default waere +3dBm
-    // (ESP_PWR_LVL_P3, siehe esp_bt.h). -9dBm ist ein Startwert -- auf echter
-    // Hardware ggf. nachjustieren, die tatsaechliche Reichweite haengt stark
-    // von Antenne/Umgebung ab und laesst sich nicht zuverlaessig vorausberechnen.
+    // Thermals + deliberately short range (~2-5m): the default would be +3dBm
+    // (ESP_PWR_LVL_P3, see esp_bt.h). -9dBm is a starting value -- may need
+    // adjustment on real hardware, the actual range depends heavily on the
+    // antenna/environment and can't be reliably predicted in advance.
     BLEDevice::setPower(ESP_PWR_LVL_N9);
 
     server_ = BLEDevice::createServer();
@@ -89,8 +89,8 @@ void BleExporter::begin(const char* deviceName) {
 void BleExporter::end() {
   if (!advertising_) return;
 
-  // Fuehlt sich fuer den Nutzer wie "Bluetooth aus" an: eine bestehende
-  // Verbindung wird aktiv getrennt statt nur unsichtbar zu werden.
+  // Feels to the user like "Bluetooth off": an existing connection is
+  // actively disconnected instead of merely becoming invisible.
   if (connected_ && server_) {
     server_->disconnect(server_->getConnId());
   }
@@ -126,7 +126,7 @@ bool BleExporter::send(const std::string& payload, ProgressCallback onProgress) 
   size_t total = payload.size();
   size_t sent = 0;
   while (sent < total) {
-    if (!connected_) return false;  // waehrend des Sendens getrennt
+    if (!connected_) return false;  // disconnected while sending
     size_t n = std::min(chunkSize, total - sent);
     txChar_->setValue(payload.substr(sent, n));
     txChar_->notify();

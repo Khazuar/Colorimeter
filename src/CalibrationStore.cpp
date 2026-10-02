@@ -4,20 +4,20 @@
 #include <ArduinoJson.h>
 #include <LittleFS.h>
 
-// Der Messspitzen-Katalog (siehe unten) liegt bewusst auf LittleFS statt in
-// den NVS-"Preferences" wie die uebrigen Werte: die "nvs"-Partition ist laut
-// partitions.csv nur 20 KB gross und wird bereits von live/dark/white_settings
-// geteilt -- mit Fingerabdruecken (siehe TipCatalog.h::WhiteFingerprint,
-// bis zu MAX_WHITE_FINGERPRINTS_PER_TIP je Spitze) waechst der Katalog leicht
-// auf mehrere KB pro Spitze. LittleFS (die "spiffs"-Partition, 1.4 MB) traegt
-// bereits die mindestens ebenso wichtige Messhistorie (HistoryStore) und ist
-// genauso stromausfall-sicher -- kein neues Risiko, nur eine passendere
-// Partition fuer wachsende Daten.
+// The measurement tip catalog (see below) deliberately lives on LittleFS
+// instead of in the NVS "Preferences" like the other values: according to
+// partitions.csv the "nvs" partition is only 20 KB in size and is already
+// shared by live/dark/white_settings -- with fingerprints (see
+// TipCatalog.h::WhiteFingerprint, up to MAX_WHITE_FINGERPRINTS_PER_TIP per
+// tip) the catalog grows easily to several KB per tip. LittleFS (the
+// "spiffs" partition, 1.4 MB) already carries the at-least-equally-important
+// measurement history (HistoryStore) and is just as power-loss-safe -- no
+// new risk, just a more suitable partition for growing data.
 static const char* TIPS_PATH = "/tips.json";
 
 void CalibrationStore::begin() {
   prefs_.begin("colorim", false);
-  LittleFS.begin(/*formatOnFail=*/true);  // idempotent, siehe HistoryStore::begin()
+  LittleFS.begin(/*formatOnFail=*/true);  // idempotent, see HistoryStore::begin()
 }
 
 bool CalibrationStore::load(const char* key, Measurement& out) {
@@ -34,16 +34,15 @@ void CalibrationStore::save(const char* key, const Measurement& v) {
   prefs_.putBytes(key, v.data(), v.size() * sizeof(float));
 }
 
-// Gemeinsames Lese-/Schreibpaar fuer die drei Felder von SensorSettings --
-// genutzt vom "sensor"-Unterobjekt in writeOpticalFields()/readOpticalFields()
-// UND direkt fuer die eingefrorenen SensorSettings in einem WhiteFingerprint
-// (siehe TipCatalog.h), damit die JSON-Form nicht mehrfach gepflegt werden
-// muss. Generisch auf JsonVariant/JsonVariantConst, damit sowohl ein ganzes
-// JsonDocument als auch ein einzelnes JsonObject (Array-Element, Unterobjekt)
-// als Ziel/Quelle dienen koennen. Enum-Werte werden als Strings kodiert
-// (siehe SettingsCodec.h), damit eine kuenftige Umsortierung/Erweiterung des
-// Enums nicht stillschweigend die Bedeutung eines bereits gespeicherten
-// Werts veraendert.
+// Shared read/write pair for the three fields of SensorSettings -- used by
+// the "sensor" sub-object in writeOpticalFields()/readOpticalFields() AND
+// directly for the frozen SensorSettings in a WhiteFingerprint (see
+// TipCatalog.h), so the JSON shape doesn't need to be maintained in multiple
+// places. Generic over JsonVariant/JsonVariantConst, so that both an entire
+// JsonDocument and a single JsonObject (array element, sub-object) can serve
+// as target/source. Enum values are encoded as strings (see
+// SettingsCodec.h), so that a future reordering/extension of the enum does
+// not silently change the meaning of an already-stored value.
 static void writeSensorFields(JsonVariant target, const SensorSettings& sensor) {
   target["gain"]  = gainCsvLabel(sensor.gain);
   target["atime"] = sensor.atime;
@@ -57,20 +56,19 @@ static bool readSensorFields(JsonVariantConst source, SensorSettings& sensor) {
   return ok;
 }
 
-// Analog fuer OpticalSettings (Filter + Sensor zusammen) -- genutzt fuer das
-// "optical"-Unterobjekt von RootSettings, ein eigenstaendiges OpticalSettings-
-// Dokument (Dark-/Weiss-Referenzen) UND je ein "optical"-Unterobjekt pro
-// Messspitzen-Katalog-Eintrag. Siehe schema/settings.schema.json fuer die
-// dokumentierte Form.
+// Analogous for OpticalSettings (filter + sensor together) -- used for the
+// "optical" sub-object of RootSettings, a standalone OpticalSettings document
+// (dark/white references) AND one "optical" sub-object per measurement tip
+// catalog entry. See schema/settings.schema.json for the documented shape.
 static void writeOpticalFields(JsonVariant target, FilterState fs, const SensorSettings& sensor) {
   target["filter"] = filterStateCsvLabel(fs);
   writeSensorFields(target["sensor"].to<JsonObject>(), sensor);
 }
 
-// Feldweise robust: jedes fehlende/unbekannte Feld schlaegt fehl -- der
-// Aufrufer faellt dann komplett auf den jeweiligen Struct-Default zurueck
-// (kein Mischzustand aus altem/neuem Wert), gleiche Philosophie wie zuvor die
-// binaere Groessen-Pruefung, jetzt nur feldweise statt "ganz oder gar nicht".
+// Robust field by field: any missing/unknown field fails -- the caller then
+// falls back completely to the respective struct default (no mixed state of
+// old/new value), the same philosophy as previously the binary size check,
+// just now field by field instead of "all or nothing".
 static bool readOpticalFields(JsonVariantConst source, FilterState& fs, SensorSettings& sensor) {
   bool ok = filterStateFromCsvLabel(source["filter"] | "", fs);
   return ok && readSensorFields(source["sensor"], sensor);
@@ -79,7 +77,7 @@ static bool readOpticalFields(JsonVariantConst source, FilterState& fs, SensorSe
 static String serializeRootSettings(const RootSettings& s) {
   JsonDocument doc;
   writeOpticalFields(doc["optical"].to<JsonObject>(), s.optical.filterState, s.optical.sensor);
-  // kuenftig: weitere RootSettings-Gruppen hier als weitere Top-Level-Keys ergaenzen
+  // future: add further RootSettings groups here as additional top-level keys
   String out;
   serializeJson(doc, out);
   return out;
@@ -111,10 +109,10 @@ static bool deserializeOpticalSettings(const String& json, OpticalSettings& out)
   return ok;
 }
 
-// Schreibt direkt in den gegebenen Stream (kein Zwischen-String) -- der
-// Katalog kann mit vollen Fingerabdruck-Listen mehrere KB gross werden,
-// direktes Streamen in die Datei spart den Umweg ueber eine grosse String-
-// Kopie im RAM.
+// Writes directly into the given stream (no intermediate string) -- the
+// catalog can grow to several KB in size with full fingerprint lists,
+// streaming directly into the file saves the detour via a large string copy
+// in RAM.
 static void serializeTipCatalog(const TipCatalog& c, Print& out) {
   JsonDocument doc;
   doc["active"] = c.active.c_str();
@@ -136,10 +134,10 @@ static void serializeTipCatalog(const TipCatalog& c, Print& out) {
   serializeJson(doc, out);
 }
 
-// Ungueltig (-> false, Aufrufer faellt auf einen leeren Katalog zurueck), wenn
-// JSON kaputt ist, ODER die resultierende Liste leer waere, ODER 'active'
-// keinen der geladenen Eintraege trifft -- die Invariante "immer >=1 Spitze,
-// 'active' immer gueltig" wird hier durchgesetzt, nicht erst beim Zugriff.
+// Invalid (-> false, caller falls back to an empty catalog) if JSON is
+// broken, OR the resulting list would be empty, OR 'active' matches none of
+// the loaded entries -- the invariant "always >=1 tip, 'active' always valid"
+// is enforced here, not only at access time.
 static bool deserializeTipCatalog(Stream& in, TipCatalog& out) {
   TipCatalog result;
   JsonDocument doc;
@@ -153,11 +151,11 @@ static bool deserializeTipCatalog(Stream& in, TipCatalog& out) {
         ok = false;
         break;
       }
-      // whiteFingerprints ist OPTIONAL (aeltere/neu angelegte Kataloge haben
-      // noch keine) -- fehlt der Schluessel, bleibt die Liste einfach leer,
-      // das ist KEIN Ladefehler. Ein einzelner kaputter Fingerabdruck-Eintrag
-      // wird uebersprungen statt den ganzen Katalog zu verwerfen (reine
-      // Zusatzdaten).
+      // whiteFingerprints is OPTIONAL (older/newly created catalogs don't
+      // have any yet) -- if the key is missing, the list simply stays empty,
+      // that is NOT a load error. A single broken fingerprint entry is
+      // skipped instead of discarding the whole catalog (purely supplemental
+      // data).
       if (o["whiteFingerprints"].is<JsonArray>()) {
         for (JsonObject fpObj : o["whiteFingerprints"].as<JsonArray>()) {
           if (!fpObj["values"].is<JsonArray>()) continue;
@@ -177,26 +175,24 @@ static bool deserializeTipCatalog(Stream& in, TipCatalog& out) {
   return ok;
 }
 
-// NEUE Key-Namen ("_json"-Suffix, bewusst anders als die frueheren binaeren
-// Blob-Keys) -- alte Blob-Eintraege werden dadurch nie wieder gelesen
-// (verwaiste, harmlose Bytes in NVS) statt als vermeintliches JSON
-// missinterpretiert zu werden. Keine Migration: nach dem Flashen dieser
-// Aenderung springen Einstellungen/Referenzen einmalig auf ihre Defaults
-// zurueck, genau wie bei einem Erstboot.
+// NEW key names ("_json" suffix, deliberately different from the earlier
+// binary blob keys) -- this means old blob entries are never read again
+// (orphaned, harmless bytes in NVS) instead of being misinterpreted as
+// supposed JSON. No migration: after flashing this change, settings/
+// references revert to their defaults once, exactly as on a first boot.
 //
-// WICHTIG: NVS-Keys duerfen laut ESP-IDF hoechstens 15 Zeichen lang sein
-// (Preferences::putString()/getString() -> nvs_set_str()/nvs_get_str()
-// scheitern sonst mit ESP_ERR_NVS_KEY_TOO_LONG -- die Preferences-Bibliothek
-// meldet das nur per log_e(), der Rueckgabewert wird unten deshalb explizit
-// geprueft). "*_settings_json" waere 18-19 Zeichen lang gewesen und ist
-// NIEMALS tatsaechlich gespeichert worden -- "*_cfg_json" bleibt knapp
-// darunter.
+// IMPORTANT: according to ESP-IDF, NVS keys may be at most 15 characters
+// long (Preferences::putString()/getString() -> nvs_set_str()/nvs_get_str()
+// otherwise fail with ESP_ERR_NVS_KEY_TOO_LONG -- the Preferences library
+// only reports this via log_e(), so the return value is explicitly checked
+// below). "*_settings_json" would have been 18-19 characters long and was
+// NEVER actually saved -- "*_cfg_json" stays just under the limit.
 bool CalibrationStore::loadDark(Measurement& out, Measurement& outSem, OpticalSettings& optical) {
   bool ok = load("dark_raw", out);
   if (ok) {
     String json = prefs_.getString("dark_cfg_json", "");
     if (json.isEmpty() || !deserializeOpticalSettings(json, optical)) optical = OpticalSettings();
-    if (!load("dark_sem", outSem)) outSem.clear();  // z.B. Referenz von vor dieser Erweiterung -- kein Fehler
+    if (!load("dark_sem", outSem)) outSem.clear();  // e.g. a reference from before this extension -- not an error
   }
   return ok;
 }
@@ -239,7 +235,7 @@ void CalibrationStore::saveSettings(const RootSettings& v) {
   }
 }
 
-// Auf LittleFS statt NVS/Preferences -- siehe Kommentar an TIPS_PATH oben.
+// On LittleFS instead of NVS/Preferences -- see the comment on TIPS_PATH above.
 bool CalibrationStore::loadTips(TipCatalog& out) {
   if (!LittleFS.exists(TIPS_PATH)) { out = TipCatalog(); return false; }
   File f = LittleFS.open(TIPS_PATH, FILE_READ);
@@ -250,7 +246,7 @@ bool CalibrationStore::loadTips(TipCatalog& out) {
 }
 
 void CalibrationStore::saveTips(const TipCatalog& v) {
-  File f = LittleFS.open(TIPS_PATH, FILE_WRITE, true);  // "w" trunkiert automatisch
+  File f = LittleFS.open(TIPS_PATH, FILE_WRITE, true);  // "w" truncates automatically
   if (!f) return;
   serializeTipCatalog(v, f);
   f.close();

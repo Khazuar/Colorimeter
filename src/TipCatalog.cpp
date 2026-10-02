@@ -4,16 +4,16 @@
 
 namespace {
 
-// Klassischer Ausreisser-Test: 3 Standardabweichungen um den Mittelwert
-// gelten als "noch normal" (3-Sigma-Regel) -- Standardheuristik fuer
-// angenaehert normalverteilte Messreihen.
+// Classic outlier test: 3 standard deviations around the mean
+// are considered "still normal" (3-sigma rule) -- standard heuristic for
+// approximately normally distributed measurement series.
 const float PLAUSIBILITY_Z_THRESHOLD = 3.0f;
 
-// Boden fuer die effektive Standardabweichung je Kanal, relativ zum
-// Kanal-Mittelwert -- verhindert, dass ein zufaellig sehr eng beieinander
-// liegender kleiner Stichprobenmittelwert den Test ueberempfindlich macht.
-// Konservativ gewaehlt relativ zur ohnehin je Einzelmessung angestrebten
-// Praezision von 1% relSEM (PRECISE_TARGET_REL_SEM, AS7341Spectrometer.cpp).
+// Floor for the effective standard deviation per channel, relative to the
+// channel mean -- prevents a sample mean that happens to lie very
+// tightly clustered from making the test oversensitive.
+// Chosen conservatively relative to the precision of 1% relSEM already
+// targeted per individual measurement anyway (PRECISE_TARGET_REL_SEM, AS7341Spectrometer.cpp).
 const float MIN_RELATIVE_STD = 0.02f;
 
 std::vector<float> channelMean(const std::vector<const Measurement*>& samples, size_t ch) {
@@ -24,9 +24,9 @@ std::vector<float> channelMean(const std::vector<const Measurement*>& samples, s
   return mean;
 }
 
-// Stichproben-Standardabweichung (Bessel-korrigiert, n-1) je Kanal um einen
-// bereits berechneten Mittelwert. Voraussetzung: samples.size() >= 2 (vom
-// Aufrufer sichergestellt).
+// Sample standard deviation (Bessel-corrected, n-1) per channel around an
+// already-computed mean. Precondition: samples.size() >= 2 (ensured by
+// the caller).
 void channelStdDev(const std::vector<const Measurement*>& samples, size_t ch,
                     const std::vector<float>& mean, std::vector<float>& outStd) {
   outStd.assign(ch, 0.0f);
@@ -35,17 +35,17 @@ void channelStdDev(const std::vector<const Measurement*>& samples, size_t ch,
   for (size_t c = 0; c < ch; c++) outStd[c] = sqrtf(outStd[c] / (float)(samples.size() - 1));
 }
 
-// Aggregiert die Streuung (als Variationskoeffizient je Kanal) ueber alle
-// ANDEREN Spitzen hinweg, OHNE deren Rohwerte zu mischen: je Spitze eigener
-// Mittelwert/eigene Standardabweichung (ihre Fingerabdruecke mit passender
-// sensorId), die daraus abgeleiteten Variationskoeffizienten werden gewichtet
-// (Gewicht = Anzahl Fingerabdruecke - 1, wie bei einer gepoolten Varianz)
-// gemittelt -- unterschiedliche Spitzen haben unterschiedliche optische
-// Pfade, also eine andere absolute Skala, deshalb je Spitze getrennt
-// berechnet statt alle Rohwerte einfach zusammenzuwerfen. Spitzen mit < 2
-// passenden Fingerabdruecken tragen nichts bei (Standardabweichung nicht
-// definiert). false, wenn in Summe zu wenige Eintraege
-// (< MIN_FINGERPRINTS_FOR_FALLBACK_STATS) beigetragen haben.
+// Aggregates the spread (as a coefficient of variation per channel) across all
+// OTHER tips, WITHOUT mixing their raw values: each tip gets its own
+// mean/own standard deviation (its fingerprints with a matching
+// sensorId), the coefficients of variation derived from these are weighted
+// (weight = number of fingerprints - 1, as with a pooled variance)
+// and averaged -- different tips have different optical
+// paths, i.e. a different absolute scale, so this is computed separately
+// per tip instead of simply throwing all raw values together. Tips with < 2
+// matching fingerprints contribute nothing (standard deviation not
+// defined). false if, in total, too few entries
+// (< MIN_FINGERPRINTS_FOR_FALLBACK_STATS) contributed.
 bool pooledCoefficientOfVariation(const std::vector<MeasurementTip>& tips, const std::string& excludeName,
                                    const std::string& sensorId, size_t ch, std::vector<float>& outCv) {
   std::vector<float> weightedSum(ch, 0.0f);
@@ -78,18 +78,18 @@ bool pooledCoefficientOfVariation(const std::vector<MeasurementTip>& tips, const
 
 PlausibilityResult MeasurementTip::isPlausible(const WhiteFingerprint& candidate,
                                                 const TipCatalog& catalog) const {
-  // Measurement ist per Spectrometer-Vertrag nie leer (buildWhiteFingerprint()
-  // wird nur mit einer bereits validierten Messung aufgerufen) -- keine
-  // Sonderbehandlung fuer den leeren Fall noetig.
+  // Measurement is never empty per Spectrometer contract (buildWhiteFingerprint()
+  // is only called with an already validated measurement) -- no
+  // special handling needed for the empty case.
   const size_t ch = candidate.normalized.size();
 
-  // Nur Fingerabdruecke DESSELBEN Sensors sind absolut vergleichbar (siehe
-  // WhiteFingerprint-Kommentar in TipCatalog.h).
+  // Only fingerprints of THE SAME sensor are absolutely comparable (see
+  // the WhiteFingerprint comment in TipCatalog.h).
   std::vector<const Measurement*> own;
   for (const WhiteFingerprint& fp : whiteFingerprints)
     if (fp.sensorId == candidate.sensorId) own.push_back(&fp.normalized);
 
-  if (own.empty()) return PlausibilityResult::Indeterminate;  // keine Vergleichsbasis
+  if (own.empty()) return PlausibilityResult::Indeterminate;  // no basis for comparison
 
   std::vector<float> ownMean = channelMean(own, ch);
   std::vector<float> effectiveStd;
@@ -98,10 +98,10 @@ PlausibilityResult MeasurementTip::isPlausible(const WhiteFingerprint& candidate
   if (own.size() >= MIN_FINGERPRINTS_FOR_DIRECT_STATS) {
     channelStdDev(own, ch, ownMean, effectiveStd);
   } else {
-    // Fallback: zu wenige eigene Fingerabdruecke fuer eine direkte Schaetzung
-    // -- Streuung stattdessen aus den Fingerabdruecken ALLER ANDEREN Spitzen
-    // schaetzen (nur der gepoolte Variationskoeffizient wird uebernommen,
-    // siehe pooledCoefficientOfVariation()).
+    // Fallback: too few own fingerprints for a direct estimate
+    // -- instead estimate the spread from the fingerprints of ALL OTHER tips
+    // (only the pooled coefficient of variation is adopted,
+    // see pooledCoefficientOfVariation()).
     std::vector<float> cv;
     if (!pooledCoefficientOfVariation(catalog.tips, name, candidate.sensorId, ch, cv)) {
       return PlausibilityResult::Indeterminate;
@@ -115,7 +115,7 @@ PlausibilityResult MeasurementTip::isPlausible(const WhiteFingerprint& candidate
   for (size_t c = 0; c < ch; c++) {
     float stdFloor = MIN_RELATIVE_STD * ownMean[c];
     float std_c = std::max(effectiveStd[c], stdFloor);
-    if (std_c <= 0.0f) continue;  // Mittelwert 0 -- kein sinnvoller Test moeglich
+    if (std_c <= 0.0f) continue;  // mean 0 -- no meaningful test possible
     float z = fabsf(candidate.normalized[c] - ownMean[c]) / std_c;
     if (z > PLAUSIBILITY_Z_THRESHOLD) return PlausibilityResult::Implausible;
   }

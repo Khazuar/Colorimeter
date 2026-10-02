@@ -2,16 +2,15 @@
 #include <Arduino.h>
 #include <cstdint>
 
-// Reines Polling, keine Interrupts. poll() jeden loop()-Durchlauf aufrufen.
+// Pure polling, no interrupts. Call poll() on every loop() iteration.
 class DebouncedButton {
 public:
-  // LongPress feuert bereits waehrend des Haltens, sobald longPressMs erreicht
-  // ist (nicht erst beim Loslassen) -- genau einmal pro Druckvorgang, auch
-  // wenn der Taster danach weiter gehalten wird. ShortRelease feuert wie
-  // bisher erst beim Loslassen, aber nur falls die Lang-Druck-Schwelle waehrend
-  // des Haltens nicht schon ueberschritten wurde (sonst wurde die Aktion
-  // bereits per LongPress ausgeloest, das anschliessende Loslassen meldet
-  // dann None).
+  // LongPress already fires while the button is being held, as soon as
+  // longPressMs is reached (not only on release) -- exactly once per press,
+  // even if the button continues to be held afterwards. ShortRelease fires,
+  // as before, only on release, but only if the long-press threshold was not
+  // already exceeded during the hold (otherwise the action was already
+  // triggered via LongPress, and the subsequent release then reports None).
   enum class Event : uint8_t { None, Pressed, ShortRelease, LongPress };
 
   explicit DebouncedButton(uint8_t pin, uint32_t debounceMs = 40, uint32_t longPressMs = 600)
@@ -20,7 +19,7 @@ public:
   void begin() { pinMode(pin_, INPUT_PULLUP); }
 
   Event poll() {
-    bool raw = (digitalRead(pin_) == LOW);  // Pullup + Taster gegen GND: LOW = gedrueckt
+    bool raw = (digitalRead(pin_) == LOW);  // Pullup + button against GND: LOW = pressed
     uint32_t now = millis();
 
     if (raw != rawPressed_) { lastChangeMs_ = now; rawPressed_ = raw; }

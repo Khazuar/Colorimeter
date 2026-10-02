@@ -8,18 +8,18 @@
 
 static const char* HISTORY_PATH = "/history.csv";
 
-// Zeilenformat: <label>,<kindNum>,<tempC>,<sessionMs>,<uptimeS>,<filterStateNum>,<gainNum>,<atime>,<astep>,<precisionNum>,<sampleCount>,<relSemWorst|leer>,<channelCount>,<v0>,...,<vN-1>,<sem0|leer>,...,<semN-1|leer>
-// Bounds-Check auf kindNum/filterStateNum/gainNum/precisionNum/channelCount
-// schuetzt vor einer durch Stromausfall verstuemmelten Zeile, die zufaellig
-// trotzdem mit '\n' endet. relSemWorst ist ein LEERES Feld (nicht "0"), wenn
-// kein relSEM berechnet wurde -- siehe MeasurementRecord-Kommentar in
-// HistoryStore.h. channelCount macht den zweiten (SEM-)Werteblock erst
-// parsebar (ohne ihn wuesste man nicht, wo der erste Block endet) --
-// Zeilen von VOR dieser Erweiterung (ohne channelCount) werden dadurch
-// zuverlaessig verworfen statt fehlinterpretiert: ihr erster Rohwert wird
-// als (garantiert zu grosse) channelCount gelesen, das anschliessende Lesen
-// so vieler Felder laeuft ueber das Zeilenende hinaus und schlaegt sauber
-// fehl (siehe Bounds-Check unten) -- keine Migration, wie ueberall sonst.
+// Row format: <label>,<kindNum>,<tempC>,<sessionMs>,<uptimeS>,<filterStateNum>,<gainNum>,<atime>,<astep>,<precisionNum>,<sampleCount>,<relSemWorst|empty>,<channelCount>,<v0>,...,<vN-1>,<sem0|empty>,...,<semN-1|empty>
+// The bounds check on kindNum/filterStateNum/gainNum/precisionNum/channelCount
+// guards against a row mangled by a power loss that still happens to end with
+// '\n'. relSemWorst is an EMPTY field (not "0") when no relSEM was computed --
+// see the MeasurementRecord comment in HistoryStore.h. channelCount is what
+// makes the second (SEM) value block parsable in the first place (without it
+// there would be no way to know where the first block ends) -- rows from
+// BEFORE this extension (without channelCount) are thereby reliably discarded
+// instead of misinterpreted: their first raw value is read as a (guaranteed
+// too large) channelCount, the subsequent read of that many fields runs past
+// the end of the line and fails cleanly (see the bounds check below) -- no
+// migration, as everywhere else.
 static bool parseLine(const std::string& line, MeasurementRecord& rec) {
   size_t pos = 0;
   auto nextField = [&](std::string& out) -> bool {
@@ -78,7 +78,7 @@ static bool parseLine(const std::string& line, MeasurementRecord& rec) {
 
   if (!nextField(field)) return false;
   long channelCountL = strtol(field.c_str(), nullptr, 10);
-  if (channelCountL < 0 || channelCountL > 64) return false;  // Sicherheitsnetz, siehe Format-Kommentar oben
+  if (channelCountL < 0 || channelCountL > 64) return false;  // safety net, see format comment above
   size_t channelCount = (size_t)channelCountL;
 
   rec.measurement.clear();
@@ -88,9 +88,9 @@ static bool parseLine(const std::string& line, MeasurementRecord& rec) {
     rec.measurement.push_back(strtof(field.c_str(), nullptr));
   }
 
-  // Zweiter Werteblock (SEM je Kanal) -- bleibt insgesamt leer, wenn KEIN
-  // einzelnes Feld gesetzt war (Precision::Single, oder eine Zeile von vor
-  // dieser Erweiterung), statt N Nullen vorzutaeuschen.
+  // Second value block (SEM per channel) -- stays entirely empty if NOT A
+  // SINGLE field was set (Precision::Single, or a row from before this
+  // extension), instead of faking N zeros.
   Measurement sem(channelCount, 0.0f);
   bool anySem = false;
   for (size_t i = 0; i < channelCount; i++) {
@@ -105,9 +105,9 @@ static void countingVisitor(const MeasurementRecord&, void* userData) {
   (*reinterpret_cast<size_t*>(userData))++;
 }
 
-// clear()-Helfer: merkt sich die LETZTE Dark- bzw. White-Zeile (per
-// Ueberschreiben bei jedem weiteren Treffer waehrend des chronologischen
-// Durchlaufs bleibt am Ende jeweils die juengste uebrig).
+// clear() helper: remembers the LAST dark and white row respectively (by
+// overwriting on every further match during the chronological pass, the most
+// recent one is what remains at the end).
 struct LastRefCtx {
   bool haveDark = false, haveWhite = false;
   MeasurementRecord dark, white;
@@ -132,7 +132,7 @@ bool HistoryStore::begin() {
   }
 
   count_ = 0;
-  forEach(countingVisitor, &count_);  // einziger vollstaendiger Scan, danach nur noch RAM-Cache
+  forEach(countingVisitor, &count_);  // only full scan, RAM cache only from here on
   return true;
 }
 
@@ -163,7 +163,7 @@ bool HistoryStore::append(const MeasurementRecord& rec) {
   f.print(',');
   f.print(rec.sampleCount);
   f.print(',');
-  if (!isnan(rec.relSemWorst)) f.print(rec.relSemWorst, 5);  // leer lassen, wenn NAN -- siehe Header-Kommentar
+  if (!isnan(rec.relSemWorst)) f.print(rec.relSemWorst, 5);  // leave empty if NAN -- see header comment
   f.print(',');
   f.print(rec.measurement.size());
   for (float v : rec.measurement) {
@@ -172,7 +172,7 @@ bool HistoryStore::append(const MeasurementRecord& rec) {
   }
   for (size_t i = 0; i < rec.measurement.size(); i++) {
     f.print(',');
-    if (i < rec.semPerChannel.size()) f.print(rec.semPerChannel[i], 3);  // leer lassen, falls nicht ermittelt
+    if (i < rec.semPerChannel.size()) f.print(rec.semPerChannel[i], 3);  // leave empty if not determined
   }
   f.print('\n');
   f.flush();
@@ -181,24 +181,24 @@ bool HistoryStore::append(const MeasurementRecord& rec) {
   return true;
 }
 
-// Behaelt bewusst die letzte Dark- UND die letzte White-Zeile (falls
-// vorhanden), statt die Historie restlos zu leeren: main.cpp berechnet
-// Reflexion/Lab/Hex fuer eine Messung gegen die Dark-/Weisszeile, die
-// chronologisch zuletzt VOR ihr in der Historie steht (siehe
-// SettingsRefState/observeReference() in main.cpp) -- ohne mindestens eine
-// erhaltene Referenzzeile koennten danach aufgenommene Messungen (bis zur
-// naechsten ECHTEN Referenzmessung) nicht mehr korrekt ausgewertet werden,
-// obwohl die zugehoerige Kalibrierung weiterhin gueltig ist. Die vollen,
-// ORIGINALEN Zeilen (samt Telemetrie) werden 1:1 zurueckgeschrieben -- keine
-// rekonstruierte/vereinfachte Ersatzzeile, deshalb ueber den normalen
-// append()-Pfad statt eines main.cpp-seitig neu gebauten MeasurementRecord.
+// Deliberately keeps the last dark AND the last white row (if present)
+// instead of wiping the history completely: main.cpp computes
+// reflectance/Lab/hex for a measurement against the dark/white row that is
+// chronologically the last one BEFORE it in the history (see
+// SettingsRefState/observeReference() in main.cpp) -- without at least one
+// preserved reference row, measurements taken afterward (until the next
+// REAL reference measurement) could no longer be evaluated correctly, even
+// though the associated calibration remains valid. The full, ORIGINAL rows
+// (telemetry included) are written back 1:1 -- not a reconstructed/
+// simplified replacement row, hence via the normal append() path rather
+// than a MeasurementRecord newly built on the main.cpp side.
 void HistoryStore::clear() {
   if (!mounted_) return;
 
   LastRefCtx ref;
   forEach(collectLastRefVisitor, &ref);
 
-  File f = LittleFS.open(HISTORY_PATH, FILE_WRITE, true);  // "w" trunkiert automatisch
+  File f = LittleFS.open(HISTORY_PATH, FILE_WRITE, true);  // "w" truncates automatically
   if (f) f.close();
   count_ = 0;
 
@@ -222,18 +222,19 @@ void HistoryStore::forEach(RecordVisitor visitor, void* userData) const {
       line.push_back(static_cast<char>(c));
     }
   }
-  // Ein am Dateiende unvollstaendiger Rest (z.B. Stromausfall mitten in
-  // append()) wird bewusst verworfen -- nie gezaehlt/besucht. So bleiben
-  // count() und forEach() immer konsistent, auch nach einem harten Abbruch.
+  // A remainder incomplete at the end of the file (e.g. power loss in the
+  // middle of append()) is deliberately discarded -- never counted/visited.
+  // This keeps count() and forEach() always consistent, even after a hard
+  // abort.
   f.close();
 }
 
-// Liest vorwaerts bis zur ERSTEN erfolgreich parsebaren Zeile, statt nur die
-// buchstaeblich erste zu versuchen -- eine einzelne fuehrende Zeile in einem
-// mittlerweile veralteten Format (z.B. von vor einer Zeilenformat-Erweiterung,
-// siehe parseLine()-Kommentar) soll nicht die Kanalzahl fuer die GESAMTE
-// Historie (und damit die Spaltenkoepfe des Exports) unbrauchbar machen, wo
-// doch alle nachfolgenden Zeilen bereits korrekt parsebar sind.
+// Reads forward to the FIRST successfully parsable row, instead of only
+// trying the literal first one -- a single leading row in a by-now outdated
+// format (e.g. from before a row-format extension, see the parseLine()
+// comment) should not render the channel count for the ENTIRE history (and
+// thus the export's column headers) unusable, when all subsequent rows are
+// already correctly parsable.
 size_t HistoryStore::firstRecordChannelCount() const {
   if (!mounted_) return 0;
   File f = LittleFS.open(HISTORY_PATH, FILE_READ);

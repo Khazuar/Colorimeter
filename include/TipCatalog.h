@@ -3,46 +3,46 @@
 #include <vector>
 #include "AppConfig.h"
 
-struct TipCatalog;  // siehe MeasurementTip::isPlausible() weiter unten
+struct TipCatalog;  // see MeasurementTip::isPlausible() further below
 
-// Ergebnis von MeasurementTip::isPlausible() -- ob eine neue Weissmessung zu
-// den bisher fuer diese Spitze gesammelten Fingerabdruecken passt.
-// PlausibleViaFallback = plausibel, aber
-// nur anhand einer aus Fremddaten geschaetzten Streuung beurteilt (zu wenige
-// eigene Fingerabdruecke fuer eine direkte Schaetzung, siehe isPlausible()) --
-// fuer die UI heute gleichbedeutend mit Plausible (nur Implausible/
-// Indeterminate unterbrechen den Messablauf, siehe main.cpp).
+// Result of MeasurementTip::isPlausible() -- whether a new white measurement
+// matches the fingerprints collected so far for this tip.
+// PlausibleViaFallback = plausible, but
+// judged only using a spread estimated from foreign data (too few
+// own fingerprints for a direct estimate, see isPlausible()) --
+// currently equivalent to Plausible for the UI (only Implausible/
+// Indeterminate interrupt the measurement flow, see main.cpp).
 enum class PlausibilityResult : uint8_t { Plausible, PlausibleViaFallback, Implausible, Indeterminate };
 
-// Ergebnis von MeasurementTip::whiteFingerprintStats() -- je Kanal Mittelwert
-// und ABSOLUTER Standardfehler des Mittelwerts (SEM, gleiche Einheit/
-// Groessenordnung wie 'mean' -- bewusst NICHT relativ/prozentual: die
-// normalisierten Werte selbst reichen ueber viele Groessenordnungen, ein
-// Prozentwert allein macht die absolute Groessenordnung nicht sichtbar, siehe
-// main.cpp::renderWhiteFingerprintStats()) ueber die eigenen Fingerabdruecke
-// EINER Spitze+Sensor-Kombination (siehe isPlausible() fuer die Begruendung,
-// warum nur diese untereinander vergleichbar sind). 'mean'/'sem'
-// sind leer, wenn n == 0; 'sem' bleibt zusaetzlich leer bei n == 1
-// (Standardfehler dort nicht definiert) -- Anzeige-Code (main.cpp) muss beide
-// Faelle abfangen.
+// Result of MeasurementTip::whiteFingerprintStats() -- per-channel mean
+// and ABSOLUTE standard error of the mean (SEM, same unit/
+// order of magnitude as 'mean' -- deliberately NOT relative/percentage: the
+// normalized values themselves span many orders of magnitude, a
+// percentage value alone does not make the absolute order of magnitude visible, see
+// main.cpp::renderWhiteFingerprintStats()) over the own fingerprints
+// of ONE tip+sensor combination (see isPlausible() for the reasoning
+// why only these are comparable to one another). 'mean'/'sem'
+// are empty when n == 0; 'sem' is additionally empty when n == 1
+// (standard error is not defined there) -- display code (main.cpp) must handle both
+// cases.
 struct WhiteFingerprintStats {
   size_t n = 0;
   std::vector<float> mean;
   std::vector<float> sem;
 };
 
-// Ein Fingerabdruck: normalisierte Rohmessung (siehe Spectrometer::normalize())
-// + Zeitpunkt (main.cpp::uptimeLogger, gleiche Konvention wie
-// HistoryStore::MeasurementRecord::uptimeS) + die zum Messzeitpunkt aktiven
-// SensorSettings (eingefroren, NICHT die live editierbaren -- gleiche
-// Asymmetrie wie AppConfig.h::RootSettings vs. main.cpp::lastMeasurementSettings)
-// fuer spaetere Ausreisser-Diagnose (z.B. "war der Gain hier ungewoehnlich
-// niedrig" statt vorschnell auf eine physische Veraenderung der Spitze zu
-// schliessen) + die sensorId (siehe Spectrometer::sensorId()) des Sensors, der
-// ihn erzeugt hat: 'normalized' ist ein opakes, sensorspezifisches Measurement
-// (siehe Spectrometer.h), zwei Fingerabdruecke sind nur bei UEBEREINSTIMMENDER
-// sensorId ueberhaupt vergleichbar (ein reiner Laengenvergleich waere keine
-// echte Garantie, siehe MeasurementTip::isPlausible()).
+// A fingerprint: normalized raw measurement (see Spectrometer::normalize())
+// + timestamp (main.cpp::uptimeLogger, same convention as
+// HistoryStore::MeasurementRecord::uptimeS) + the SensorSettings active
+// at measurement time (frozen, NOT the live editable ones -- the same
+// asymmetry as AppConfig.h::RootSettings vs. main.cpp::lastMeasurementSettings)
+// for later outlier diagnosis (e.g. "was the gain unusually
+// low here" instead of prematurely concluding a physical change
+// of the tip) + the sensorId (see Spectrometer::sensorId()) of the sensor that
+// produced it: 'normalized' is an opaque, sensor-specific Measurement
+// (see Spectrometer.h); two fingerprints are only comparable at all if their
+// sensorId MATCHES (a plain length comparison would be no
+// real guarantee, see MeasurementTip::isPlausible()).
 struct WhiteFingerprint {
   uint32_t uptimeS = 0;
   std::string sensorId;
@@ -50,54 +50,54 @@ struct WhiteFingerprint {
   Measurement normalized;
 };
 
-// Aeltester Eintrag faellt raus, sobald ein neuer dazukommt und die Liste
-// bereits MAX_WHITE_FINGERPRINTS_PER_TIP Eintraege haette (siehe
+// The oldest entry is dropped as soon as a new one is added and the list
+// would already have MAX_WHITE_FINGERPRINTS_PER_TIP entries (see
 // main.cpp::appendWhiteFingerprint()).
 static const size_t MAX_WHITE_FINGERPRINTS_PER_TIP = 20;
 
-// Ab wie vielen eigenen Fingerabdruecken (mit passender sensorId)
-// MeasurementTip::isPlausible() Mittelwert UND Streuung direkt daraus schaetzt
-// (statt auf eine Fremd-Stichprobe fuer die Streuung auszuweichen). 5 statt
-// weniger, weil eine Stichproben-Standardabweichung bei nur 2-3
-// Freiheitsgraden noch sehr instabil ist.
+// From how many own fingerprints (with a matching sensorId) onward
+// MeasurementTip::isPlausible() estimates mean AND spread directly from them
+// (instead of falling back to a foreign sample for the spread). 5 instead of
+// fewer, because a sample standard deviation with only 2-3
+// degrees of freedom is still very unstable.
 static const uint8_t MIN_FINGERPRINTS_FOR_DIRECT_STATS = 5;
 
-// Ab wie vielen (ueber mehrere vergleichbare Gruppen gepoolten) Eintraegen
-// eine Fallback-Stichprobe ueberhaupt als Grundlage fuer eine
-// Streuungsschaetzung benutzt wird -- siehe isPlausible().
+// From how many entries (pooled across several comparable groups) onward
+// a fallback sample is used at all as the basis for a
+// spread estimate -- see isPlausible().
 static const uint8_t MIN_FINGERPRINTS_FOR_FALLBACK_STATS = 5;
 
-// Eine bekannte Messspitze: eindeutiger Name (aktuell autogeneriert,
-// "Messspitze N") + das OpticalSettings, das beim Aktivieren dieser Spitze
-// automatisch geladen/angewendet wird (siehe main.cpp::activateTip()) + die
-// letzten Weissreferenz-"Fingerabdruecke" dieser Spitze (siehe
-// WhiteFingerprint). Weitere Meta-/Diagnosedaten (kein Teil von
-// OpticalSettings) kommen hier kuenftig als weitere Felder dazu.
+// A known measurement tip: unique name (currently autogenerated,
+// "tip N") + the OpticalSettings that is automatically loaded/applied
+// when this tip is activated (see main.cpp::activateTip()) + the
+// last white-reference "fingerprints" of this tip (see
+// WhiteFingerprint). Further meta-/diagnostic data (not part of
+// OpticalSettings) will be added here as additional fields in the future.
 struct MeasurementTip {
   std::string name;
   OpticalSettings optical;
   std::vector<WhiteFingerprint> whiteFingerprints;
 
-  // Prueft, ob 'candidate' (eine gerade aufgenommene, noch nicht angehaengte
-  // Weissmessung, siehe main.cpp::buildWhiteFingerprint()) zu den bisherigen
-  // Fingerabdruecken DIESER Spitze passt. 'catalog' wird nur fuer den
-  // Fallback-Fall gebraucht (Streuungsschaetzung aus Fingerabdruecken anderer
-  // Spitzen) -- siehe TipCatalog.cpp fuer die volle Herleitung.
+  // Checks whether 'candidate' (a white measurement just taken, not yet
+  // appended, see main.cpp::buildWhiteFingerprint()) matches the previous
+  // fingerprints of THIS tip. 'catalog' is only needed for the
+  // fallback case (spread estimate from fingerprints of other
+  // tips) -- see TipCatalog.cpp for the full derivation.
   PlausibilityResult isPlausible(const WhiteFingerprint& candidate, const TipCatalog& catalog) const;
 
-  // Mittelwert + absoluter Standardfehler je Kanal ueber die eigenen
-  // Fingerabdruecke der gegebenen sensorId (typischerweise der Sensor, der
-  // gerade misst) -- fuer den "Weiss-Fingerabdruck"-Anzeige-Screen (main.cpp).
+  // Mean + absolute standard error per channel over the own
+  // fingerprints of the given sensorId (typically the sensor that is
+  // currently measuring) -- for the "white fingerprint" display screen (main.cpp).
   WhiteFingerprintStats whiteFingerprintStats(const std::string& sensorId) const;
 };
 
-// Alle bekannten Messspitzen PLUS welche davon aktiv ist -- bewusst EIN
-// zusammenhaengendes, atomar persistiertes Dokument (CalibrationStore::
-// save/loadTips(), schema/tips.schema.json): "welche Spitze aktiv ist" ist
-// eine Eigenschaft DES KATALOGS (welche der hier gelisteten Optionen gerade
-// gewaehlt ist), keine RootSettings-Einstellung -- RootSettings kennt das
-// Konzept "Spitze" gar nicht. Invariante (von main.cpp aufrechterhalten):
-// tips ist NIE leer, 'active' bezeichnet IMMER einen existierenden Eintrag.
+// All known measurement tips PLUS which of them is active -- deliberately ONE
+// coherent, atomically persisted document (CalibrationStore::
+// save/loadTips(), schema/tips.schema.json): "which tip is active" is
+// a property OF THE CATALOG (which of the options listed here is currently
+// selected), not a RootSettings setting -- RootSettings does not know the
+// concept "tip" at all. Invariant (maintained by main.cpp):
+// tips is NEVER empty, 'active' ALWAYS refers to an existing entry.
 struct TipCatalog {
   std::string active;
   std::vector<MeasurementTip> tips;
@@ -113,12 +113,12 @@ struct TipCatalog {
   MeasurementTip* activeTip() { return find(active); }
   const MeasurementTip* activeTip() const { return find(active); }
 
-  // Findet alle ANDEREN Spitzen (Name != excludeName), fuer die 'candidate'
-  // plausibel waere (Plausible/PlausibleViaFallback), als Indizes in 'tips'.
-  // Sortierung: alle mit direkter Plausible-Bewertung zuerst, dann alle nur
-  // ueber PlausibleViaFallback -- jeweils in Katalog-Reihenfolge. Vorschlags-
-  // liste fuer main.cpp's Bestaetigungs-Screen, wenn 'candidate' fuer die
-  // AKTIVE Spitze Implausible/Indeterminate war (siehe MeasurementTip::
+  // Finds all OTHER tips (name != excludeName) for which 'candidate'
+  // would be plausible (Plausible/PlausibleViaFallback), as indices into 'tips'.
+  // Sorting: all with a direct Plausible rating first, then all only
+  // via PlausibleViaFallback -- each in catalog order. Suggestion
+  // list for main.cpp's confirmation screen, when 'candidate' was
+  // Implausible/Indeterminate for the ACTIVE tip (see MeasurementTip::
   // isPlausible()).
   std::vector<size_t> rankPlausibleTips(const WhiteFingerprint& candidate, const std::string& excludeName) const;
 };
