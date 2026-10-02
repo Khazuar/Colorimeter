@@ -191,33 +191,37 @@ static bool deserializeTipCatalog(Stream& in, TipCatalog& out) {
 // geprueft). "*_settings_json" waere 18-19 Zeichen lang gewesen und ist
 // NIEMALS tatsaechlich gespeichert worden -- "*_cfg_json" bleibt knapp
 // darunter.
-bool CalibrationStore::loadDark(Measurement& out, OpticalSettings& optical) {
+bool CalibrationStore::loadDark(Measurement& out, Measurement& outSem, OpticalSettings& optical) {
   bool ok = load("dark_raw", out);
   if (ok) {
     String json = prefs_.getString("dark_cfg_json", "");
     if (json.isEmpty() || !deserializeOpticalSettings(json, optical)) optical = OpticalSettings();
+    if (!load("dark_sem", outSem)) outSem.clear();  // z.B. Referenz von vor dieser Erweiterung -- kein Fehler
   }
   return ok;
 }
 
-bool CalibrationStore::loadWhite(Measurement& out, OpticalSettings& optical) {
+bool CalibrationStore::loadWhite(Measurement& out, Measurement& outSem, OpticalSettings& optical) {
   bool ok = load("white_raw", out);
   if (ok) {
     String json = prefs_.getString("white_cfg_json", "");
     if (json.isEmpty() || !deserializeOpticalSettings(json, optical)) optical = OpticalSettings();
+    if (!load("white_sem", outSem)) outSem.clear();
   }
   return ok;
 }
 
-void CalibrationStore::saveDark(const Measurement& v, const OpticalSettings& optical) {
+void CalibrationStore::saveDark(const Measurement& v, const Measurement& sem, const OpticalSettings& optical) {
   save("dark_raw", v);
+  save("dark_sem", sem);
   if (!prefs_.putString("dark_cfg_json", serializeOpticalSettings(optical))) {
     Serial.println("# dark_cfg_json: NVS-Schreibfehler");
   }
 }
 
-void CalibrationStore::saveWhite(const Measurement& v, const OpticalSettings& optical) {
+void CalibrationStore::saveWhite(const Measurement& v, const Measurement& sem, const OpticalSettings& optical) {
   save("white_raw", v);
+  save("white_sem", sem);
   if (!prefs_.putString("white_cfg_json", serializeOpticalSettings(optical))) {
     Serial.println("# white_cfg_json: NVS-Schreibfehler");
   }

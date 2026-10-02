@@ -24,6 +24,14 @@ struct MeasurementRecord {
   Precision precision = Precision::Single;
   uint8_t sampleCount = 1;
   float relSemWorst = NAN;
+
+  // Absoluter Standardfehler des Mittelwerts JE KANAL (siehe
+  // MeasurementTelemetry::semPerChannel) -- leer, wenn nicht ermittelt
+  // (Precision::Single, oder eine Zeile von vor dieser Erweiterung). Damit
+  // stehen bei einer spaeteren Neuberechnung (Export, Diagnose) dieselben
+  // Unsicherheitsdaten zur Verfuegung wie live zum Messzeitpunkt, nicht nur
+  // der aggregierte relSemWorst.
+  Measurement semPerChannel;
 };
 
 // Persistiert die Messhistorie zeilenweise als CSV auf der (bisher

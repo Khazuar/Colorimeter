@@ -18,15 +18,18 @@ public:
   void begin();  // prefs_.begin("colorim", false) + LittleFS.begin() (fuer loadTips/saveTips, siehe dort)
 
   // false, falls nie gespeichert ODER JSON nicht lesbar (out/optical fallen
-  // dann auf ihre Defaults zurueck).
-  bool loadDark(Measurement& out, OpticalSettings& optical);
-  bool loadWhite(Measurement& out, OpticalSettings& optical);
+  // dann auf ihre Defaults zurueck). outSem (absoluter Standardfehler je
+  // Kanal, siehe MeasurementTelemetry::semPerChannel) bleibt leer, wenn nie
+  // gespeichert (z.B. eine Referenz von vor dieser Erweiterung) -- kein
+  // Ladefehler, checkValidity() faellt dann auf 0 fuer diesen Anteil zurueck.
+  bool loadDark(Measurement& out, Measurement& outSem, OpticalSettings& optical);
+  bool loadWhite(Measurement& out, Measurement& outSem, OpticalSettings& optical);
 
   // optical wird zusammen mit den Rohwerten gespeichert -- Referenz und die
   // bei ihrer Aufnahme aktiven Einstellungen gehoeren untrennbar zusammen
   // (siehe main.cpp::calibrationValidFor()).
-  void saveDark(const Measurement& v, const OpticalSettings& optical);
-  void saveWhite(const Measurement& v, const OpticalSettings& optical);
+  void saveDark(const Measurement& v, const Measurement& sem, const OpticalSettings& optical);
+  void saveWhite(const Measurement& v, const Measurement& sem, const OpticalSettings& optical);
 
   // Die vollstaendige, aktuell im Settings-Baum gewaehlte Konfiguration --
   // unabhaengig davon, was gerade als Dark/White-Referenz kalibriert ist.

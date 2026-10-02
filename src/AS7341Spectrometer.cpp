@@ -226,6 +226,21 @@ Measurement AS7341Spectrometer::performMeasurement(Precision precision, Progress
     for (uint8_t i = 0; i < taken; i++) sum += buf[i][ch];
     m[ch] = (float)sum / (float)taken;
   }
+
+  // Absoluter Standardfehler des Mittelwerts JE KANAL (siehe
+  // MeasurementTelemetry::semPerChannel) -- ungefiltert, bewusst OHNE die
+  // NOISE_FLOOR_COUNTS-Ausnahme von converged() (die entscheidet nur ueber
+  // den Abbruch der Sample-Schleife, nicht ueber die Verwertbarkeit der
+  // Daten). Nur ab 2 Samples berechenbar (Precision::Single nimmt genau 1).
+  if (outTelemetry && taken >= 2) {
+    outTelemetry->semPerChannel.assign(N_CH, 0.0f);
+    for (uint8_t ch = 0; ch < N_CH; ch++) {
+      float varSum = 0.0f;
+      for (uint8_t i = 0; i < taken; i++) { float d = (float)buf[i][ch] - m[ch]; varSum += d * d; }
+      float stddev = sqrtf(varSum / (float)(taken - 1));
+      outTelemetry->semPerChannel[ch] = stddev / sqrtf((float)taken);
+    }
+  }
   return m;
 }
 
@@ -313,8 +328,27 @@ uint8_t AS7341Spectrometer::relevantChannels(FilterState fs, uint8_t outIdx[N_CH
   return count;
 }
 
-MeasurementValidity AS7341Spectrometer::checkValidity(const Measurement& raw,
-                                                       const OpticalSettings& settings) const {
+// ADC-Quantisierung (+-0.5 LSB) ist unabhaengig von Gain/Integrationszeit --
+// ein Kanal braucht trotzdem einen kleinen absoluten Mindestwert, sonst
+// dominiert reines Rundungsrauschen, selbst bei exzellentem relativen SEM.
+// Bewusst viel kleiner als NOISE_FLOOR_COUNTS(=50) -- die eigentliche "ist
+// das ueberhaupt Signal"-Frage uebernimmt jetzt SEPARATION_Z_THRESHOLD.
+// TODO tunen.
+static const float MIN_QUANTIZATION_COUNTS = 10.0f;
+
+// Limit-of-Detection-Test (IUPAC-Konvention: Signal > Blindwert-Mittelwert +
+// 3*Blindwert-Streuung), hier auf zwei unabhaengige Mittelwerte (Weiss,
+// Dunkel) mit je eigenem Standardfehler des Mittelwerts (SEM) angewandt: die
+// Differenz muss die KOMBINIERTE (quadratisch addierte) Unsicherheit beider
+// um das 3-fache uebersteigen. Gleiche Schwelle wie
+// TipCatalog.cpp::PLAUSIBILITY_Z_THRESHOLD (dort: Ausreisser-Erkennung unter
+// Fingerabdruecken) -- andere Anwendung, dieselbe Standardheuristik fuer
+// "statistisch signifikant verschieden".
+static const float SEPARATION_Z_THRESHOLD = 3.0f;
+
+MeasurementValidity AS7341Spectrometer::checkValidity(const Measurement& raw, const Measurement& rawSem,
+                                                       const OpticalSettings& settings,
+                                                       const Measurement& darkMean, const Measurement& darkSem) const {
   MeasurementValidity result;
   if (raw.size() != N_CH) return result;  // ok bleibt false
 
@@ -325,10 +359,21 @@ MeasurementValidity AS7341Spectrometer::checkValidity(const Measurement& raw,
     if (raw[c] > satLimit) result.anyClipping = true;
   }
 
+  // Ohne Dunkelreferenz (z.B. noch nie gemessen) ist die Trennschaerfe-Pruefung
+  // unten nicht durchfuehrbar -- entfaellt dann einfach, die Quantisierungs-
+  // Untergrenze bleibt trotzdem in Kraft.
+  bool haveDark = (darkMean.size() == N_CH);
+
   uint8_t relIdx[N_CH];
   uint8_t relCount = relevantChannels(settings.filterState, relIdx);
   for (uint8_t i = 0; i < relCount; i++) {
-    if (raw[relIdx[i]] < NOISE_FLOOR_COUNTS) result.anyBelowNoiseFloor = true;
+    uint8_t c = relIdx[i];
+    if (raw[c] < MIN_QUANTIZATION_COUNTS) { result.anyBelowNoiseFloor = true; continue; }
+    if (!haveDark) continue;
+    float rawSemC  = (rawSem.size()  == N_CH) ? rawSem[c]  : 0.0f;
+    float darkSemC = (darkSem.size() == N_CH) ? darkSem[c] : 0.0f;
+    float combinedSem = sqrtf(rawSemC * rawSemC + darkSemC * darkSemC);
+    if ((raw[c] - darkMean[c]) <= SEPARATION_Z_THRESHOLD * combinedSem) result.anyBelowNoiseFloor = true;
   }
 
   result.ok = !result.anyClipping && !result.anyBelowNoiseFloor;

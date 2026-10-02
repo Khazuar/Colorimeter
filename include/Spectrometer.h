@@ -93,6 +93,15 @@ struct MeasurementTelemetry {
   MeasurementStatus status = MeasurementStatus::Ok;
   uint8_t sampleCount = 0;
   float relSemWorst = NAN;
+
+  // Absoluter Standardfehler des Mittelwerts JE KANAL, in Rohwert-Einheiten
+  // (NICHT relativ wie relSemWorst) -- leer bei Precision::Single (nur 1
+  // Sample, keine Streuung berechenbar) oder falls sonst nicht ermittelbar.
+  // UNGEFILTERT (keine NOISE_FLOOR_COUNTS-Ausnahme wie bei relSemWorst) --
+  // Konsumenten (z.B. Spectrometer::checkValidity()) werten Verwertbarkeit
+  // selbst aus, anhand des tatsaechlichen Vergleichs mit einer Referenz,
+  // statt sich auf einen vorab gefilterten Wert zu verlassen.
+  Measurement semPerChannel;
 };
 
 // Fwd-Deklarationen statt #include "AppConfig.h" -- vermeidet einen
@@ -107,6 +116,12 @@ struct SensorSettings;
 // verlaesslich genug ist, um z.B. als Weissreferenz/Fingerabdruck uebernommen
 // zu werden. Sensor-unabhaengig; WELCHE internen Kanaele/Schwellen dafuer
 // herangezogen werden, entscheidet jede Implementierung selbst.
+// anyBelowNoiseFloor deckt dabei ZWEI unterschiedliche Ursachen ab (siehe
+// jeweilige Implementierung): einen kleinen absoluten Mindestwert (raus aus
+// der ADC-Quantisierung) UND fehlende statistische Trennschaerfe von der
+// Dunkelreferenz (Limit-of-Detection-Test) -- fuer main.cpp/die Anzeige
+// bewusst EIN gemeinsames Flag ("Kanal zu dunkel"), da beide Faelle fuer den
+// Nutzer dieselbe Konsequenz haben.
 struct MeasurementValidity {
   bool ok = false;
   bool anyBelowNoiseFloor = false;
@@ -156,13 +171,19 @@ public:
                                 FilterState filterState) const = 0;
 
   // Prueft eine ROHE Messung (z.B. eine Weissreferenz) auf Verlaesslichkeit
-  // -- z.B. Kanaele, die klippen oder unter der Rauschgrenze liegen. WELCHE
-  // Kanaele/Schwellen das im Detail sind, ist Sache der jeweiligen
-  // Implementierung. Aufrufer (main.cpp) nutzen NUR dieses Interface, nie
-  // sensorspezifische Details -- vorbereitet fuer einen kuenftigen zweiten
-  // Spectrometer (z.B. AS7343).
-  virtual MeasurementValidity checkValidity(const Measurement& raw,
-                                             const OpticalSettings& settings) const = 0;
+  // -- z.B. Kanaele, die klippen, eine ADC-Quantisierungs-Untergrenze
+  // unterschreiten, oder sich nicht signifikant von der Dunkelreferenz
+  // abheben (Limit-of-Detection-Test: Differenz muss gross sein gegenueber
+  // der kombinierten Unsicherheit beider Messungen, siehe rawSem/darkSem).
+  // darkMean/darkSem duerfen leer sein (z.B. noch keine Dunkelmessung
+  // vorhanden) -- dann entfaellt nur die Trennschaerfe-Pruefung, nicht die
+  // uebrigen. WELCHE Kanaele/Schwellen im Detail herangezogen werden, ist
+  // Sache der jeweiligen Implementierung. Aufrufer (main.cpp) nutzen NUR
+  // dieses Interface, nie sensorspezifische Details -- vorbereitet fuer einen
+  // kuenftigen zweiten Spectrometer (z.B. AS7343).
+  virtual MeasurementValidity checkValidity(const Measurement& raw, const Measurement& rawSem,
+                                             const OpticalSettings& settings,
+                                             const Measurement& darkMean, const Measurement& darkSem) const = 0;
 
   // Rohwert normalisiert auf Verstaerkung/Integrationszeit (sensorspezifische
   // Bedeutung von "Verstaerkung"/"Integrationszeit") -- macht Messungen unter

@@ -8,11 +8,18 @@
 
 static const char* HISTORY_PATH = "/history.csv";
 
-// Zeilenformat: <label>,<kindNum>,<tempC>,<sessionMs>,<uptimeS>,<filterStateNum>,<gainNum>,<atime>,<astep>,<precisionNum>,<sampleCount>,<relSemWorst|leer>,<v0>,...,<vN-1>
-// Bounds-Check auf kindNum/filterStateNum/gainNum/precisionNum schuetzt vor
-// einer durch Stromausfall verstuemmelten Zeile, die zufaellig trotzdem mit
-// '\n' endet. relSemWorst ist ein LEERES Feld (nicht "0"), wenn kein relSEM
-// berechnet wurde -- siehe MeasurementRecord-Kommentar in HistoryStore.h.
+// Zeilenformat: <label>,<kindNum>,<tempC>,<sessionMs>,<uptimeS>,<filterStateNum>,<gainNum>,<atime>,<astep>,<precisionNum>,<sampleCount>,<relSemWorst|leer>,<channelCount>,<v0>,...,<vN-1>,<sem0|leer>,...,<semN-1|leer>
+// Bounds-Check auf kindNum/filterStateNum/gainNum/precisionNum/channelCount
+// schuetzt vor einer durch Stromausfall verstuemmelten Zeile, die zufaellig
+// trotzdem mit '\n' endet. relSemWorst ist ein LEERES Feld (nicht "0"), wenn
+// kein relSEM berechnet wurde -- siehe MeasurementRecord-Kommentar in
+// HistoryStore.h. channelCount macht den zweiten (SEM-)Werteblock erst
+// parsebar (ohne ihn wuesste man nicht, wo der erste Block endet) --
+// Zeilen von VOR dieser Erweiterung (ohne channelCount) werden dadurch
+// zuverlaessig verworfen statt fehlinterpretiert: ihr erster Rohwert wird
+// als (garantiert zu grosse) channelCount gelesen, das anschliessende Lesen
+// so vieler Felder laeuft ueber das Zeilenende hinaus und schlaegt sauber
+// fehl (siehe Bounds-Check unten) -- keine Migration, wie ueberall sonst.
 static bool parseLine(const std::string& line, MeasurementRecord& rec) {
   size_t pos = 0;
   auto nextField = [&](std::string& out) -> bool {
@@ -69,10 +76,28 @@ static bool parseLine(const std::string& line, MeasurementRecord& rec) {
   if (!nextField(field)) return false;
   rec.relSemWorst = field.empty() ? NAN : strtof(field.c_str(), nullptr);
 
+  if (!nextField(field)) return false;
+  long channelCountL = strtol(field.c_str(), nullptr, 10);
+  if (channelCountL < 0 || channelCountL > 64) return false;  // Sicherheitsnetz, siehe Format-Kommentar oben
+  size_t channelCount = (size_t)channelCountL;
+
   rec.measurement.clear();
-  while (nextField(field)) {
-    if (!field.empty()) rec.measurement.push_back(strtof(field.c_str(), nullptr));
+  rec.measurement.reserve(channelCount);
+  for (size_t i = 0; i < channelCount; i++) {
+    if (!nextField(field)) return false;
+    rec.measurement.push_back(strtof(field.c_str(), nullptr));
   }
+
+  // Zweiter Werteblock (SEM je Kanal) -- bleibt insgesamt leer, wenn KEIN
+  // einzelnes Feld gesetzt war (Precision::Single, oder eine Zeile von vor
+  // dieser Erweiterung), statt N Nullen vorzutaeuschen.
+  Measurement sem(channelCount, 0.0f);
+  bool anySem = false;
+  for (size_t i = 0; i < channelCount; i++) {
+    if (!nextField(field)) return false;
+    if (!field.empty()) { sem[i] = strtof(field.c_str(), nullptr); anySem = true; }
+  }
+  rec.semPerChannel = anySem ? sem : Measurement();
   return true;
 }
 
@@ -139,9 +164,15 @@ bool HistoryStore::append(const MeasurementRecord& rec) {
   f.print(rec.sampleCount);
   f.print(',');
   if (!isnan(rec.relSemWorst)) f.print(rec.relSemWorst, 5);  // leer lassen, wenn NAN -- siehe Header-Kommentar
+  f.print(',');
+  f.print(rec.measurement.size());
   for (float v : rec.measurement) {
     f.print(',');
     f.print(v, 3);
+  }
+  for (size_t i = 0; i < rec.measurement.size(); i++) {
+    f.print(',');
+    if (i < rec.semPerChannel.size()) f.print(rec.semPerChannel[i], 3);  // leer lassen, falls nicht ermittelt
   }
   f.print('\n');
   f.flush();
@@ -197,6 +228,12 @@ void HistoryStore::forEach(RecordVisitor visitor, void* userData) const {
   f.close();
 }
 
+// Liest vorwaerts bis zur ERSTEN erfolgreich parsebaren Zeile, statt nur die
+// buchstaeblich erste zu versuchen -- eine einzelne fuehrende Zeile in einem
+// mittlerweile veralteten Format (z.B. von vor einer Zeilenformat-Erweiterung,
+// siehe parseLine()-Kommentar) soll nicht die Kanalzahl fuer die GESAMTE
+// Historie (und damit die Spaltenkoepfe des Exports) unbrauchbar machen, wo
+// doch alle nachfolgenden Zeilen bereits korrekt parsebar sind.
 size_t HistoryStore::firstRecordChannelCount() const {
   if (!mounted_) return 0;
   File f = LittleFS.open(HISTORY_PATH, FILE_READ);
@@ -205,11 +242,14 @@ size_t HistoryStore::firstRecordChannelCount() const {
   std::string line;
   int c;
   while ((c = f.read()) >= 0) {
-    if (c == '\n') break;
+    if (c == '\n') {
+      MeasurementRecord rec;
+      if (parseLine(line, rec)) { f.close(); return rec.measurement.size(); }
+      line.clear();
+      continue;
+    }
     if (c != '\r') line.push_back(static_cast<char>(c));
   }
   f.close();
-
-  MeasurementRecord rec;
-  return parseLine(line, rec) ? rec.measurement.size() : 0;
+  return 0;
 }

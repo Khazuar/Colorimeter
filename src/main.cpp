@@ -32,6 +32,11 @@ Spectrometer& spectrometer = sensorImpl;
 // ------------------------- Kalibrierung: Sache der Orchestrierung -------------------------
 CalibrationStore calStore;
 Measurement darkRef, whiteRef;
+// Absoluter Standardfehler des Mittelwerts je Kanal, eingefroren MIT der
+// jeweiligen Referenz (siehe MeasurementTelemetry::semPerChannel) -- Basis
+// fuer den Limit-of-Detection-Test in checkValidity() bei der naechsten
+// Weissmessung. Leer, falls (noch) nicht verfuegbar.
+Measurement darkRefSem, whiteRefSem;
 OpticalSettings darkRefSettings;   // eingefroren MIT darkRef, siehe CalibrationStore
 OpticalSettings whiteRefSettings;  // eingefroren MIT whiteRef
 bool calibrated = false;  // "Referenz passt zu den AKTUELL gewaehlten Einstellungen" -- siehe calibrationValidFor()
@@ -1301,6 +1306,27 @@ void flashBorder() {
   delay(80);
 }
 
+// Sticky-Screen (gleiches Muster wie renderMeasurementError()): eine
+// Weissmessung wurde erst gar nicht gestartet, weil fuer die AKTUELLEN
+// Einstellungen noch keine passende Dunkelreferenz vorliegt -- checkValidity()
+// koennte sonst nicht auf Trennschaerfe pruefen (Limit-of-Detection-Test
+// gegen Dunkel, siehe dort), eine Weissreferenz waere dann unabhaengig von
+// ihrer tatsaechlichen Qualitaet immer akzeptiert worden. Verlangt bewusst
+// dieselben Einstellungen wie calibrationValidFor() -- eine Dunkelreferenz
+// von einer ANDEREN Gain/ATIME/ASTEP-Kombination waere ohnehin nicht
+// vergleichbar.
+void renderNeedDarkFirstWarning() {
+  if (!displayOk) return;
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("Dunkelreferenz");
+  display.println("fehlt fuer diese");
+  display.println("Einstellungen");
+  display.display();
+}
+
 // Eigener Screen fuer einen fehlgeschlagenen Messversuch (leeres Measurement
 // von spectrometer.performMeasurement()) -- bleibt stehen, bis die naechste
 // Aktion (erneuter Trigger-/Mode-Druck) einen regulaeren Re-Render ausloest,
@@ -1482,19 +1508,22 @@ void finalizeMeasurement(Precision precision, SampleKind kind, const Measurement
   rec.precision = precision;
   rec.sampleCount = telemetry.sampleCount;
   rec.relSemWorst = telemetry.relSemWorst;
+  rec.semPerChannel = telemetry.semPerChannel;
   if (!historyStore.append(rec)) {
     Serial.println("# history append failed (Flash voll?)");
   }
 
   if (kind == SampleKind::Dark) {
     darkRef = measurement;
+    darkRefSem = telemetry.semPerChannel;
     darkRefSettings = currentSettings.optical;  // Einstellungen zum Aufnahmezeitpunkt einfrieren
-    calStore.saveDark(darkRef, darkRefSettings);
+    calStore.saveDark(darkRef, darkRefSem, darkRefSettings);
   }
   if (kind == SampleKind::White) {
     whiteRef = measurement;
+    whiteRefSem = telemetry.semPerChannel;
     whiteRefSettings = currentSettings.optical;
-    calStore.saveWhite(whiteRef, whiteRefSettings);
+    calStore.saveWhite(whiteRef, whiteRefSem, whiteRefSettings);
 
     MeasurementTip* active = targetTip ? targetTip : tipCatalog.activeTip();
     if (active) {
@@ -1515,6 +1544,21 @@ void finalizeMeasurement(Precision precision, SampleKind kind, const Measurement
 // loop() (Calibration ignoriert die Rueckgabe weiterhin einfach).
 bool performMeasurement(Precision precision, SampleKind kind) {
   if (busy) return false;  // keine zweite Messung waehrend eine laeuft
+
+  // Ohne eine fuer die AKTUELLEN Einstellungen gueltige Dunkelreferenz kann
+  // checkValidity() eine neue Weissmessung nicht auf Trennschaerfe pruefen
+  // (siehe dort) -- statt das stillschweigend zu uebergehen (dann waere JEDE
+  // Weissmessung unabhaengig von ihrer tatsaechlichen Qualitaet akzeptiert
+  // worden), wird sie erst gar nicht gestartet. Reihenfolge erzwungen: Dunkel
+  // vor Weiss, siehe renderNeedDarkFirstWarning().
+  if (kind == SampleKind::White) {
+    bool haveDarkForSettings = !darkRef.empty() && darkRefSettings == currentSettings.optical;
+    if (!haveDarkForSettings) {
+      renderNeedDarkFirstWarning();
+      return false;
+    }
+  }
+
   busy = true;
 
   flashBorder();  // nur hier, also nur wenn tatsaechlich gestartet wird
@@ -1549,7 +1593,8 @@ bool performMeasurement(Precision precision, SampleKind kind) {
   // lastMeasurement/lastMeasurementSettings bleiben dabei unveraendert, wie
   // beim Sensorfehler-/Nicht-Konvergenz-Fall oben.
   if (kind == SampleKind::White) {
-    MeasurementValidity validity = spectrometer.checkValidity(measurement, currentSettings.optical);
+    MeasurementValidity validity = spectrometer.checkValidity(measurement, telemetry.semPerChannel,
+                                                               currentSettings.optical, darkRef, darkRefSem);
     if (!validity.ok) {
       busy = false;
       renderWhiteValidityWarning(measurement, validity);
@@ -1805,8 +1850,8 @@ void setup() {
   modeBtn.begin();
 
   calStore.begin();
-  calStore.loadDark(darkRef, darkRefSettings);
-  calStore.loadWhite(whiteRef, whiteRefSettings);
+  calStore.loadDark(darkRef, darkRefSem, darkRefSettings);
+  calStore.loadWhite(whiteRef, whiteRefSem, whiteRefSettings);
   calStore.loadSettings(currentSettings);
   calibrated = calibrationValidFor(currentSettings.optical);
 

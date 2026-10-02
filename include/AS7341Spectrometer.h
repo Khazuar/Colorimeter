@@ -19,11 +19,12 @@ public:
   static const char* const MEASUREMENT_LABELS[N_CH];
 
   // Rohkanaele mit einem Mittelwert darunter liefern keinen verlaesslichen
-  // relSEM (siehe converged() in der .cpp) und gelten in checkValidity() als
-  // "zu dunkel". Oeffentlich, weil main.cpp/Aufrufer diesen Wert konzeptuell
-  // kennen koennen muessen (z.B. fuer Fehlermeldungen) -- der Zugriff darauf
-  // sollte trotzdem nur ueber das Spectrometer-Interface (checkValidity())
-  // erfolgen, nicht direkt.
+  // relSEM und zaehlen deshalb nicht zur Abbruchentscheidung der Sample-
+  // Schleife (siehe converged() in der .cpp) -- reine Effizienz-/Berichts-
+  // Heuristik, KEINE Aussage ueber Verwertbarkeit (die trifft checkValidity()
+  // separat, ueber einen Limit-of-Detection-Test gegen die Dunkelreferenz,
+  // siehe dort). Oeffentlich, weil main.cpp diesen Wert konzeptuell kennen
+  // koennen muss (z.B. fuer Fehlermeldungen).
   static constexpr float NOISE_FLOOR_COUNTS = 50.0f;
 
   bool begin();  // NUR as7341_.begin() (I2C-Inbetriebnahme). Kein NVS-Zugriff,
@@ -45,7 +46,9 @@ public:
                         const Measurement& darkReference,
                         FilterState filterState) const override;
 
-  MeasurementValidity checkValidity(const Measurement& raw, const OpticalSettings& settings) const override;
+  MeasurementValidity checkValidity(const Measurement& raw, const Measurement& rawSem,
+                                     const OpticalSettings& settings,
+                                     const Measurement& darkMean, const Measurement& darkSem) const override;
   Measurement normalize(const Measurement& raw, const SensorSettings& sensor) const override;
 
 private:
