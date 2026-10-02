@@ -18,18 +18,18 @@ static void drawModeCorner(Adafruit_SSD1306& d, const char* modeLabel) {
 
 static void renderNotCalibrated(Adafruit_SSD1306& d) {
   d.setCursor(0, 0);
-  d.println("nicht kalibriert");
-  d.println("Mode lang: White/");
-  d.println("Dark waehlen,");
-  d.println("dann Trigger");
+  d.println("not calibrated");
+  d.println("Mode long: White/");
+  d.println("Dark select,");
+  d.println("then trigger");
 }
 
-// Unlike "nicht kalibriert": calibration is available, it just hasn't been
+// Unlike "not calibrated": calibration is available, it just hasn't been
 // measured in this mode yet since the last mode change (or boot).
 static void renderNoMeasurementYet(Adafruit_SSD1306& d) {
   d.setCursor(0, 0);
-  d.println("keine Messung");
-  d.println("Trigger druecken");
+  d.println("no measurement");
+  d.println("Press trigger");
 }
 
 // Replaces the former LabHex view: label, L*/a*/b*, chroma/hue angle
@@ -107,7 +107,7 @@ static void renderSpectrum(Adafruit_SSD1306& d, const ViewContext& ctx) {
 
   if (ctx.measurement.empty()) {
     d.setCursor(0, 0);
-    d.println("keine Messung");
+    d.println("no measurement");
   } else {
     Spectrum spec = ctx.spectrometer.getSpectrum(ctx.measurement, ctx.whiteReference, ctx.darkReference, ctx.filterState);
     size_t n = spec.values.size();

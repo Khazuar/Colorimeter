@@ -211,7 +211,7 @@ void CalibrationStore::saveDark(const Measurement& v, const Measurement& sem, co
   save("dark_raw", v);
   save("dark_sem", sem);
   if (!prefs_.putString("dark_cfg_json", serializeOpticalSettings(optical))) {
-    Serial.println("# dark_cfg_json: NVS-Schreibfehler");
+    Serial.println("# dark_cfg_json: NVS write error");
   }
 }
 
@@ -219,7 +219,7 @@ void CalibrationStore::saveWhite(const Measurement& v, const Measurement& sem, c
   save("white_raw", v);
   save("white_sem", sem);
   if (!prefs_.putString("white_cfg_json", serializeOpticalSettings(optical))) {
-    Serial.println("# white_cfg_json: NVS-Schreibfehler");
+    Serial.println("# white_cfg_json: NVS write error");
   }
 }
 
@@ -231,7 +231,7 @@ bool CalibrationStore::loadSettings(RootSettings& out) {
 
 void CalibrationStore::saveSettings(const RootSettings& v) {
   if (!prefs_.putString("live_cfg_json", serializeRootSettings(v))) {
-    Serial.println("# live_cfg_json: NVS-Schreibfehler");
+    Serial.println("# live_cfg_json: NVS write error");
   }
 }
 

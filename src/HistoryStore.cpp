@@ -120,7 +120,7 @@ static void collectLastRefVisitor(const MeasurementRecord& rec, void* userData) 
 
 bool HistoryStore::begin() {
   if (!LittleFS.begin(/*formatOnFail=*/true)) {
-    Serial.println("# LittleFS mount failed -- Historie bleibt deaktiviert");
+    Serial.println("# LittleFS mount failed -- history stays disabled");
     mounted_ = false;
     return false;
   }

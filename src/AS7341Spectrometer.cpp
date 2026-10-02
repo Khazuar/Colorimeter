@@ -216,7 +216,7 @@ Measurement AS7341Spectrometer::performMeasurement(Precision precision, Progress
   // "completely dark sample" case above (stoppedShortNoSignal).
   float reportedRelSemWorst = lastRelSemWorst;
   if (lastAnyUnmeasurable) {
-    Serial.println("# Hinweis: mindestens ein Kanal blieb unterhalb der Rauschgrenze -- relSEM daher nicht ausgewiesen");
+    Serial.println("# Note: at least one channel stayed below the noise floor -- relSEM therefore not reported");
     reportedRelSemWorst = NAN;
   }
   setTelemetry(outTelemetry, MeasurementStatus::Ok, taken, reportedRelSemWorst);

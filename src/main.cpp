@@ -155,7 +155,7 @@ const char* filterStateUiLabel(FilterState fs) {
   switch (fs) {
     case FilterState::Filter650nm: return "650nm";
     case FilterState::Filter700nm: return "700nm";
-    default:                       return "kein Filter";
+    default:                       return "no filter";
   }
 }
 // filterStateCsvLabel()/gainCsvLabel() (for CSV export AND the new
@@ -173,7 +173,7 @@ const char* precisionCsvLabel(Precision p) {
 // instead of a flat list -- its shape follows RootSettings/AppConfig.h.
 // A node is either a leaf (editable value, like SettingDescriptor before),
 // a navigation node (goes one level deeper via a long trigger press),
-// the fictitious "<Zurueck>" entry (goes one level up), OR TipList -- a
+// the fictitious "<Back>" entry (goes one level up), OR TipList -- a
 // main.cpp-local special case that branches off into its own, main.cpp-
 // local subflow instead of the generic tree stack (see TipMenuStage/
 // tipCatalog further below), because the tip catalog is dynamic (no
@@ -247,11 +247,11 @@ void setAStepSetting(uint32_t v) {
   commitCurrentSettings();
 }
 
-// Children of "Sensor-Einst." -- "<Zurueck>" is deliberately the first entry
+// Children of "Sensor" -- "<Back>" is deliberately the first entry
 // (see Plan). Only Leaf fields are set, Branch fields (children/childCount)
 // remain 0/nullptr -- unused for Leaf/Back.
 const SettingsNode SETTINGS_SENSOR[] = {
-  { "<Zurueck>", SettingsNodeKind::Back },
+  { "<Back>", SettingsNodeKind::Back },
   { "Gain",  SettingsNodeKind::Leaf, 1, {AS7341_GAIN_COUNT}, AS7341_GAIN_COUNT - 1, gainSettingLabel, getGainSetting, setGainSetting },
   // ATIME (uint8_t, max 255): 3 decimal digits, leading digit 0-2.
   { "ATIME", SettingsNodeKind::Leaf, 3, {3, 10, 10},         255,                  nullptr,          getATimeSetting, setATimeSetting },
@@ -259,15 +259,15 @@ const SettingsNode SETTINGS_SENSOR[] = {
   { "ASTEP", SettingsNodeKind::Leaf, 5, {7, 10, 10, 10, 10}, 65535,                nullptr,          getAStepSetting, setAStepSetting },
 };
 
-// Children of "Optical-Einst." -- filter, sensor settings AND tips (tip
+// Children of "Optical" -- filter, sensor settings AND tips (tip
 // selection affects only optical, so it belongs in here rather than at
 // the root -- see Plan/context: this keeps the tree and JSON structure
 // congruent).
 const SettingsNode SETTINGS_OPTICAL[] = {
-  { "<Zurueck>",     SettingsNodeKind::Back },
-  { "Messspitzen",   SettingsNodeKind::TipList, 0, {}, 0, nullptr, nullptr, nullptr, nullptr, 0 },
-  { "Filter",        SettingsNodeKind::Leaf,   1, {3}, 2, filterSettingLabel, getFilterSetting, setFilterSetting },
-  { "Sensor-Einst.", SettingsNodeKind::Branch, 0, {},  0, nullptr, nullptr, nullptr,
+  { "<Back>", SettingsNodeKind::Back },
+  { "Tips",   SettingsNodeKind::TipList, 0, {}, 0, nullptr, nullptr, nullptr, nullptr, 0 },
+  { "Filter", SettingsNodeKind::Leaf,   1, {3}, 2, filterSettingLabel, getFilterSetting, setFilterSetting },
+  { "Sensor", SettingsNodeKind::Branch, 0, {},  0, nullptr, nullptr, nullptr,
     SETTINGS_SENSOR, sizeof(SETTINGS_SENSOR) / sizeof(SETTINGS_SENSOR[0]) },
 };
 
@@ -275,7 +275,7 @@ const SettingsNode SETTINGS_OPTICAL[] = {
 // accepted (see Plan/context), preferable to a UI level that wouldn't
 // correspond to the JSON schema.
 const SettingsNode SETTINGS_ROOT[] = {
-  { "Optical-Einst.", SettingsNodeKind::Branch, 0, {}, 0, nullptr, nullptr, nullptr,
+  { "Optical", SettingsNodeKind::Branch, 0, {}, 0, nullptr, nullptr, nullptr,
     SETTINGS_OPTICAL, sizeof(SETTINGS_OPTICAL) / sizeof(SETTINGS_OPTICAL[0]) },
 };
 
@@ -289,14 +289,14 @@ static const uint8_t SETTINGS_TREE_MAX_DEPTH = 4;  // root + 3 levels reserved f
 SettingsLevel settingsStack[SETTINGS_TREE_MAX_DEPTH] = {
   { SETTINGS_ROOT, sizeof(SETTINGS_ROOT) / sizeof(SETTINGS_ROOT[0]), 0 }
 };
-uint8_t settingsDepth = 0;  // 0 == root -- no "<Zurueck>" there (see Plan/context)
+uint8_t settingsDepth = 0;  // 0 == root -- no "<Back>" there (see Plan/context)
 
 const SettingsNode& currentSettingsNode() {
   const SettingsLevel& lvl = settingsStack[settingsDepth];
   return lvl.nodes[lvl.index];
 }
 
-// ------------------------- Messspitzen-Unterfluss -------------------------
+// ------------------------- Tip subflow -------------------------
 // Its own small state instead of being part of the generic tree stack (see
 // the SettingsNodeKind::TipList comment above) -- only 3 levels, no
 // dedicated stack needed. Closed = we are NOT in the tip menu entry (the
@@ -305,7 +305,7 @@ const SettingsNode& currentSettingsNode() {
 // screen, no further cursor needed.
 enum class TipMenuStage : uint8_t { Closed, List, Detail, FingerprintStats };
 TipMenuStage tipMenuStage = TipMenuStage::Closed;
-// 0 = <Zurueck>, 1 = "Neue Spitze anlegen",
+// 0 = <Back>, 1 = "Create new tip",
 // TIP_LIST_FIXED_ENTRIES.. = tips[index-TIP_LIST_FIXED_ENTRIES].
 static const uint8_t TIP_LIST_FIXED_ENTRIES = 2;
 uint8_t tipListIndex = 0;
@@ -338,8 +338,8 @@ struct PendingWhiteDecision {
 };
 PendingWhiteDecision pendingWhite;
 // Cursor in the selection list of renderWhitePlausibilityConfirm(): 0..
-// suggestedTipIndices.size()-1 = a suggested tip, followed by "Als neue
-// Spitze", "Uebernehmen", "Verwerfen" (see there). Held as an index (not a
+// suggestedTipIndices.size()-1 = a suggested tip, followed by "As new
+// tip", "Accept", "Discard" (see there). Held as an index (not a
 // bool) so a variable number of entries is possible without restructuring
 // the cursor logic.
 uint8_t whiteConfirmIndex = 0;
@@ -347,7 +347,7 @@ uint8_t whiteConfirmIndex = 0;
 std::string nextTipName() {
   for (uint32_t n = 1; ; n++) {
     char buf[24];
-    snprintf(buf, sizeof(buf), "Messspitze %lu", (unsigned long)n);
+    snprintf(buf, sizeof(buf), "Tip %lu", (unsigned long)n);
     if (!tipCatalog.find(buf)) return buf;
   }
 }
@@ -437,7 +437,7 @@ const char* calibrationTargetLabel(CalibrationTarget t) {
 }
 
 // Returns the mode abbreviation appropriate for the current display (e.g.
-// the "MESSUNG" screen) -- in Calibration mode that of the currently
+// the "MEASURING" screen) -- in Calibration mode that of the currently
 // selected reference (White/Dark), in Measure mode that of the currently
 // selected measurement mode (see MEASUREMENT_MODES), otherwise that of the
 // DisplayMode itself. Needed because showMeasuringScreen(), as a
@@ -593,8 +593,8 @@ void observeReference(std::vector<SettingsRefState>& states, const MeasurementRe
   states.push_back(s);
 }
 
-// Beim jetzigen Stand von 'states' fuer 'settings' geltende Referenz --
-// nullptr, falls dafuer noch nie etwas gemessen wurde.
+// Reference that currently applies to 'settings' given the present state of
+// 'states' -- nullptr if nothing has ever been measured for it.
 const SettingsRefState* findRefState(const std::vector<SettingsRefState>& states, const OpticalSettings& settings) {
   for (const SettingsRefState& s : states) if (s.settings == settings) return &s;
   return nullptr;
@@ -733,28 +733,28 @@ void renderExportStatus() {
   display.setTextSize(1);
 
   display.setCursor(0, 0);
-  display.println("Export-Modus");
+  display.println("Export mode");
 
   display.setCursor(0, 10);
-  display.println(exportPage == ExportPage::Debug ? "Modus: Debug" : "Modus: Normal");
+  display.println(exportPage == ExportPage::Debug ? "Mode: Debug" : "Mode: Normal");
 
   display.setCursor(0, 20);
   if (!bleExporter.isActive()) {
-    display.println("Trigger: BLE an");
+    display.println("Trigger: BLE on");
   } else if (bleExporter.isConnected()) {
-    display.println("BLE: verbunden");
+    display.println("BLE: connected");
   } else {
-    display.println("BLE: warte...");
+    display.println("BLE: waiting...");
   }
 
   char line[24];
-  snprintf(line, sizeof(line), "%u Messungen", (unsigned)historyStore.count());
+  snprintf(line, sizeof(line), "%u measurements", (unsigned)historyStore.count());
   display.setCursor(0, 30);
   display.println(line);
 
   if (exportSending) {
     display.setCursor(0, 40);
-    display.println("sende...");
+    display.println("sending...");
     int barX = 4, barY = 50, barW = OLED_WIDTH - 8, barH = 10;
     display.drawRect(barX, barY, barW, barH, SSD1306_WHITE);
     int fillW = exportTotalBytes
@@ -763,12 +763,12 @@ void renderExportStatus() {
     if (fillW > 0) display.fillRect(barX + 1, barY + 1, fillW, barH - 2, SSD1306_WHITE);
   } else if (exportHint) {
     display.setCursor(0, 42);
-    display.println("Kein Handy");
-    display.println("verbunden!");
+    display.println("No phone");
+    display.println("connected!");
   } else if (exportSentOk) {
     display.setTextSize(2);
     display.setCursor(0, 46);
-    display.println("gesendet");
+    display.println("sent");
   }
 
   display.display();
@@ -794,7 +794,7 @@ void renderReferenceStatus() {
 
   bool isWhite = (calibrationTarget == CalibrationTarget::White);
   display.setCursor(0, 0);
-  display.println(isWhite ? "Weiss-Referenz" : "Dunkel-Referenz");
+  display.println(isWhite ? "White reference" : "Dark reference");
 
   const Measurement& ref = isWhite ? whiteRef : darkRef;
   const OpticalSettings& refSettings = isWhite ? whiteRefSettings : darkRefSettings;
@@ -802,8 +802,8 @@ void renderReferenceStatus() {
 
   if (!refValid) {
     display.setCursor(0, 16);
-    display.println("keine Messung");
-    display.println("Trigger halten");
+    display.println("no measurement");
+    display.println("Hold trigger");
   } else {
     // Deliberately WITHOUT a filter/gain/ATIME/ASTEP summary here -- it took
     // up too much space and offered little added value for this screen (the
@@ -850,11 +850,11 @@ void renderInfoStatus() {
   uint32_t hh = totalSec / 3600;
   uint32_t mm = (totalSec % 3600) / 60;
   char line[24];
-  snprintf(line, sizeof(line), "Betrieb: %lu:%02lu", (unsigned long)hh, (unsigned long)mm);
+  snprintf(line, sizeof(line), "Uptime: %lu:%02lu", (unsigned long)hh, (unsigned long)mm);
   display.setCursor(0, 20);
   display.println(line);
 
-  snprintf(line, sizeof(line), "Messungen: %lu", (unsigned long)uptimeLogger.measurementCount());
+  snprintf(line, sizeof(line), "Measurements: %lu", (unsigned long)uptimeLogger.measurementCount());
   display.setCursor(0, 32);
   display.println(line);
 
@@ -868,7 +868,7 @@ void renderInfoStatus() {
 // Third "page" of export mode: deletes the persisted history, but only
 // after a LONG trigger press (see loop()) -- a short press here
 // deliberately does nothing, hence the hint text. After deletion, the same
-// page immediately shows "0 Messungen" -- that is the success feedback.
+// page immediately shows "0 measurements" -- that is the success feedback.
 void renderExportClear() {
   if (!displayOk) return;
   display.clearDisplay();
@@ -876,17 +876,17 @@ void renderExportClear() {
   display.setTextSize(1);
 
   display.setCursor(0, 0);
-  display.println("Verlauf loeschen?");
+  display.println("Clear history?");
 
   char line[24];
-  snprintf(line, sizeof(line), "%u Messungen", (unsigned)historyStore.count());
+  snprintf(line, sizeof(line), "%u measurements", (unsigned)historyStore.count());
   display.setCursor(0, 16);
   display.println(line);
 
   display.setCursor(0, 32);
-  display.println("Trigger halten");
+  display.println("Hold trigger");
   display.setCursor(0, 42);
-  display.println("zum Loeschen");
+  display.println("to clear");
 
   display.display();
 }
@@ -934,7 +934,7 @@ void renderSettingsStatus() {
     // from SETTINGS[currentSettingIndex].
     const SettingsNode& s = currentSettingsNode();
     display.setCursor(0, 0);
-    display.println("Einstellungen");
+    display.println("Settings");
     display.setCursor(0, 20);
     display.print(s.name);
     display.println(":");
@@ -976,7 +976,7 @@ void renderSettingsStatus() {
   }
 
   // Tree navigation (not editing): list of all siblings of the current
-  // level with a ">" cursor. Title is "Einstellungen" at the root,
+  // level with a ">" cursor. Title is "Settings" at the root,
   // otherwise the name of the branch node that was descended from
   // (breadcrumb). If not all siblings fit on the display, a scroll window
   // of VISIBLE_ROWS rows keeps the cursor as centered as possible (clamps
@@ -984,7 +984,7 @@ void renderSettingsStatus() {
   const SettingsLevel& lvl = settingsStack[settingsDepth];
   display.setCursor(0, 0);
   if (settingsDepth == 0) {
-    display.println("Einstellungen");
+    display.println("Settings");
   } else {
     const SettingsLevel& parent = settingsStack[settingsDepth - 1];
     display.println(parent.nodes[parent.index].name);
@@ -1031,12 +1031,12 @@ void renderSettingsStatus() {
   display.display();
 }
 
-// List of the tip menu entry: "<Zurueck>", "Neue Spitze anlegen", then all
-// tips (the active one with an " AKTIV" suffix). Same scroll window as the
+// List of the tip menu entry: "<Back>", "Create new tip", then all
+// tips (the active one with an " ACTIVE" suffix). Same scroll window as the
 // generic tree view (see computeScrollStart()).
 void renderTipList() {
   display.setCursor(0, 0);
-  display.println("Messspitzen");
+  display.println("Tips");
 
   uint8_t total = (uint8_t)(TIP_LIST_FIXED_ENTRIES + tipCatalog.tips.size());
   uint8_t start = computeScrollStart(tipListIndex, total, 4);
@@ -1045,13 +1045,13 @@ void renderTipList() {
   for (uint8_t i = start; i < start + 4 && i < total; i++) {
     char line[22];
     if (i == 0) {
-      snprintf(line, sizeof(line), "<Zurueck>");
+      snprintf(line, sizeof(line), "<Back>");
     } else if (i == 1) {
-      snprintf(line, sizeof(line), "Neue Spitze anlegen");
+      snprintf(line, sizeof(line), "Create new tip");
     } else {
       const MeasurementTip& t = tipCatalog.tips[i - TIP_LIST_FIXED_ENTRIES];
       snprintf(line, sizeof(line), "%s%s", t.name.c_str(),
-               (t.name == tipCatalog.active) ? " AKTIV" : "");
+               (t.name == tipCatalog.active) ? " ACTIVE" : "");
     }
     display.setCursor(0, y);
     display.print(i == tipListIndex ? "> " : "  ");
@@ -1070,10 +1070,10 @@ void renderTipList() {
   display.display();
 }
 
-// Detail menu of a single tip: name (+ "AKTIV" hint), below it the
-// available actions -- "Aktivieren"/"Loeschen" only for NON-active tips
-// (see Plan/context: the active tip cannot be deleted, "Aktivieren" would
-// be a no-op for it anyway), "Weiss-Fingerabdruck" (see
+// Detail menu of a single tip: name (+ "ACTIVE" hint), below it the
+// available actions -- "Activate"/"Delete" only for NON-active tips
+// (see Plan/context: the active tip cannot be deleted, "Activate" would
+// be a no-op for it anyway), "White fingerprint" (see
 // renderWhiteFingerprintStats()) for BOTH. Never more than 4 rows, no
 // scroll window needed.
 void renderTipDetail() {
@@ -1084,11 +1084,11 @@ void renderTipDetail() {
   display.println(tip.name.c_str());
   if (isActive) {
     display.setCursor(0, 10);
-    display.println("AKTIV");
+    display.println("ACTIVE");
   }
 
-  static const char* const ACTIVE_ACTIONS[]   = { "<Zurueck>", "Weiss-Fingerabdruck" };
-  static const char* const INACTIVE_ACTIONS[] = { "<Zurueck>", "Aktivieren", "Loeschen", "Weiss-Fingerabdruck" };
+  static const char* const ACTIVE_ACTIONS[]   = { "<Back>", "White fingerprint" };
+  static const char* const INACTIVE_ACTIONS[] = { "<Back>", "Activate", "Delete", "White fingerprint" };
   const char* const* actions = isActive ? ACTIVE_ACTIONS : INACTIVE_ACTIONS;
   uint8_t count = isActive ? 2 : 4;
 
@@ -1119,7 +1119,7 @@ static void splitScientific(float value, float& mantissa, int& exponent) {
   if (mantissa >= 9.995f) { mantissa /= 10.0f; exponent += 1; }
 }
 
-// "Weiss-Fingerabdruck" action from renderTipDetail(): mean + absolute
+// "White fingerprint" action from renderTipDetail(): mean + absolute
 // standard error per channel of THIS tip's own fingerprints, only over the
 // currently active sensor (see MeasurementTip::whiteFingerprintStats() --
 // other sensors are not comparable, see MeasurementTip::isPlausible()).
@@ -1142,7 +1142,7 @@ void renderWhiteFingerprintStats() {
 
   if (stats.n == 0) {
     display.setCursor(0, 10);
-    display.println("keine Messungen");
+    display.println("no measurements");
     display.display();
     return;
   }
@@ -1192,7 +1192,7 @@ void renderMeasureSelect() {
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(1);
   display.setCursor(0, 0);
-  display.println("Messmodus");
+  display.println("Measurement mode");
   int y = 16;
   for (uint8_t i = 0; i < MEASUREMENT_MODE_COUNT; i++) {
     display.setCursor(0, y);
@@ -1239,7 +1239,7 @@ void renderCurrentView() {
   // empty), there's nothing to freeze -- lastMeasurementSettings would then
   // still sit at its boot defaults, which would falsely register as a
   // mismatch against a calibration that's actually valid for OTHER settings
-  // ("nicht kalibriert" right after startup, even though a matching
+  // ("not calibrated" right after startup, even though a matching
   // reference is stored). In this case, therefore, check against
   // currentSettings instead (the actually relevant question: "would a
   // measurement started RIGHT NOW be validly calibrated").
@@ -1267,10 +1267,10 @@ void showMeasuringScreen(uint8_t current, uint8_t maxEstimate) {
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(2);
   display.setCursor(4, 8);
-  display.println("MESSUNG");
+  display.println("MEASURING");
   display.setTextSize(1);
   display.setCursor(0, 30);
-  display.print("Modus: ");
+  display.print("Mode: ");
   display.println(activeModeLabel());
 
   int barX = 4, barY = 44, barW = OLED_WIDTH - 8, barH = 10;
@@ -1317,16 +1317,16 @@ void renderNeedDarkFirstWarning() {
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(1);
   display.setCursor(0, 0);
-  display.println("Dunkelreferenz");
-  display.println("fehlt fuer diese");
-  display.println("Einstellungen");
+  display.println("Dark reference");
+  display.println("missing for these");
+  display.println("settings");
   display.display();
 }
 
 // Its own screen for a failed measurement attempt (empty Measurement from
 // spectrometer.performMeasurement()) -- stays up until the next action
 // (another trigger/Mode press) triggers a regular re-render, the same
-// pattern as e.g. the "gesendet"/"Kein Handy verbunden" feedback in export
+// pattern as e.g. the "sent"/"No phone connected" feedback in export
 // mode. Applies equally to all performMeasurement() callers
 // (Measure/Calibration) -- the cause is relevant regardless.
 void renderMeasurementError(MeasurementStatus status) {
@@ -1336,17 +1336,17 @@ void renderMeasurementError(MeasurementStatus status) {
   display.setTextSize(1);
 
   display.setCursor(0, 0);
-  display.println("Fehler");
+  display.println("Error");
 
   display.setCursor(0, 20);
   if (status == MeasurementStatus::NotConverged) {
-    display.println("Messung zu stark");
-    display.println("verrauscht");
-    display.println("Geraet ruhig halten");
-    display.println("und erneut versuchen");
+    display.println("Measurement too");
+    display.println("noisy");
+    display.println("Hold device still");
+    display.println("and try again");
   } else {
-    display.println("Sensor antwortet");
-    display.println("nicht");
+    display.println("Sensor not");
+    display.println("responding");
   }
 
   display.display();
@@ -1362,11 +1362,11 @@ void renderWhiteValidityWarning(const Measurement& raw, const MeasurementValidit
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(1);
   display.setCursor(0, 0);
-  display.println("Weiss ungueltig");
+  display.println("White invalid");
   display.setCursor(0, 9);
-  if (v.anyClipping && v.anyBelowNoiseFloor) display.println("klippt + zu dunkel");
-  else if (v.anyClipping) display.println("Kanal klippt");
-  else display.println("Kanal zu dunkel");
+  if (v.anyClipping && v.anyBelowNoiseFloor) display.println("clipping + too dark");
+  else if (v.anyClipping) display.println("Channel clipping");
+  else display.println("Channel too dark");
 
   const char* const* labels = spectrometer.measurementLabels();
   char line[27];
@@ -1393,8 +1393,8 @@ void renderWhiteValidityWarning(const Measurement& raw, const MeasurementValidit
 // whiteConfirmIndex, a short Mode press moves it, a long trigger press
 // selects -- see loop()): first all suggested OTHER tips for which the
 // measurement would be plausible (see pendingWhite.suggestedTipIndices/
-// TipCatalog::rankPlausibleTips()), then "Als neue Spitze", "Uebernehmen",
-// "Verwerfen". Same scroll scheme as renderTipList() (computeScrollStart(),
+// TipCatalog::rankPlausibleTips()), then "As new tip", "Accept",
+// "Discard". Same scroll scheme as renderTipList() (computeScrollStart(),
 // 4 visible rows, "^"/"v" indicators as needed).
 void renderWhitePlausibilityConfirm() {
   if (!displayOk) return;
@@ -1403,17 +1403,17 @@ void renderWhitePlausibilityConfirm() {
   display.setTextSize(1);
   display.setCursor(0, 0);
   if (pendingWhite.plausibility == PlausibilityResult::Implausible) {
-    display.println("Weiss weicht ab");
+    display.println("White differs");
     display.setCursor(0, 9);
-    display.println("von alten Werten");
+    display.println("from old values");
   } else {
-    display.println("Weiss unklar");
+    display.println("White unclear");
     display.setCursor(0, 9);
-    display.println("zu wenig Daten");
+    display.println("not enough data");
   }
 
   size_t sCount = pendingWhite.suggestedTipIndices.size();
-  uint8_t total = (uint8_t)(sCount + 3);  // suggestions + "Als neue Spitze" + Uebernehmen + Verwerfen
+  uint8_t total = (uint8_t)(sCount + 3);  // suggestions + "As new tip" + Accept + Discard
   const uint8_t VISIBLE_ROWS = 4;
   uint8_t start = computeScrollStart(whiteConfirmIndex, total, VISIBLE_ROWS);
 
@@ -1423,11 +1423,11 @@ void renderWhitePlausibilityConfirm() {
     if (i < sCount) {
       snprintf(line, sizeof(line), "%s", tipCatalog.tips[pendingWhite.suggestedTipIndices[i]].name.c_str());
     } else if (i == sCount) {
-      snprintf(line, sizeof(line), "Als neue Spitze");
+      snprintf(line, sizeof(line), "As new tip");
     } else if (i == sCount + 1) {
-      snprintf(line, sizeof(line), "Uebernehmen");
+      snprintf(line, sizeof(line), "Accept");
     } else {
-      snprintf(line, sizeof(line), "Verwerfen");
+      snprintf(line, sizeof(line), "Discard");
     }
     display.setCursor(0, y);
     display.print(i == whiteConfirmIndex ? "> " : "  ");
@@ -1448,7 +1448,7 @@ void renderWhitePlausibilityConfirm() {
 // Shared completion for an ACCEPTED measurement -- both for the direct
 // success case in performMeasurement() and for a white measurement
 // previously held back as Implausible/Indeterminate and then confirmed via
-// "Uebernehmen"/a suggested tip/"Als neue Spitze" (see pendingWhite/loop()).
+// "Accept"/a suggested tip/"As new tip" (see pendingWhite/loop()).
 // Writes lastMeasurement/-Settings, assigns the sample number, appends to
 // history, updates the dark/white reference including the fingerprint, and
 // re-determines 'calibrated'.
@@ -1505,7 +1505,7 @@ void finalizeMeasurement(Precision precision, SampleKind kind, const Measurement
   rec.relSemWorst = telemetry.relSemWorst;
   rec.semPerChannel = telemetry.semPerChannel;
   if (!historyStore.append(rec)) {
-    Serial.println("# history append failed (Flash voll?)");
+    Serial.println("# history append failed (flash full?)");
   }
 
   if (kind == SampleKind::Dark) {
@@ -1568,13 +1568,13 @@ bool performMeasurement(Precision precision, SampleKind kind) {
       // the sample budget is a useful diagnostic value when tuning
       // PRECISE_TARGET_REL_SEM/PRECISE_MAX_SAMPLES.
       if (!isnan(telemetry.relSemWorst)) {
-        Serial.printf("# Messung nicht konvergiert (%u Samples, letztes relSEM %.2f%%) -- Geraet ruhig halten und erneut versuchen\n",
+        Serial.printf("# Measurement did not converge (%u samples, last relSEM %.2f%%) -- hold device still and try again\n",
                       telemetry.sampleCount, telemetry.relSemWorst * 100.0f);
       } else {
-        Serial.println("# Messung nicht konvergiert -- Geraet ruhig halten und erneut versuchen");
+        Serial.println("# Measurement did not converge -- hold device still and try again");
       }
     } else {
-      Serial.println("# Sensorfehler bei der Messung");
+      Serial.println("# Sensor error during measurement");
     }
     busy = false;
     renderMeasurementError(telemetry.status);
@@ -1616,8 +1616,8 @@ bool performMeasurement(Precision precision, SampleKind kind) {
       pendingWhite.plausibility = plaus;
       // Maybe the measurement matches a DIFFERENT, already-known tip (e.g. a
       // physical tip swap without informing the device) -- offered in the
-      // confirmation screen BEFORE "Als neue Spitze"/"Uebernehmen"/
-      // "Verwerfen" (see renderWhitePlausibilityConfirm()).
+      // confirmation screen BEFORE "As new tip"/"Accept"/
+      // "Discard" (see renderWhitePlausibilityConfirm()).
       pendingWhite.suggestedTipIndices = active ? tipCatalog.rankPlausibleTips(candidate, active->name)
                                                  : std::vector<size_t>();
       whiteConfirmIndex = 0;
@@ -1706,7 +1706,7 @@ void cycleView() {
     }
     if (tipMenuStage == TipMenuStage::Detail) {
       bool isActive = (tipCatalog.tips[tipDetailIndex].name == tipCatalog.active);
-      // active: <Zurueck>/Weiss-Fingerabdruck; otherwise: <Zurueck>/Aktivieren/Loeschen/Weiss-Fingerabdruck.
+      // active: <Back>/White fingerprint; otherwise: <Back>/Activate/Delete/White fingerprint.
       uint8_t total = isActive ? 2 : 4;
       tipActionIndex = (tipActionIndex + 1) % total;
       renderCurrentView();
@@ -1835,7 +1835,7 @@ void setup() {
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(0, 0);
     display.println("Colorimeter");
-    display.println("startet ...");
+    display.println("starting ...");
     display.display();  // push immediately -- no "snow" frame visible anymore
   }
 
@@ -1852,7 +1852,7 @@ void setup() {
   calibrated = calibrationValidFor(currentSettings.optical);
 
   // Catalog never empty, see TipCatalog.h -- on the very first boot (or if
-  // the stored JSON is invalid) there's no tip yet: creates "Messspitze 1"
+  // the stored JSON is invalid) there's no tip yet: creates "Tip 1"
   // with the settings just loaded/defaults.
   if (!calStore.loadTips(tipCatalog)) {
     createTipFromCurrentSettings();
@@ -1864,7 +1864,7 @@ void setup() {
   if (!displayOk) {
     // Pure boot diagnostics on an error path -- never mixes with the actual
     // CSV export (which only starts later/live in loop()).
-    Serial.println("# SSD1306 nicht gefunden/initialisiert (Adresse 0x3C) - Display bleibt inaktiv");
+    Serial.println("# SSD1306 not found/initialized (address 0x3C) - display stays inactive");
   }
 
   if (!sensorImpl.begin()) {
@@ -1873,7 +1873,7 @@ void setup() {
   }
   sensorImpl.applySettings(currentSettings.optical);  // hardware matches the loaded state from the start
 
-  // Replaces the "startet ..." text from above once everything is
+  // Replaces the "starting ..." text from above once everything is
   // initialized -- currentDisplayMode/measurePage are already at their
   // defaults (Measure/Select), so this directly shows the measurement mode
   // selection instead of a separate "ready" intermediate screen.
@@ -1918,8 +1918,8 @@ void loop() {
     if (pendingWhite.active) {
       // User decides on a white measurement previously held back as
       // Implausible/Indeterminate (see performMeasurement()/
-      // renderWhitePlausibilityConfirm()): a suggested tip, "Als neue
-      // Spitze", "Uebernehmen", or "Verwerfen".
+      // renderWhitePlausibilityConfirm()): a suggested tip, "As new
+      // tip", "Accept", or "Discard".
       if (te == DebouncedButton::Event::LongPress) {
         size_t sCount = pendingWhite.suggestedTipIndices.size();
         if (whiteConfirmIndex < sCount) {
@@ -1936,7 +1936,7 @@ void loop() {
           busy = false;
           activateTip(target);
         } else if (whiteConfirmIndex == sCount) {
-          // "Als neue Spitze" -- reversed order: FIRST create+activate
+          // "As new tip" -- reversed order: FIRST create+activate
           // (does NOT change currentSettings.optical, see
           // createTipFromCurrentSettings()), ONLY THEN finalize (via the
           // default target path it automatically lands on the freshly
@@ -1946,12 +1946,12 @@ void loop() {
           finalizeMeasurement(pendingWhite.precision, SampleKind::White, pendingWhite.measurement, pendingWhite.telemetry);
           busy = false;
         } else if (whiteConfirmIndex == sCount + 1) {
-          // "Uebernehmen" -- for the active tip already flagged as implausible.
+          // "Accept" -- for the active tip already flagged as implausible.
           busy = true;
           finalizeMeasurement(pendingWhite.precision, SampleKind::White, pendingWhite.measurement, pendingWhite.telemetry);
           busy = false;
         }
-        // sCount+2 ("Verwerfen"): do nothing, the measurement stays discarded.
+        // sCount+2 ("Discard"): do nothing, the measurement stays discarded.
         pendingWhite = PendingWhiteDecision();  // release the state + held Measurement
         renderCurrentView();
       }
@@ -1977,8 +1977,8 @@ void loop() {
     // exceeded while holding (see Buttons.h) -- exactly like the Mode
     // button already does.
     if (tipMenuStage == TipMenuStage::List) {
-      // "<Zurueck>" leaves the tip menu entry (back into the generic tree,
-      // positioned on "Messspitzen"); "Neue Spitze anlegen" registers+
+      // "<Back>" leaves the tip menu entry (back into the generic tree,
+      // positioned on "Tips"); "Create new tip" registers+
       // activates immediately; every other entry opens the detail menu of
       // the selected tip.
       if (te == DebouncedButton::Event::LongPress) {
@@ -2008,7 +2008,7 @@ void loop() {
           tipListIndex = 0;
           tipMenuStage = TipMenuStage::List;
         } else if ((isActive && tipActionIndex == 1) || (!isActive && tipActionIndex == 3)) {
-          // "Weiss-Fingerabdruck" -- always the last entry of both lists
+          // "White fingerprint" -- always the last entry of both lists
           // (see renderTipDetail()).
           fingerprintStatsScroll = 0;
           tipMenuStage = TipMenuStage::FingerprintStats;
@@ -2017,14 +2017,14 @@ void loop() {
       }
     } else if (tipMenuStage == TipMenuStage::FingerprintStats) {
       // Pure display screen -- a long trigger press goes back to the detail
-      // menu (no "<Zurueck>" entry needed, since there is no cursor).
+      // menu (no "<Back>" entry needed, since there is no cursor).
       if (te == DebouncedButton::Event::LongPress) {
         tipMenuStage = TipMenuStage::Detail;
         renderCurrentView();
       }
     } else if (!editingActive) {
       // Outside of editing, a long trigger press acts differently depending
-      // on the node kind: "<Zurueck>" goes one level up, a navigation node
+      // on the node kind: "<Back>" goes one level up, a navigation node
       // one level down, a leaf starts editing (as before), TipList opens
       // the tip menu entry.
       if (te == DebouncedButton::Event::LongPress) {
