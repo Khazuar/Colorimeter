@@ -18,6 +18,7 @@
 #include "DisplayViews.h"
 #include "BleExporter.h"
 #include "ColorimetryTables.h"
+#include "DefaultColorDerivationModel.h"
 #include "UptimeLogger.h"
 #include "HistoryStore.h"
 #include "DigitEditor.h"
@@ -532,7 +533,7 @@ void appendCsvRow(std::string& out, const char* label, const Measurement& measur
       }
       if (idx >= 0) { snprintf(buf, sizeof(buf), "%.4f", spec.values[idx]); out += buf; }
     }
-    Lab lab = getColor(spec);
+    Lab lab = DefaultColorDerivationModel::instance().deriveColor(spec);
     LCh lch = labToLCh(lab);
     uint8_t r, g, b;
     labToSRGB255(lab, r, g, b);

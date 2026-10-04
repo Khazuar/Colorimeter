@@ -19,21 +19,6 @@ static const float D50_XN = 96.429568f;
 static const float D50_YN = 100.000000f;
 static const float D50_ZN = 82.510460f;
 
-// Integrates R(lambda) against CIE_CMF*CIE_D50_SPD into XYZ, normalized so that
-// a perfect diffuser (R=1 everywhere) maps to Y=100. R(lambda) is
-// reconstructed at each CIE_CMF sample point from ALL bands (weight
-// per band = a Gaussian curve around its center_nm with a width derived
-// from fwhm_nm) instead of interpolating linearly between band centers --
-// the AS7341 per-band sensitivity curves are themselves nearly Gaussian
-// according to the datasheet, which reproduces the actual physical band shape
-// instead of replacing it with straight line segments. In the overlapping core
-// region of the bands this yields a true weighted average; outside the
-// bands it is strictly normalized, so R(lambda) there holds the value of the
-// nearest band (see spectrumToXYZ). A constant spectrum therefore
-// yields an exactly neutral color.
-void spectrumToXYZ(const Band* bands, const float* values, int n,
-                    float& X, float& Y, float& Z);
-
 Lab  xyzToLab(float X, float Y, float Z);
 void xyzToSRGB255(float X, float Y, float Z, uint8_t& r, uint8_t& g, uint8_t& b);
 
@@ -52,10 +37,3 @@ struct LCh {
   float h;
 };
 LCh labToLCh(const Lab& lab);
-
-// Derives a Lab color from a sensor-independent Spectrum (Gaussian-
-// weighted CIE integration over band center +- width, see spectrumToXYZ).
-// Deliberately NOT part of the Spectrometer abstraction -- generic
-// color science, depends on no sensor details, only on the (already
-// calibrated) Spectrum.
-Lab getColor(const Spectrum& spectrum);

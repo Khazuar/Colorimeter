@@ -2,6 +2,7 @@
 #include <cmath>
 #include "AS7341Math.h"
 #include "ColorimetryTables.h"
+#include "DefaultColorDerivationModel.h"
 
 void setUp() {}
 void tearDown() {}
