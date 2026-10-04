@@ -77,6 +77,7 @@ static bool readOpticalFields(JsonVariantConst source, FilterState& fs, SensorSe
 static String serializeRootSettings(const RootSettings& s) {
   JsonDocument doc;
   writeOpticalFields(doc["optical"].to<JsonObject>(), s.optical.filterState, s.optical.sensor);
+  doc["colorModel"] = s.colorModel;
   // future: add further RootSettings groups here as additional top-level keys
   String out;
   serializeJson(doc, out);
@@ -88,6 +89,10 @@ static bool deserializeRootSettings(const String& json, RootSettings& out) {
   JsonDocument doc;
   bool ok = (deserializeJson(doc, json) == DeserializationError::Ok);
   if (ok) ok = readOpticalFields(doc["optical"], result.optical.filterState, result.optical.sensor);
+  // Tolerant on its own (unlike the strict all-or-nothing optical fields
+  // above): a settings blob saved before this field existed simply has no
+  // "colorModel" key, which should not invalidate the whole document.
+  if (ok) result.colorModel = (const char*)(doc["colorModel"] | "Default");
   out = ok ? result : RootSettings();
   return ok;
 }

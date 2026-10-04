@@ -1,7 +1,7 @@
 #include "DisplayViews.h"
 #include "AppConfig.h"
 #include "ColorimetryTables.h"
-#include "DefaultColorDerivationModel.h"
+#include "ColorDerivationModelRegistry.h"
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -47,7 +47,7 @@ static void renderColorInfo(Adafruit_SSD1306& d, const ViewContext& ctx) {
     renderNoMeasurementYet(d);
   } else {
     Spectrum spec = ctx.spectrometer.getSpectrum(ctx.measurement, ctx.whiteReference, ctx.darkReference, ctx.filterState);
-    Lab lab = DefaultColorDerivationModel::instance().deriveColor(spec);
+    Lab lab = ColorDerivationModelRegistry::instance().active().deriveColor(spec);
     LCh lch = labToLCh(lab);
     uint8_t r, g, b;
     labToSRGB255(lab, r, g, b);

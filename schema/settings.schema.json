@@ -37,6 +37,10 @@
       },
       "required": ["filter", "sensor"],
       "additionalProperties": false
+    },
+    "colorModel": {
+      "type": "string",
+      "description": "Name of the selected entry in the firmware's ColorDerivationModelRegistry. Falls back to \"Default\" if missing or not recognized by the running firmware."
     }
   },
   "required": ["optical"],

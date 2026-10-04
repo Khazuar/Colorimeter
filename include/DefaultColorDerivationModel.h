@@ -24,13 +24,9 @@ void spectrumToXYZ(const Band* bands, const float* values, int n,
 // (ColorimetryTables::xyzToLab). Meant as the always-selectable fallback
 // once multiple ColorDerivationModels exist. Sensor-independent: operates
 // only on the already sensor-abstracted Spectrum (bands + values), not on
-// any concrete sensor's raw channels.
+// any concrete sensor's raw channels. Not a singleton itself -- instantiated
+// exactly once by ColorDerivationModelRegistry at boot (see main.cpp::setup()).
 class DefaultColorDerivationModel : public ColorDerivationModel {
 public:
-  static DefaultColorDerivationModel& instance();
-
   Lab deriveColor(const Spectrum& spectrum) const override;
-
-private:
-  DefaultColorDerivationModel() = default;
 };

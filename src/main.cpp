@@ -6,6 +6,7 @@
 #include <cmath>
 #include <string>
 #include <algorithm>
+#include <memory>
 
 #include "AppConfig.h"
 #include "FirmwareRevision.h"
@@ -19,6 +20,7 @@
 #include "BleExporter.h"
 #include "ColorimetryTables.h"
 #include "DefaultColorDerivationModel.h"
+#include "ColorDerivationModelRegistry.h"
 #include "UptimeLogger.h"
 #include "HistoryStore.h"
 #include "DigitEditor.h"
@@ -175,15 +177,16 @@ const char* precisionCsvLabel(Precision p) {
 // instead of a flat list -- its shape follows RootSettings/AppConfig.h.
 // A node is either a leaf (editable value, like SettingDescriptor before),
 // a navigation node (goes one level deeper via a long trigger press),
-// the fictitious "<Back>" entry (goes one level up), OR TipList -- a
-// main.cpp-local special case that branches off into its own, main.cpp-
-// local subflow instead of the generic tree stack (see TipMenuStage/
-// tipCatalog further below), because the tip catalog is dynamic (no
-// compile-time-fixed child list). A node ALWAYS carries all fields, even
-// if only part of them is used depending on 'kind' -- the same pragmatism
-// as before with SettingDescriptor (there, e.g., valueLabel was only
-// populated when digitCount==1).
-enum class SettingsNodeKind : uint8_t { Leaf, Branch, Back, TipList };
+// the fictitious "<Back>" entry (goes one level up), OR TipList/
+// ColorModelList -- main.cpp-local special cases that each branch off into
+// their own, main.cpp-local subflow instead of the generic tree stack (see
+// TipMenuStage/tipCatalog and colorModelListOpen/ColorDerivationModelRegistry
+// further below), because both the tip catalog and the color-model registry
+// are dynamic (no compile-time-fixed child list/count). A node ALWAYS
+// carries all fields, even if only part of them is used depending on 'kind'
+// -- the same pragmatism as before with SettingDescriptor (there, e.g.,
+// valueLabel was only populated when digitCount==1).
+enum class SettingsNodeKind : uint8_t { Leaf, Branch, Back, TipList, ColorModelList };
 
 struct SettingsNode {
   const char* name;
@@ -273,12 +276,13 @@ const SettingsNode SETTINGS_OPTICAL[] = {
     SETTINGS_SENSOR, sizeof(SETTINGS_SENSOR) / sizeof(SETTINGS_SENSOR[0]) },
 };
 
-// Root of the settings tree. Currently only ONE entry -- deliberately
-// accepted (see Plan/context), preferable to a UI level that wouldn't
-// correspond to the JSON schema.
+// Root of the settings tree: "Optical" (filter/sensor/tips) and
+// "ColorModel" (see ColorDerivationModelRegistry) as two separate thematic
+// groups, matching RootSettings' own two sibling fields.
 const SettingsNode SETTINGS_ROOT[] = {
   { "Optical", SettingsNodeKind::Branch, 0, {}, 0, nullptr, nullptr, nullptr,
     SETTINGS_OPTICAL, sizeof(SETTINGS_OPTICAL) / sizeof(SETTINGS_OPTICAL[0]) },
+  { "ColorModel", SettingsNodeKind::ColorModelList, 0, {}, 0, nullptr, nullptr, nullptr, nullptr, 0 },
 };
 
 // Navigation state in the settings tree: a small, fixed-size stack of
@@ -318,6 +322,15 @@ uint8_t tipActionIndex = 0;  // cursor in the detail screen's action list (see r
 // actual channel count), advanced by a short Mode press (see cycleView()).
 // Reset to 0 when the screen is entered.
 uint8_t fingerprintStatsScroll = 0;
+
+// ------------------------- ColorModel subflow -------------------------
+// Mirrors the Tip subflow above, but simpler: the color-model registry has
+// no create/delete/detail actions, just a flat list where a long trigger
+// press on an entry activates it immediately (see activateColorModel()/
+// loop()). No dedicated "stage" enum needed -- only one sub-screen exists.
+bool colorModelListOpen = false;
+uint8_t colorModelListIndex = 0;  // 0 = <Back>, 1.. = registry entries
+static const uint8_t COLOR_MODEL_LIST_FIXED_ENTRIES = 1;  // just <Back> -- models aren't user-creatable
 
 // A white measurement that passed checkValidity() but, according to
 // MeasurementTip::isPlausible(), is Implausible/Indeterminate -- waits for
@@ -372,6 +385,15 @@ void activateTip(const MeasurementTip& tip) {
   currentSettings.optical = tip.optical;
   sensorImpl.applySettings(currentSettings.optical);
   tipCatalog.active = tip.name;
+  commitCurrentSettings();
+}
+
+// Mirrors activateTip(): makes 'name' the active color derivation model,
+// both live (registry, actually consulted by appendCsvRow()/renderColorInfo())
+// and persisted (RootSettings, so it survives a reboot).
+void activateColorModel(const std::string& name) {
+  ColorDerivationModelRegistry::instance().setActive(name);
+  currentSettings.colorModel = name;
   commitCurrentSettings();
 }
 
@@ -533,7 +555,7 @@ void appendCsvRow(std::string& out, const char* label, const Measurement& measur
       }
       if (idx >= 0) { snprintf(buf, sizeof(buf), "%.4f", spec.values[idx]); out += buf; }
     }
-    Lab lab = DefaultColorDerivationModel::instance().deriveColor(spec);
+    Lab lab = ColorDerivationModelRegistry::instance().active().deriveColor(spec);
     LCh lch = labToLCh(lab);
     uint8_t r, g, b;
     labToSRGB255(lab, r, g, b);
@@ -704,6 +726,18 @@ std::string buildHistoryCsv(bool includeRaw) {
   snprintf(revisionLine, sizeof(revisionLine), "firmware_revision,%s\n",
            FIRMWARE_REVISION);
   out += revisionLine;
+
+  // Which ColorDerivationModel produced the Lab/C*/h*/hex columns below --
+  // the model ACTIVE AT EXPORT TIME, not necessarily the one active when
+  // each row was originally recorded (rows are always recomputed from raw
+  // data live, same as calibration/reflectance already were before this).
+  // Deliberately not tracked per row -- out of scope for now, revisit if
+  // that historical distinction ever actually matters once a second model
+  // exists.
+  char colorModelLine[64];
+  snprintf(colorModelLine, sizeof(colorModelLine), "color_model,%s\n",
+           ColorDerivationModelRegistry::instance().activeName().c_str());
+  out += colorModelLine;
 
   CsvBuildCtx ctx{ &out, includeRaw, &bandColumns, {} };
   historyStore.forEach(appendRecordToCsv, &ctx);
@@ -926,6 +960,7 @@ uint8_t computeScrollStart(uint8_t selected, uint8_t count, uint8_t visible) {
 void renderTipList();
 void renderTipDetail();
 void renderWhiteFingerprintStats();
+void renderColorModelList();
 
 // Forward declaration: defined below (closer to performMeasurement(), which
 // populates the associated pendingWhite state), but already needed by
@@ -941,6 +976,7 @@ void renderSettingsStatus() {
   if (tipMenuStage == TipMenuStage::List)   { renderTipList();   return; }
   if (tipMenuStage == TipMenuStage::Detail) { renderTipDetail(); return; }
   if (tipMenuStage == TipMenuStage::FingerprintStats) { renderWhiteFingerprintStats(); return; }
+  if (colorModelListOpen) { renderColorModelList(); return; }
 
   if (editingActive) {
     // Digit/option editing of a leaf -- UNCHANGED compared to the earlier
@@ -1017,10 +1053,11 @@ void renderSettingsStatus() {
       else snprintf(val, sizeof(val), "%lu", (unsigned long)n.getValue());
       val[sizeof(val) - 1] = '\0';
       snprintf(line, sizeof(line), "%-10.10s%s", n.name, val);
-    } else if (n.kind == SettingsNodeKind::Branch || n.kind == SettingsNodeKind::TipList) {
-      // Both go one level deeper via a long trigger press (TipList into the
-      // tip subflow instead of the generic tree) -- visually
-      // indistinguishable, ">" indicates "leads further in".
+    } else if (n.kind == SettingsNodeKind::Branch || n.kind == SettingsNodeKind::TipList
+               || n.kind == SettingsNodeKind::ColorModelList) {
+      // All three go one level deeper via a long trigger press (TipList/
+      // ColorModelList into their own subflow instead of the generic tree)
+      // -- visually indistinguishable, ">" indicates "leads further in".
       snprintf(line, sizeof(line), "%-10.10s>", n.name);
     } else {
       snprintf(line, sizeof(line), "%s", n.name);
@@ -1069,6 +1106,46 @@ void renderTipList() {
     }
     display.setCursor(0, y);
     display.print(i == tipListIndex ? "> " : "  ");
+    display.println(line);
+    y += 10;
+  }
+  if (start > 0) {
+    display.setCursor(122, 0);
+    display.print("^");
+  }
+  if (start + 4 < total) {
+    display.setCursor(122, 56);
+    display.print("v");
+  }
+
+  display.display();
+}
+
+// List of the ColorModel menu entry: "<Back>", then every registered
+// ColorDerivationModel (the active one with an " ACTIVE" suffix) -- same
+// scroll window as the generic tree view and the tip list (see
+// computeScrollStart()). No "create new" entry -- unlike tips, models are
+// not user-creatable.
+void renderColorModelList() {
+  display.setCursor(0, 0);
+  display.println("ColorModel");
+
+  ColorDerivationModelRegistry& registry = ColorDerivationModelRegistry::instance();
+  uint8_t total = (uint8_t)(COLOR_MODEL_LIST_FIXED_ENTRIES + registry.count());
+  uint8_t start = computeScrollStart(colorModelListIndex, total, 4);
+
+  int y = 16;
+  for (uint8_t i = start; i < start + 4 && i < total; i++) {
+    char line[22];
+    if (i == 0) {
+      snprintf(line, sizeof(line), "<Back>");
+    } else {
+      const std::string& name = registry.nameAt(i - COLOR_MODEL_LIST_FIXED_ENTRIES);
+      snprintf(line, sizeof(line), "%s%s", name.c_str(),
+               (name == registry.activeName()) ? " ACTIVE" : "");
+    }
+    display.setCursor(0, y);
+    display.print(i == colorModelListIndex ? "> " : "  ");
     display.println(line);
     y += 10;
   }
@@ -1731,6 +1808,12 @@ void cycleView() {
       renderCurrentView();
       return;
     }
+    if (colorModelListOpen) {
+      uint8_t total = (uint8_t)(COLOR_MODEL_LIST_FIXED_ENTRIES + ColorDerivationModelRegistry::instance().count());
+      colorModelListIndex = (colorModelListIndex + 1) % total;
+      renderCurrentView();
+      return;
+    }
     SettingsLevel& lvl = settingsStack[settingsDepth];
     lvl.index = (lvl.index + 1) % lvl.count;
     renderCurrentView();
@@ -1792,6 +1875,7 @@ void cycleMode() {
     settingsDepth = 0;
     settingsStack[0] = { SETTINGS_ROOT, sizeof(SETTINGS_ROOT) / sizeof(SETTINGS_ROOT[0]), 0 };
     tipMenuStage = TipMenuStage::Closed;
+    colorModelListOpen = false;
   }
   if (currentDisplayMode == DisplayMode::Calibration && previous != DisplayMode::Calibration) {
     // Same consideration -- don't unknowingly land on "Dark".
@@ -1859,11 +1943,22 @@ void setup() {
   triggerBtn.begin();
   modeBtn.begin();
 
+  // Only "Default" for now -- future models would be registered here too,
+  // possibly data-driven (see ColorDerivationModelRegistry/Plan/context).
+  // Must happen before loadSettings() below tries to activate a persisted
+  // selection.
+  ColorDerivationModelRegistry::instance().registerModel(
+      "Default", std::unique_ptr<ColorDerivationModel>(new DefaultColorDerivationModel()));
+
   calStore.begin();
   calStore.loadDark(darkRef, darkRefSem, darkRefSettings);
   calStore.loadWhite(whiteRef, whiteRefSem, whiteRefSettings);
   calStore.loadSettings(currentSettings);
   calibrated = calibrationValidFor(currentSettings.optical);
+  // No-op (stays on "Default") if the persisted name isn't registered --
+  // e.g. a settings blob saved before this field existed, or a firmware
+  // downgrade.
+  ColorDerivationModelRegistry::instance().setActive(currentSettings.colorModel);
 
   // Catalog never empty, see TipCatalog.h -- on the very first boot (or if
   // the stored JSON is invalid) there's no tip yet: creates "Tip 1"
@@ -2036,6 +2131,22 @@ void loop() {
         tipMenuStage = TipMenuStage::Detail;
         renderCurrentView();
       }
+    } else if (colorModelListOpen) {
+      // "<Back>" closes the list (back into the generic tree, positioned on
+      // "ColorModel"); any other entry activates that model immediately --
+      // no detail/confirm step, unlike Tips, since there's only one possible
+      // action here. Stays ON the list afterward (re-rendering shows the
+      // updated " ACTIVE" marker), mirroring how activateTip() also returns
+      // to the Tips List stage rather than leaving the subflow entirely.
+      if (te == DebouncedButton::Event::LongPress) {
+        if (colorModelListIndex == 0) {
+          colorModelListOpen = false;
+        } else {
+          ColorDerivationModelRegistry& registry = ColorDerivationModelRegistry::instance();
+          activateColorModel(registry.nameAt(colorModelListIndex - COLOR_MODEL_LIST_FIXED_ENTRIES));
+        }
+        renderCurrentView();
+      }
     } else if (!editingActive) {
       // Outside of editing, a long trigger press acts differently depending
       // on the node kind: "<Back>" goes one level up, a navigation node
@@ -2063,6 +2174,11 @@ void loop() {
           case SettingsNodeKind::TipList:
             tipMenuStage = TipMenuStage::List;
             tipListIndex = 0;
+            renderCurrentView();
+            break;
+          case SettingsNodeKind::ColorModelList:
+            colorModelListOpen = true;
+            colorModelListIndex = 0;
             renderCurrentView();
             break;
         }

@@ -1,6 +1,7 @@
 #pragma once
 #include <Adafruit_AS7341.h>
 #include <cstdint>
+#include <string>
 #include "Spectrometer.h"  // FilterState (part of OpticalSettings, see below)
 
 // ------------------------- I2C / Bus -------------------------
@@ -112,7 +113,8 @@ struct OpticalSettings {
 // sibling fields -- NOT mixed into optical.
 struct RootSettings {
   OpticalSettings optical;
-  bool operator==(const RootSettings& o) const { return optical == o.optical; }
+  std::string colorModel = "Default";  // name in ColorDerivationModelRegistry
+  bool operator==(const RootSettings& o) const { return optical == o.optical && colorModel == o.colorModel; }
   bool operator!=(const RootSettings& o) const { return !(*this == o); }
 };
 

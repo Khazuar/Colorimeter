@@ -66,11 +66,6 @@ void spectrumToXYZ(const Band* bands, const float* values, int n,
   X *= scale; Y *= scale; Z *= scale;
 }
 
-DefaultColorDerivationModel& DefaultColorDerivationModel::instance() {
-  static DefaultColorDerivationModel inst;
-  return inst;
-}
-
 Lab DefaultColorDerivationModel::deriveColor(const Spectrum& spectrum) const {
   float X, Y, Z;
   spectrumToXYZ(spectrum.bands.data(), spectrum.values.data(), (int)spectrum.bands.size(), X, Y, Z);
