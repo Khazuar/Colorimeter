@@ -47,37 +47,72 @@ static void writeSensorFields(JsonVariant target, const SensorSettings& sensor) 
   target["gain"]  = gainCsvLabel(sensor.gain);
   target["atime"] = sensor.atime;
   target["astep"] = sensor.astep;
+  target["bandDefinitions"] = sensor.bandDefinitions;
 }
 
 static bool readSensorFields(JsonVariantConst source, SensorSettings& sensor) {
   bool ok = gainFromCsvLabel(source["gain"] | "", sensor.gain);
   if (ok && source["atime"].is<uint8_t>())  sensor.atime = source["atime"].as<uint8_t>();   else ok = false;
   if (ok && source["astep"].is<uint16_t>()) sensor.astep = source["astep"].as<uint16_t>();  else ok = false;
+  // Tolerant on its own (unlike the strict gain/atime/astep fields above):
+  // a settings blob saved before this field existed simply has no
+  // "bandDefinitions" key, which should not invalidate the whole document --
+  // there's no fixed enum left to validate against anyway (see
+  // RootSettings::bandDefinitionSets/main.cpp::resolveBandDefinitions(),
+  // which already has its own graceful fallback for an unrecognized name).
+  sensor.bandDefinitions = (const char*)(source["bandDefinitions"] | "AS7341 raw");
   return ok;
 }
 
-// Analogous for OpticalSettings (filter + sensor together) -- used for the
-// "optical" sub-object of RootSettings, a standalone OpticalSettings document
-// (dark/white references) AND one "optical" sub-object per measurement tip
-// catalog entry. See schema/settings.schema.json for the documented shape.
-static void writeOpticalFields(JsonVariant target, FilterState fs, const SensorSettings& sensor) {
-  target["filter"] = filterStateCsvLabel(fs);
-  writeSensorFields(target["sensor"].to<JsonObject>(), sensor);
+// Analogous for OpticalSettings (tip identity + sensor together) -- used for
+// the "optical" sub-object of RootSettings, a standalone OpticalSettings
+// document (dark/white references) AND one "optical" sub-object per
+// measurement tip catalog entry. See schema/settings.schema.json for the
+// documented shape.
+static void writeOpticalFields(JsonVariant target, const OpticalSettings& s) {
+  target["tipName"] = s.tipName;
+  writeSensorFields(target["sensor"].to<JsonObject>(), s.sensor);
 }
 
-// Robust field by field: any missing/unknown field fails -- the caller then
-// falls back completely to the respective struct default (no mixed state of
-// old/new value), the same philosophy as previously the binary size check,
-// just now field by field instead of "all or nothing".
-static bool readOpticalFields(JsonVariantConst source, FilterState& fs, SensorSettings& sensor) {
-  bool ok = filterStateFromCsvLabel(source["filter"] | "", fs);
-  return ok && readSensorFields(source["sensor"], sensor);
+// Robust field by field: any missing/unknown REQUIRED field fails -- the
+// caller then falls back completely to the respective struct default (no
+// mixed state of old/new value), the same philosophy as previously the
+// binary size check, just now field by field instead of "all or nothing".
+// tipName and the legacy "filter" translation below are deliberately NOT
+// part of 'ok' -- see their own comments.
+static bool readOpticalFields(JsonVariantConst source, OpticalSettings& out) {
+  out.tipName = (const char*)(source["tipName"] | "");
+  bool ok = readSensorFields(source["sensor"], out.sensor);
+  // Legacy migration: a blob saved before this change had the filter/
+  // band-definitions choice at "filter" (one level up from where it lives
+  // now, "sensor.bandDefinitions"), as one of "none"/"650nm"/"700nm" --
+  // translate to its exact semantic equivalent instead of silently
+  // resetting every existing device's choice to the uncorrected fallback.
+  if (source["filter"].is<const char*>()) {
+    std::string legacy = source["filter"].as<const char*>();
+    if (legacy == "none")        out.sensor.bandDefinitions = "AS7341 NIR-corrected";
+    else if (legacy == "650nm")  out.sensor.bandDefinitions = "AS7341 650nm filter";
+    else if (legacy == "700nm")  out.sensor.bandDefinitions = "AS7341 700nm filter";
+  }
+  return ok;
 }
 
 static String serializeRootSettings(const RootSettings& s) {
   JsonDocument doc;
-  writeOpticalFields(doc["optical"].to<JsonObject>(), s.optical.filterState, s.optical.sensor);
+  writeOpticalFields(doc["optical"].to<JsonObject>(), s.optical);
   doc["colorModel"] = s.colorModel;
+  JsonObject sets = doc["bandDefinitionSets"].to<JsonObject>();
+  for (const auto& kv : s.bandDefinitionSets) {
+    JsonArray bands = sets[kv.first].to<JsonObject>()["bands"].to<JsonArray>();
+    for (const VisBandDef& b : kv.second.bands) {
+      JsonObject bo = bands.add<JsonObject>();
+      bo["channelIndex"] = b.channelIndex;
+      bo["center_nm"] = b.center_nm;
+      bo["fwhm_nm"] = b.fwhm_nm;
+      bo["nirFactor"] = b.nirFactor;
+      bo["nirFactorErr"] = b.nirFactorErr;
+    }
+  }
   // future: add further RootSettings groups here as additional top-level keys
   String out;
   serializeJson(doc, out);
@@ -88,18 +123,38 @@ static bool deserializeRootSettings(const String& json, RootSettings& out) {
   RootSettings result;
   JsonDocument doc;
   bool ok = (deserializeJson(doc, json) == DeserializationError::Ok);
-  if (ok) ok = readOpticalFields(doc["optical"], result.optical.filterState, result.optical.sensor);
+  if (ok) ok = readOpticalFields(doc["optical"], result.optical);
   // Tolerant on its own (unlike the strict all-or-nothing optical fields
   // above): a settings blob saved before this field existed simply has no
   // "colorModel" key, which should not invalidate the whole document.
   if (ok) result.colorModel = (const char*)(doc["colorModel"] | "Default");
+  // Likewise tolerant: missing/malformed -> stays empty, seeded fresh by
+  // main.cpp::setup() (see there) -- one malformed set/band is dropped
+  // individually, not the whole document.
+  if (ok && doc["bandDefinitionSets"].is<JsonObject>()) {
+    for (JsonPair kv : doc["bandDefinitionSets"].as<JsonObject>()) {
+      if (!kv.value()["bands"].is<JsonArray>()) continue;
+      BandDefinitionSet set;
+      for (JsonObject bo : kv.value()["bands"].as<JsonArray>()) {
+        if (!bo["channelIndex"].is<uint8_t>() || !bo["center_nm"].is<float>() || !bo["fwhm_nm"].is<float>()) continue;
+        VisBandDef b;
+        b.channelIndex = bo["channelIndex"].as<uint8_t>();
+        b.center_nm = bo["center_nm"].as<float>();
+        b.fwhm_nm = bo["fwhm_nm"].as<float>();
+        b.nirFactor = bo["nirFactor"] | 0.0f;
+        b.nirFactorErr = bo["nirFactorErr"] | 0.0f;
+        set.bands.push_back(b);
+      }
+      if (!set.bands.empty()) result.bandDefinitionSets[kv.key().c_str()] = set;
+    }
+  }
   out = ok ? result : RootSettings();
   return ok;
 }
 
 static String serializeOpticalSettings(const OpticalSettings& s) {
   JsonDocument doc;
-  writeOpticalFields(doc.to<JsonObject>(), s.filterState, s.sensor);
+  writeOpticalFields(doc.to<JsonObject>(), s);
   String out;
   serializeJson(doc, out);
   return out;
@@ -109,7 +164,7 @@ static bool deserializeOpticalSettings(const String& json, OpticalSettings& out)
   OpticalSettings result;
   JsonDocument doc;
   bool ok = (deserializeJson(doc, json) == DeserializationError::Ok);
-  if (ok) ok = readOpticalFields(doc.as<JsonVariantConst>(), result.filterState, result.sensor);
+  if (ok) ok = readOpticalFields(doc.as<JsonVariantConst>(), result);
   out = ok ? result : OpticalSettings();
   return ok;
 }
@@ -125,7 +180,7 @@ static void serializeTipCatalog(const TipCatalog& c, Print& out) {
   for (const MeasurementTip& t : c.tips) {
     JsonObject o = arr.add<JsonObject>();
     o["name"] = t.name.c_str();
-    writeOpticalFields(o["optical"].to<JsonObject>(), t.optical.filterState, t.optical.sensor);
+    writeOpticalFields(o["optical"].to<JsonObject>(), t.optical);
     JsonArray fps = o["whiteFingerprints"].to<JsonArray>();
     for (const WhiteFingerprint& fp : t.whiteFingerprints) {
       JsonObject fpObj = fps.add<JsonObject>();
@@ -152,7 +207,7 @@ static bool deserializeTipCatalog(Stream& in, TipCatalog& out) {
     for (JsonObject o : doc["tips"].as<JsonArray>()) {
       MeasurementTip t;
       t.name = (const char*)(o["name"] | "");
-      if (t.name.empty() || !readOpticalFields(o["optical"], t.optical.filterState, t.optical.sensor)) {
+      if (t.name.empty() || !readOpticalFields(o["optical"], t.optical)) {
         ok = false;
         break;
       }

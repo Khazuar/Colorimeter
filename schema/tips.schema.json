@@ -17,9 +17,9 @@
             "type": "object",
             "title": "OpticalSettings",
             "properties": {
-              "filter": {
+              "tipName": {
                 "type": "string",
-                "enum": ["none", "650nm", "700nm"]
+                "description": "Equal to this tip's own 'name' above -- OpticalSettings is used unchanged as a whole everywhere (see settings.schema.json), so this field is always present, if redundant, here."
               },
               "sensor": {
                 "type": "object",
@@ -38,13 +38,17 @@
                     "type": "integer",
                     "minimum": 0,
                     "maximum": 65535
+                  },
+                  "bandDefinitions": {
+                    "type": "string",
+                    "description": "Name of a band-definition set known to the device -- see settings.schema.json's RootSettings.bandDefinitionSets (a device-level map, NOT duplicated here)."
                   }
                 },
                 "required": ["gain", "atime", "astep"],
                 "additionalProperties": false
               }
             },
-            "required": ["filter", "sensor"],
+            "required": ["sensor"],
             "additionalProperties": false
           },
           "whiteFingerprints": {
@@ -72,6 +76,10 @@
                       "type": "integer",
                       "minimum": 0,
                       "maximum": 65535
+                    },
+                    "bandDefinitions": {
+                      "type": "string",
+                      "description": "Name of a band-definition set known to the device -- see settings.schema.json's RootSettings.bandDefinitionSets."
                     }
                   },
                   "required": ["gain", "atime", "astep"],

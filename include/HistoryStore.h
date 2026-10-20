@@ -15,7 +15,7 @@ struct MeasurementRecord {
   float tempC = 0.0f;         // ESP32 internal temperature sensor, degrees Celsius
   uint32_t sessionMs = 0;     // millis() at measurement time (runtime since this boot)
   uint32_t uptimeS = 0;       // UptimeLogger::totalSeconds() at measurement time (LED age, lifetime)
-  OpticalSettings settings;  // filter/gain/ATIME/ASTEP at measurement time
+  OpticalSettings settings;  // tip/gain/ATIME/ASTEP/band definitions at measurement time
 
   // Measurement mode + precision telemetry (see Spectrometer.h::MeasurementTelemetry).
   // sampleCount is always 1 for Precision::Single. relSemWorst is NAN when no

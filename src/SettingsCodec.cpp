@@ -2,22 +2,6 @@
 #include "AppConfig.h"
 #include <cstring>
 
-const char* filterStateCsvLabel(FilterState fs) {
-  switch (fs) {
-    case FilterState::Filter650nm: return "650nm";
-    case FilterState::Filter700nm: return "700nm";
-    default:                       return "none";
-  }
-}
-
-bool filterStateFromCsvLabel(const char* s, FilterState& out) {
-  if (!s) return false;
-  if (strcmp(s, "none") == 0)   { out = FilterState::None;        return true; }
-  if (strcmp(s, "650nm") == 0)  { out = FilterState::Filter650nm; return true; }
-  if (strcmp(s, "700nm") == 0)  { out = FilterState::Filter700nm; return true; }
-  return false;
-}
-
 // Order == as7341_gain_t (see Adafruit_AS7341.h), verified.
 static const char* const GAIN_LABELS[AS7341_GAIN_COUNT] = {
   "0.5X", "1X", "2X", "4X", "8X", "16X", "32X", "64X", "128X", "256X", "512X"

@@ -20,11 +20,12 @@ struct ViewContext {
   bool calibrated;                      // tracked by the orchestration
   const char* modeLabel;                // "S"/"P"/"W"/"D"/"E" for the corner display
   const char* lastLabel;                // e.g. "sample_03", "" if no measurement yet
-  // Filter that was actually in use at the time OF 'measurement' (NOT
-  // necessarily the one currently selected in Settings mode) -- see
+  // Band definitions that were actually in use at the time OF 'measurement'
+  // (NOT necessarily the ones currently selected in Settings mode) -- see
   // main.cpp::renderCurrentView() for the rationale behind this asymmetry
-  // relative to whiteReference/darkReference.
-  FilterState filterState;
+  // relative to whiteReference/darkReference. Already resolved by the
+  // caller (main.cpp::resolveBandDefinitions()) from a name to data.
+  const BandDefinitionSet& bandDefinitions;
 };
 
 using ViewRenderFn = void (*)(Adafruit_SSD1306& d, const ViewContext& ctx);

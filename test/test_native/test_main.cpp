@@ -4,6 +4,8 @@
 #include "ColorimetryTables.h"
 #include "DefaultColorDerivationModel.h"
 
+#include "MarqueeLabel.h"
+
 void setUp() {}
 void tearDown() {}
 
@@ -48,8 +50,37 @@ static void test_gray_neutral_no_filter() { assertNeutral(BANDS_NONE, 7); }
 static void test_gray_neutral_700nm()     { assertNeutral(BANDS_700NM, 8); }
 static void test_gray_neutral_650nm()     { assertNeutral(BANDS_650NM, 6); }
 
+// --- Marquee label ---------------------------------------------------------
+
+static void test_marquee_fits_never_moves() {
+  TEST_ASSERT_EQUAL_UINT32(0, marqueeOffset(10, 10, 99999));
+  TEST_ASSERT_EQUAL_UINT32(0, marqueeOffset(3, 10, 99999));
+  TEST_ASSERT_EQUAL_UINT32(0, marqueeOffset(30, 0, 99999));
+}
+
+static void test_marquee_start_delay_then_steps() {
+  // 14 chars in a 10-char window -> max offset 4.
+  TEST_ASSERT_EQUAL_UINT32(0, marqueeOffset(14, 10, 0));
+  TEST_ASSERT_EQUAL_UINT32(0, marqueeOffset(14, 10, 1999));
+  TEST_ASSERT_EQUAL_UINT32(0, marqueeOffset(14, 10, 2000));
+  TEST_ASSERT_EQUAL_UINT32(1, marqueeOffset(14, 10, 2250));
+  TEST_ASSERT_EQUAL_UINT32(4, marqueeOffset(14, 10, 3000));
+}
+
+static void test_marquee_end_hold_then_immediate_restart() {
+  // End reached at 3000 ms, held for 2000 ms, then back at 0 without a
+  // second start delay: the next step is visible STEP_MS after the jump.
+  TEST_ASSERT_EQUAL_UINT32(4, marqueeOffset(14, 10, 4999));
+  TEST_ASSERT_EQUAL_UINT32(0, marqueeOffset(14, 10, 5000));
+  TEST_ASSERT_EQUAL_UINT32(1, marqueeOffset(14, 10, 5250));
+  TEST_ASSERT_EQUAL_UINT32(4, marqueeOffset(14, 10, 6000));
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
+  RUN_TEST(test_marquee_fits_never_moves);
+  RUN_TEST(test_marquee_start_delay_then_steps);
+  RUN_TEST(test_marquee_end_hold_then_immediate_restart);
   RUN_TEST(test_full_scale_everyday_settings);
   RUN_TEST(test_full_scale_capped);
   RUN_TEST(test_full_scale_minimum);

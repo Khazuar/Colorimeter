@@ -46,7 +46,7 @@ static void renderColorInfo(Adafruit_SSD1306& d, const ViewContext& ctx) {
   } else if (ctx.measurement.empty()) {
     renderNoMeasurementYet(d);
   } else {
-    Spectrum spec = ctx.spectrometer.getSpectrum(ctx.measurement, ctx.whiteReference, ctx.darkReference, ctx.filterState);
+    Spectrum spec = ctx.spectrometer.getSpectrum(ctx.measurement, ctx.whiteReference, ctx.darkReference, ctx.bandDefinitions);
     Lab lab = ColorDerivationModelRegistry::instance().active().deriveColor(spec);
     LCh lch = labToLCh(lab);
     uint8_t r, g, b;
@@ -110,7 +110,7 @@ static void renderSpectrum(Adafruit_SSD1306& d, const ViewContext& ctx) {
     d.setCursor(0, 0);
     d.println("no measurement");
   } else {
-    Spectrum spec = ctx.spectrometer.getSpectrum(ctx.measurement, ctx.whiteReference, ctx.darkReference, ctx.filterState);
+    Spectrum spec = ctx.spectrometer.getSpectrum(ctx.measurement, ctx.whiteReference, ctx.darkReference, ctx.bandDefinitions);
     size_t n = spec.values.size();
     if (n > MAX_DISPLAYABLE_BANDS) n = MAX_DISPLAYABLE_BANDS;
 

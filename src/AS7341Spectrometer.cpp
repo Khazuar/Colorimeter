@@ -250,86 +250,18 @@ Measurement AS7341Spectrometer::performMeasurement(Precision precision, Progress
 }
 
 // Optical crosstalk: NIR light affects the VIS channels to varying
-// degrees -- WHICH channels are evaluable at all and with what
-// factor they need to be corrected depends on the IR-cut filter in
-// use (empirically determined via comparison measurements of the same
-// samples with/without the 650nm or 700nm filter). channelIndex refers to the
-// associated raw F1..F8 slot (0..7) -- the raw channel acquisition itself
-// remains unaffected by this.
-struct VisBandDef {
-  uint8_t channelIndex;
-  float center_nm;
-  float fwhm_nm;
-  float nirFactor;
-  float nirFactorErr;  // uncertainty of nirFactor -- basis of Spectrum::valueErrors
-};
+// degrees -- WHICH channels are evaluable at all and with what factor they
+// need to be corrected depends on the band-definition set in use (see
+// VisBandDef/BandDefinitionSet, Spectrometer.h -- data-driven, see
+// RootSettings::bandDefinitionSets/main.cpp::resolveBandDefinitions()).
+// channelIndex refers to the associated raw F1..F8 slot (0..7) -- the raw
+// channel acquisition itself remains unaffected by this.
 
-// No filter: F1-F7 correctable, F8 has a correction factor of unknown
-// magnitude -> omitted entirely instead of being output uncorrected.
-static const VisBandDef BANDS_NONE[] = {
-  { 0, 415.0f, 26.0f, 0.355f, 0.060f },  // F1
-  { 1, 445.0f, 30.0f, 0.109f, 0.019f },  // F2
-  { 2, 480.0f, 36.0f, 0.089f, 0.012f },  // F3
-  { 3, 515.0f, 39.0f, 0.036f, 0.007f },  // F4
-  { 4, 555.0f, 39.0f, 0.057f, 0.011f },  // F5
-  { 5, 590.0f, 40.0f, 0.0f,   0.12f  },  // F6
-  { 6, 630.0f, 50.0f, 0.0f,   0.0f   },  // F7
-};
-
-// 700nm filter: F1-F7 with more precise factors; F8 REDEFINED as its own
-// 674nm/45nm band instead of being discarded as a "truncated 680nm/52nm
-// channel" -- the 700nm cut filter makes this narrower, effectively used
-// sensitivity range NIR-free by construction (hence factor 0).
-static const VisBandDef BANDS_700NM[] = {
-  { 0, 415.0f, 26.0f, 0.125f, 0.045f },  // F1
-  { 1, 445.0f, 30.0f, 0.032f, 0.017f },  // F2
-  { 2, 480.0f, 36.0f, 0.024f, 0.013f },  // F3
-  { 3, 515.0f, 39.0f, 0.009f, 0.011f },  // F4
-  { 4, 555.0f, 39.0f, 0.026f, 0.014f },  // F5
-  { 5, 590.0f, 40.0f, 0.0f,   0.14f  },  // F6
-  { 6, 630.0f, 50.0f, 0.0f,   0.07f  },  // F7
-  { 7, 674.0f, 45.0f, 0.0f,   0.03f  },  // F8, redefined, NIR-free by construction, uncertainty geometrically determined (no clean sigmoid shape)
-};
-
-// 650nm filter: already blocks from 650nm onward -> F1-F6 NIR-free by
-// construction (factor 0), F7/F8 are dropped (the filter already cuts into
-// their actual sensitivity range, "not usable").
-// The uncertainty "0.0f" is an assumption that has not been further checked.
-// There is a lack of available methods to characterize this uncertainty.
-// However, the remaining "true" NIR component is fairly certainly negligible.
-// The remaining raw display value is caused by VIS crosstalk into the NIR channel.
-static const VisBandDef BANDS_650NM[] = {
-  { 0, 415.0f, 26.0f, 0.0f, 0.0f },  // F1
-  { 1, 445.0f, 30.0f, 0.0f, 0.0f },  // F2
-  { 2, 480.0f, 36.0f, 0.0f, 0.0f },  // F3
-  { 3, 515.0f, 39.0f, 0.0f, 0.0f },  // F4
-  { 4, 555.0f, 39.0f, 0.0f, 0.0f },  // F5
-  { 5, 590.0f, 40.0f, 0.0f, 0.0f },  // F6
-};
-
-static void bandsForFilterState(FilterState fs, const VisBandDef*& defs, size_t& count) {
-  switch (fs) {
-    case FilterState::Filter700nm:
-      defs = BANDS_700NM;
-      count = sizeof(BANDS_700NM) / sizeof(BANDS_700NM[0]);
-      break;
-    case FilterState::Filter650nm:
-      defs = BANDS_650NM;
-      count = sizeof(BANDS_650NM) / sizeof(BANDS_650NM[0]);
-      break;
-    default:
-      defs = BANDS_NONE;
-      count = sizeof(BANDS_NONE) / sizeof(BANDS_NONE[0]);
-      break;
-  }
-}
-
-uint8_t AS7341Spectrometer::relevantChannels(FilterState fs, uint8_t outIdx[N_CH]) const {
-  const VisBandDef* defs;
-  size_t n;
-  bandsForFilterState(fs, defs, n);
+uint8_t AS7341Spectrometer::relevantChannels(const BandDefinitionSet& bandDefinitions, uint8_t outIdx[N_CH]) const {
   uint8_t count = 0;
-  for (size_t i = 0; i < n && count < N_CH; i++) outIdx[count++] = defs[i].channelIndex;
+  for (size_t i = 0; i < bandDefinitions.bands.size() && count < N_CH; i++) {
+    outIdx[count++] = bandDefinitions.bands[i].channelIndex;
+  }
   return count;
 }
 
@@ -353,6 +285,7 @@ static const float SEPARATION_Z_THRESHOLD = 3.0f;
 
 MeasurementValidity AS7341Spectrometer::checkValidity(const Measurement& raw, const Measurement& rawSem,
                                                        const OpticalSettings& settings,
+                                                       const BandDefinitionSet& bandDefinitions,
                                                        const Measurement& darkMean, const Measurement& darkSem) const {
   MeasurementValidity result;
   if (raw.size() != N_CH) return result;  // ok bleibt false
@@ -369,7 +302,7 @@ MeasurementValidity AS7341Spectrometer::checkValidity(const Measurement& raw, co
   bool haveDark = (darkMean.size() == N_CH);
 
   uint8_t relIdx[N_CH];
-  uint8_t relCount = relevantChannels(settings.filterState, relIdx);
+  uint8_t relCount = relevantChannels(bandDefinitions, relIdx);
   for (uint8_t i = 0; i < relCount; i++) {
     uint8_t c = relIdx[i];
     if (raw[c] < MIN_QUANTIZATION_COUNTS) { result.anyBelowNoiseFloor = true; continue; }
@@ -397,7 +330,7 @@ Measurement AS7341Spectrometer::normalize(const Measurement& raw, const SensorSe
 void AS7341Spectrometer::computeReflectance(const Measurement& measurement,
                                              const Measurement& whiteReference,
                                              const Measurement& darkReference,
-                                             FilterState filterState,
+                                             const BandDefinitionSet& bandDefinitions,
                                              Spectrum& out) const {
   bool haveCal = (whiteReference.size() == N_CH && darkReference.size() == N_CH);
   bool haveMeasurement = (measurement.size() == N_CH);
@@ -414,16 +347,13 @@ void AS7341Spectrometer::computeReflectance(const Measurement& measurement,
 
   float R_nir = reflectance(N_CH - 1);
 
-  const VisBandDef* defs;
-  size_t n;
-  bandsForFilterState(filterState, defs, n);
-
+  size_t n = bandDefinitions.bands.size();
   out.bands.resize(n);
   out.values.resize(n);
   out.valueErrors.resize(n);
 
   for (size_t i = 0; i < n; i++) {
-    const VisBandDef& def = defs[i];
+    const VisBandDef& def = bandDefinitions.bands[i];
     out.bands[i] = Band{ def.center_nm, def.fwhm_nm };
 
     float rawR = reflectance(def.channelIndex);
@@ -446,8 +376,8 @@ void AS7341Spectrometer::computeReflectance(const Measurement& measurement,
 Spectrum AS7341Spectrometer::getSpectrum(const Measurement& measurement,
                                           const Measurement& whiteReference,
                                           const Measurement& darkReference,
-                                          FilterState filterState) const {
+                                          const BandDefinitionSet& bandDefinitions) const {
   Spectrum s;
-  computeReflectance(measurement, whiteReference, darkReference, filterState, s);
+  computeReflectance(measurement, whiteReference, darkReference, bandDefinitions, s);
   return s;
 }

@@ -47,11 +47,29 @@ struct Spectrum {
 
 enum class Precision : uint8_t { Single = 0, Precise = 1, COUNT = 2 };
 
-// Which physical (bandpass/cut) filter currently sits in front of the
-// sensor. A generic concept (any Spectrometer could support something like
-// this), even though the concrete values are currently only populated by
-// AS7341Spectrometer -- same pragmatism as with Precision::Single/Precise.
-enum class FilterState : uint8_t { None = 0, Filter650nm = 1, Filter700nm = 2, COUNT = 3 };
+// A single named band's definition within a BandDefinitionSet -- channelIndex
+// refers to a sensor-specific raw channel slot (meaning defined by each
+// Spectrometer implementation, e.g. AS7341Spectrometer's F1-F8, 0-7), the
+// rest mirrors Band (center_nm/fwhm_nm) plus an optional NIR-crosstalk
+// correction factor ("phi") and its uncertainty. Generic concept, even
+// though concrete values are currently only produced/consumed by
+// AS7341Spectrometer -- same pragmatism already applied to
+// SensorSettings's gain/atime/astep fields (see AppConfig.h).
+struct VisBandDef {
+  uint8_t channelIndex;
+  float center_nm;
+  float fwhm_nm;
+  float nirFactor;
+  float nirFactorErr;
+};
+
+// One named, selectable set of VisBandDefs -- what
+// RootSettings::bandDefinitionSets (see AppConfig.h) maps names to, and
+// what Spectrometer::getSpectrum()/checkValidity() take directly (already
+// resolved by the caller from a name) instead of a fixed enum.
+struct BandDefinitionSet {
+  std::vector<VisBandDef> bands;
+};
 
 // current: how many individual samples have already been taken; maxEstimate: upper
 // bound (with Precision::Precise possibly not exhausted, if convergence happens earlier).
@@ -104,9 +122,10 @@ struct MeasurementTelemetry {
 
 // Forward declarations instead of #include "AppConfig.h" -- avoids a
 // circular include (AppConfig.h already includes this header for
-// FilterState). References to an incomplete type are enough for a
-// pure method declaration; every implementation (e.g. AS7341Spectrometer.cpp)
-// sees the full definitions via its own #include "AppConfig.h".
+// BandDefinitionSet/VisBandDef). References to an incomplete type are
+// enough for a pure method declaration; every implementation (e.g.
+// AS7341Spectrometer.cpp) sees the full definitions via its own
+// #include "AppConfig.h".
 struct OpticalSettings;
 struct SensorSettings;
 
@@ -166,7 +185,7 @@ public:
   virtual Spectrum getSpectrum(const Measurement& measurement,
                                 const Measurement& whiteReference,
                                 const Measurement& darkReference,
-                                FilterState filterState) const = 0;
+                                const BandDefinitionSet& bandDefinitions) const = 0;
 
   // Checks a RAW measurement (e.g. a white reference) for reliability
   // -- e.g. channels that clip, fall below an ADC quantization
@@ -175,12 +194,15 @@ public:
   // the combined uncertainty of both measurements, see rawSem/darkSem).
   // darkMean/darkSem may be empty (e.g. no dark measurement
   // taken yet) -- in that case only the separation check is skipped, not the
-  // others. WHICH channels/thresholds are used in detail is
-  // up to the respective implementation. Callers (main.cpp) use ONLY
-  // this interface, never sensor-specific details -- prepared for a
-  // future second Spectrometer (e.g. AS7343).
+  // others. 'bandDefinitions' is already resolved by the caller (from
+  // settings.sensor.bandDefinitions) -- same reasoning as getSpectrum().
+  // WHICH channels/thresholds are used in detail is up to the respective
+  // implementation. Callers (main.cpp) use ONLY this interface, never
+  // sensor-specific details -- prepared for a future second Spectrometer
+  // (e.g. AS7343).
   virtual MeasurementValidity checkValidity(const Measurement& raw, const Measurement& rawSem,
                                              const OpticalSettings& settings,
+                                             const BandDefinitionSet& bandDefinitions,
                                              const Measurement& darkMean, const Measurement& darkSem) const = 0;
 
   // Raw value normalized to gain/integration time (sensor-specific

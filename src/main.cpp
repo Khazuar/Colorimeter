@@ -7,6 +7,7 @@
 #include <string>
 #include <algorithm>
 #include <memory>
+#include <iterator>
 
 #include "AppConfig.h"
 #include "FirmwareRevision.h"
@@ -24,6 +25,7 @@
 #include "UptimeLogger.h"
 #include "HistoryStore.h"
 #include "DigitEditor.h"
+#include "MarqueeLabel.h"
 
 // ------------------------- Display -------------------------
 Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
@@ -59,6 +61,21 @@ RootSettings currentSettings;
 bool calibrationValidFor(const OpticalSettings& s) {
   return !darkRef.empty() && !whiteRef.empty()
       && darkRefSettings == s && whiteRefSettings == s;
+}
+
+// Looks up 'name' in currentSettings.bandDefinitionSets; falls back to a
+// hardcoded "AS7341 raw" definition if not found (stale/corrupted name) --
+// getSpectrum() must never be left with nothing to use. Independent of
+// whether the seeded "AS7341 raw" map entry still exists/is unedited.
+const BandDefinitionSet& resolveBandDefinitions(const std::string& name) {
+  auto it = currentSettings.bandDefinitionSets.find(name);
+  if (it != currentSettings.bandDefinitionSets.end()) return it->second;
+  static const BandDefinitionSet rawFallback = { {
+    {0,415.0f,26.0f,0.0f,0.0f}, {1,445.0f,30.0f,0.0f,0.0f}, {2,480.0f,36.0f,0.0f,0.0f},
+    {3,515.0f,39.0f,0.0f,0.0f}, {4,555.0f,39.0f,0.0f,0.0f}, {5,590.0f,40.0f,0.0f,0.0f},
+    {6,630.0f,50.0f,0.0f,0.0f}, {7,680.0f,52.0f,0.0f,0.0f},
+  } };
+  return rawFallback;
 }
 
 // ------------------------- Uptime logging (dedicated NVS partition) -------------------------
@@ -155,17 +172,12 @@ ExportPage exportPage = ExportPage::Normal;
 // going backward) the assembled value is committed (see loop()).
 // Enum-like settings (filter, gain) are thereby "single-digit numbers":
 // digitCount=1, the digit is the option index.
-const char* filterStateUiLabel(FilterState fs) {
-  switch (fs) {
-    case FilterState::Filter650nm: return "650nm";
-    case FilterState::Filter700nm: return "700nm";
-    default:                       return "no filter";
-  }
-}
-// filterStateCsvLabel()/gainCsvLabel() (for CSV export AND the new
-// settings tree node labels) now live in SettingsCodec.h/.cpp -- the same
-// source that the JSON persistence (CalibrationStore.cpp) also uses, so
-// that the two can never drift apart.
+// gainCsvLabel() (for CSV export AND the settings tree node label) lives in
+// SettingsCodec.h/.cpp -- the same source that the JSON persistence
+// (CalibrationStore.cpp) also uses, so that the two can never drift apart.
+// Band definitions have no equivalent UI label function any more -- the
+// name itself already IS the label (see the ListLeaf-based "Bands" entry
+// further below).
 
 // "single"/"precision" -- literally as named by the user, instead of the
 // internal enum names Single/Precise.
@@ -177,16 +189,18 @@ const char* precisionCsvLabel(Precision p) {
 // instead of a flat list -- its shape follows RootSettings/AppConfig.h.
 // A node is either a leaf (editable value, like SettingDescriptor before),
 // a navigation node (goes one level deeper via a long trigger press),
-// the fictitious "<Back>" entry (goes one level up), OR TipList/
-// ColorModelList -- main.cpp-local special cases that each branch off into
-// their own, main.cpp-local subflow instead of the generic tree stack (see
-// TipMenuStage/tipCatalog and colorModelListOpen/ColorDerivationModelRegistry
-// further below), because both the tip catalog and the color-model registry
-// are dynamic (no compile-time-fixed child list/count). A node ALWAYS
-// carries all fields, even if only part of them is used depending on 'kind'
-// -- the same pragmatism as before with SettingDescriptor (there, e.g.,
-// valueLabel was only populated when digitCount==1).
-enum class SettingsNodeKind : uint8_t { Leaf, Branch, Back, TipList, ColorModelList };
+// the fictitious "<Back>" entry (goes one level up), TipList -- its own
+// main.cpp-local special case with a richer subflow (create/delete/detail/
+// fingerprint-stats, see TipMenuStage/tipCatalog further below), because the
+// tip catalog is dynamic (no compile-time-fixed child list/count) AND needs
+// more than a flat pick-one-of-N list -- OR ListLeaf, the generic version of
+// that same "dynamic, named, pick one of N" need for simpler cases (ColorModel,
+// Bands) that have exactly one possible action (activate), expressed via 4
+// function pointers instead of their own dedicated SettingsNodeKind+subflow
+// each. A node ALWAYS carries all fields, even if only part of them is used
+// depending on 'kind' -- the same pragmatism as before with SettingDescriptor
+// (there, e.g., valueLabel was only populated when digitCount==1).
+enum class SettingsNodeKind : uint8_t { Leaf, Branch, Back, TipList, ListLeaf };
 
 struct SettingsNode {
   const char* name;
@@ -201,6 +215,13 @@ struct SettingsNode {
   // Branch:
   const SettingsNode* children;
   uint8_t childCount;
+  // ListLeaf: a dynamically-sized, named selection list -- long trigger
+  // press on an entry activates it immediately, stays on the list
+  // afterward (same UX TipList's Activate action already has).
+  size_t (*listCount)();
+  const std::string& (*listName)(size_t index);
+  const std::string& (*listActiveName)();
+  void (*listActivate)(const std::string& name);
 };
 
 // ------------------------- Tip catalog -------------------------
@@ -223,12 +244,24 @@ void commitCurrentSettings() {
   }
 }
 
-const char* filterSettingLabel(uint32_t v) { return filterStateUiLabel(static_cast<FilterState>(v)); }
-uint32_t getFilterSetting() { return static_cast<uint32_t>(currentSettings.optical.filterState); }
-void setFilterSetting(uint32_t v) {
-  currentSettings.optical.filterState = static_cast<FilterState>(v);
+// Mirrors activateTip(): makes 'name' the active color derivation model,
+// both live (registry, actually consulted by appendCsvRow()/renderColorInfo())
+// and persisted (RootSettings, so it survives a reboot). Defined here
+// (ahead of tipCatalog/activateTip further below) because SETTINGS_ROOT's
+// "ColorModel" ListLeaf entry needs it and every list* adapter already
+// declared by the point that array is defined.
+void activateColorModel(const std::string& name) {
+  ColorDerivationModelRegistry::instance().setActive(name);
+  currentSettings.colorModel = name;
   commitCurrentSettings();
 }
+
+// ListLeaf adapter functions for the "ColorModel" settings-tree entry --
+// bridge ColorDerivationModelRegistry's own storage to the generic
+// SettingsNode::list* function-pointer signatures (see SettingsNodeKind::ListLeaf).
+size_t colorModelListCount() { return ColorDerivationModelRegistry::instance().count(); }
+const std::string& colorModelListName(size_t i) { return ColorDerivationModelRegistry::instance().nameAt(i); }
+const std::string& colorModelActiveName() { return ColorDerivationModelRegistry::instance().activeName(); }
 
 const char* gainSettingLabel(uint32_t v) { return gainCsvLabel(static_cast<as7341_gain_t>(v)); }
 uint32_t getGainSetting() { return static_cast<uint32_t>(currentSettings.optical.sensor.gain); }
@@ -252,6 +285,24 @@ void setAStepSetting(uint32_t v) {
   commitCurrentSettings();
 }
 
+// ListLeaf adapter functions for the "Bands" settings-tree entry (see
+// SettingsNodeKind::ListLeaf) -- bridge currentSettings.bandDefinitionSets
+// (a std::map, device-level, see AppConfig.h) to the generic
+// SettingsNode::list* function-pointer signatures. No sensorImpl.applySettings()
+// call in activateBandDefinitions() -- band definitions never touched sensor
+// hardware, same as the old FilterState never did.
+size_t bandDefinitionListCount() { return currentSettings.bandDefinitionSets.size(); }
+const std::string& bandDefinitionListName(size_t i) {
+  auto it = currentSettings.bandDefinitionSets.begin();
+  std::advance(it, i);
+  return it->first;
+}
+const std::string& bandDefinitionActiveName() { return currentSettings.optical.sensor.bandDefinitions; }
+void activateBandDefinitions(const std::string& name) {
+  currentSettings.optical.sensor.bandDefinitions = name;
+  commitCurrentSettings();
+}
+
 // Children of "Sensor" -- "<Back>" is deliberately the first entry
 // (see Plan). Only Leaf fields are set, Branch fields (children/childCount)
 // remain 0/nullptr -- unused for Leaf/Back.
@@ -262,27 +313,32 @@ const SettingsNode SETTINGS_SENSOR[] = {
   { "ATIME", SettingsNodeKind::Leaf, 3, {3, 10, 10},         255,                  nullptr,          getATimeSetting, setATimeSetting },
   // ASTEP (uint16_t, max 65535): 5 decimal digits, leading digit 0-6.
   { "ASTEP", SettingsNodeKind::Leaf, 5, {7, 10, 10, 10, 10}, 65535,                nullptr,          getAStepSetting, setAStepSetting },
+  // Band definitions (NIR-correction/band-shape data, see
+  // RootSettings::bandDefinitionSets) -- sensor-specific, hence nested here
+  // rather than a sibling of "Sensor" under "Optical" (a future second
+  // sensor type would fork at exactly this point).
+  { "Bands", SettingsNodeKind::ListLeaf, 0, {}, 0, nullptr, nullptr, nullptr, nullptr, 0,
+    bandDefinitionListCount, bandDefinitionListName, bandDefinitionActiveName, activateBandDefinitions },
 };
 
-// Children of "Optical" -- filter, sensor settings AND tips (tip
-// selection affects only optical, so it belongs in here rather than at
-// the root -- see Plan/context: this keeps the tree and JSON structure
-// congruent).
+// Children of "Optical" -- tips AND sensor settings (tip selection affects
+// only optical, so it belongs in here rather than at the root -- see
+// Plan/context: this keeps the tree and JSON structure congruent).
 const SettingsNode SETTINGS_OPTICAL[] = {
   { "<Back>", SettingsNodeKind::Back },
   { "Tips",   SettingsNodeKind::TipList, 0, {}, 0, nullptr, nullptr, nullptr, nullptr, 0 },
-  { "Filter", SettingsNodeKind::Leaf,   1, {3}, 2, filterSettingLabel, getFilterSetting, setFilterSetting },
   { "Sensor", SettingsNodeKind::Branch, 0, {},  0, nullptr, nullptr, nullptr,
     SETTINGS_SENSOR, sizeof(SETTINGS_SENSOR) / sizeof(SETTINGS_SENSOR[0]) },
 };
 
-// Root of the settings tree: "Optical" (filter/sensor/tips) and
+// Root of the settings tree: "Optical" (tips/sensor settings) and
 // "ColorModel" (see ColorDerivationModelRegistry) as two separate thematic
 // groups, matching RootSettings' own two sibling fields.
 const SettingsNode SETTINGS_ROOT[] = {
   { "Optical", SettingsNodeKind::Branch, 0, {}, 0, nullptr, nullptr, nullptr,
     SETTINGS_OPTICAL, sizeof(SETTINGS_OPTICAL) / sizeof(SETTINGS_OPTICAL[0]) },
-  { "ColorModel", SettingsNodeKind::ColorModelList, 0, {}, 0, nullptr, nullptr, nullptr, nullptr, 0 },
+  { "ColorModel", SettingsNodeKind::ListLeaf, 0, {}, 0, nullptr, nullptr, nullptr, nullptr, 0,
+    colorModelListCount, colorModelListName, colorModelActiveName, activateColorModel },
 };
 
 // Navigation state in the settings tree: a small, fixed-size stack of
@@ -323,14 +379,17 @@ uint8_t tipActionIndex = 0;  // cursor in the detail screen's action list (see r
 // Reset to 0 when the screen is entered.
 uint8_t fingerprintStatsScroll = 0;
 
-// ------------------------- ColorModel subflow -------------------------
-// Mirrors the Tip subflow above, but simpler: the color-model registry has
-// no create/delete/detail actions, just a flat list where a long trigger
-// press on an entry activates it immediately (see activateColorModel()/
-// loop()). No dedicated "stage" enum needed -- only one sub-screen exists.
-bool colorModelListOpen = false;
-uint8_t colorModelListIndex = 0;  // 0 = <Back>, 1.. = registry entries
-static const uint8_t COLOR_MODEL_LIST_FIXED_ENTRIES = 1;  // just <Back> -- models aren't user-creatable
+// ------------------------- ListLeaf subflow (ColorModel, Bands) -------------------------
+// Shared by every SettingsNodeKind::ListLeaf node -- simpler than the Tip
+// subflow above: no create/delete/detail actions, just a flat list where a
+// long trigger press on an entry activates it immediately (see the node's
+// own listActivate function pointer/loop()). No dedicated "stage" enum
+// needed -- only one sub-screen exists. The tree cursor (settingsStack)
+// stays on the ListLeaf node itself the whole time (see currentSettingsNode()
+// usage in renderListLeaf()/loop()), exactly like TipList's subflow does.
+bool listLeafOpen = false;
+uint8_t listLeafIndex = 0;  // 0 = <Back>, 1.. = list entries
+static const uint8_t LIST_LEAF_FIXED_ENTRIES = 1;  // just <Back> -- entries aren't user-creatable here
 
 // A white measurement that passed checkValidity() but, according to
 // MeasurementTip::isPlausible(), is Implausible/Indeterminate -- waits for
@@ -374,26 +433,23 @@ void createTipFromCurrentSettings() {
   MeasurementTip t;
   t.name = nextTipName();
   t.optical = currentSettings.optical;
+  t.optical.tipName = t.name;  // establish the OpticalSettings.tipName invariant, see AppConfig.h
   tipCatalog.tips.push_back(t);
   tipCatalog.active = t.name;
+  currentSettings.optical.tipName = t.name;  // the new tip is active now -- keep currentSettings in sync too
   commitCurrentSettings();  // persists the catalog (and harmlessly RootSettings again, see there)
 }
 
 // Applies a tip's stored filter/sensor values (hardware + RootSettings) and
-// makes it the active one.
+// makes it the active one. currentSettings.optical.tipName is carried along
+// automatically here (tip.optical.tipName == tip.name is the invariant
+// createTipFromCurrentSettings() establishes and commitCurrentSettings()'s
+// copy-back preserves) -- dark/white reference validity therefore now also
+// depends on this tip being the active one, not just its numeric settings.
 void activateTip(const MeasurementTip& tip) {
   currentSettings.optical = tip.optical;
   sensorImpl.applySettings(currentSettings.optical);
   tipCatalog.active = tip.name;
-  commitCurrentSettings();
-}
-
-// Mirrors activateTip(): makes 'name' the active color derivation model,
-// both live (registry, actually consulted by appendCsvRow()/renderColorInfo())
-// and persisted (RootSettings, so it survives a reboot).
-void activateColorModel(const std::string& name) {
-  ColorDerivationModelRegistry::instance().setActive(name);
-  currentSettings.colorModel = name;
   commitCurrentSettings();
 }
 
@@ -496,8 +552,8 @@ struct MeasurementContext {
 };
 
 // "674/45nm" -- center/FWHM, modeled on common bandpass filter notation
-// (e.g. "680/52 BrightLine"). Needed because different FilterStates deliver
-// different bands -- a plain "674nm" name would no longer be unique enough.
+// (e.g. "680/52 BrightLine"). Needed because different band-definition sets
+// deliver different bands -- a plain "674nm" name would no longer be unique enough.
 std::string bandColumnName(const Band& b) {
   char buf[24];
   snprintf(buf, sizeof(buf), "%d/%dnm", (int)lroundf(b.center_nm), (int)lroundf(b.fwhm_nm));
@@ -518,7 +574,7 @@ std::string bandColumnName(const Band& b) {
 // SettingsRefState) instead of blindly reading the currently loaded global
 // reference here. Only relevant/needed when computeSpectrum is true.
 void appendCsvRow(std::string& out, const char* label, const Measurement& measurement,
-                   FilterState filterState, bool computeSpectrum, bool includeRaw,
+                   const BandDefinitionSet& bandDefinitions, bool computeSpectrum, bool includeRaw,
                    const std::vector<Band>& bandColumns,
                    const MeasurementContext* ctx = nullptr,
                    const Measurement* whiteForSpectrum = nullptr,
@@ -531,7 +587,7 @@ void appendCsvRow(std::string& out, const char* label, const Measurement& measur
     snprintf(buf, sizeof(buf), ",%.1f", ctx->sessionMs / 1000.0f); out += buf;
     snprintf(buf, sizeof(buf), ",%lu", (unsigned long)ctx->uptimeS); out += buf;
     out += ',';
-    out += filterStateCsvLabel(ctx->settings.filterState);
+    out += ctx->settings.sensor.bandDefinitions;
     out += ',';
     out += gainCsvLabel(ctx->settings.sensor.gain);
     snprintf(buf, sizeof(buf), ",%u", ctx->settings.sensor.atime); out += buf;
@@ -546,7 +602,7 @@ void appendCsvRow(std::string& out, const char* label, const Measurement& measur
   }
 
   if (computeSpectrum) {
-    Spectrum spec = spectrometer.getSpectrum(measurement, *whiteForSpectrum, *darkForSpectrum, filterState);
+    Spectrum spec = spectrometer.getSpectrum(measurement, *whiteForSpectrum, *darkForSpectrum, bandDefinitions);
     for (const Band& col : bandColumns) {
       out += ',';
       int idx = -1;
@@ -638,7 +694,8 @@ void collectBandsVisitor(const MeasurementRecord& rec, void* userData) {
   if (rec.kind != SampleKind::Regular) return;
   const SettingsRefState* ref = findRefState(c->refState, rec.settings);
   if (!ref || ref->dark.empty() || ref->white.empty()) return;
-  Spectrum spec = spectrometer.getSpectrum(rec.measurement, ref->white, ref->dark, rec.settings.filterState);
+  Spectrum spec = spectrometer.getSpectrum(rec.measurement, ref->white, ref->dark,
+                                            resolveBandDefinitions(rec.settings.sensor.bandDefinitions));
   for (const Band& b : spec.bands) {
     bool known = false;
     for (const Band& existing : *c->cols) {
@@ -668,7 +725,8 @@ void appendRecordToCsv(const MeasurementRecord& rec, void* userData) {
   bool computeSpectrum = ref && !ref->dark.empty() && !ref->white.empty();
   MeasurementContext mctx{ rec.tempC, rec.sessionMs, rec.uptimeS, rec.settings,
                            rec.precision, rec.sampleCount, rec.relSemWorst };
-  appendCsvRow(*ctx->out, rec.label, rec.measurement, rec.settings.filterState, computeSpectrum,
+  appendCsvRow(*ctx->out, rec.label, rec.measurement,
+               resolveBandDefinitions(rec.settings.sensor.bandDefinitions), computeSpectrum,
                ctx->includeRaw, *ctx->bandColumns, &mctx,
                computeSpectrum ? &ref->white : nullptr, computeSpectrum ? &ref->dark : nullptr);
 }
@@ -682,7 +740,7 @@ void appendRecordToCsv(const MeasurementRecord& rec, void* userData) {
 // but loaded from flash.
 //
 // Two passes through the history: the first determines the union of all
-// occurring bands (different FilterStates can structurally deliver
+// occurring bands (different band-definition sets can structurally deliver
 // different bands -- a fixed column count is no longer possible), the
 // second emits the actual rows.
 std::string buildHistoryCsv(bool includeRaw) {
@@ -695,7 +753,7 @@ std::string buildHistoryCsv(bool includeRaw) {
     return a.center_nm < b.center_nm;
   });
 
-  out += "label,temp_c,session_s,uptime_s,filter,gain,atime,astep,measurement_mode,sample_count,rel_sem_worst";
+  out += "label,temp_c,session_s,uptime_s,band_definitions,gain,atime,astep,measurement_mode,sample_count,rel_sem_worst";
   for (const Band& b : bandColumns) {
     out += ',';
     out += bandColumnName(b);
@@ -749,19 +807,21 @@ std::string buildHistoryCsv(bool includeRaw) {
 // comment further above). Needs NO column union (just one row, nothing to
 // reconcile it with) -- simply uses its own bands. Can therefore have a
 // different number/naming of columns than other rows, depending on
-// filter status/calibration match -- an unavoidable consequence of the
-// filter dependency, not a bug.
+// band-definitions/calibration match -- an unavoidable consequence of that
+// dependency, not a bug.
 void printCsvRow(const MeasurementRecord& rec) {
   bool isRef = (rec.kind != SampleKind::Regular);
   bool computeSpectrum = !isRef && calibrationValidFor(rec.settings);
   std::vector<Band> bandColumns;
   if (computeSpectrum) {
-    bandColumns = spectrometer.getSpectrum(rec.measurement, whiteRef, darkRef, rec.settings.filterState).bands;
+    bandColumns = spectrometer.getSpectrum(rec.measurement, whiteRef, darkRef,
+                                            resolveBandDefinitions(rec.settings.sensor.bandDefinitions)).bands;
   }
   std::string row;
   MeasurementContext ctx{ rec.tempC, rec.sessionMs, rec.uptimeS, rec.settings,
                           rec.precision, rec.sampleCount, rec.relSemWorst };
-  appendCsvRow(row, rec.label, rec.measurement, rec.settings.filterState, computeSpectrum,
+  appendCsvRow(row, rec.label, rec.measurement,
+               resolveBandDefinitions(rec.settings.sensor.bandDefinitions), computeSpectrum,
                /*includeRaw=*/true, bandColumns, &ctx,
                computeSpectrum ? &whiteRef : nullptr, computeSpectrum ? &darkRef : nullptr);
   Serial.print(row.c_str());
@@ -955,12 +1015,84 @@ uint8_t computeScrollStart(uint8_t selected, uint8_t count, uint8_t visible) {
   return (uint8_t)start;
 }
 
+// ------------------------- Running labels -------------------------
+// Text too long for its row is shown as a window that moves over it while it
+// is selected (see MarqueeLabel.h for the timing). Only the one selected row
+// ever animates, so a single state is enough. The selection is recognized by
+// the row's text itself (and whether it is a caret row), not by hooks in the
+// cursor movement code -- whatever puts a different text under the cursor
+// restarts the 2 s wait automatically.
+static const uint8_t MENU_COLS = OLED_WIDTH / 6;  // 6px per character at text size 1
+static const uint8_t MENU_CARET_COLS = 2;         // "> " / "  "
+
+struct MarqueeState {
+  std::string key;          // text of the row that is currently selected
+  bool keyHasCaret = false;
+  uint32_t startMs = 0;     // when 'key' became selected
+  // The overflowing selected row of the screen drawn last, if any -- what
+  // marqueeNeedsRedraw() needs to know when the visible window has to move.
+  bool active = false;
+  size_t textLen = 0, window = 0, shownOffset = 0;
+};
+MarqueeState marquee;
+
+// True when the running label of the last drawn screen has to move on --
+// polled from loop(), since nothing else redraws the settings screens
+// without a button press.
+bool marqueeNeedsRedraw() {
+  if (!marquee.active) return false;
+  return marqueeOffset(marquee.textLen, marquee.window, millis() - marquee.startMs) != marquee.shownOffset;
+}
+
+// One menu row at 'y': optional caret, 'text', then 'suffix' (" ACTIVE", ">",
+// a setting's value...). 'padTo' pads a short text so the suffixes of
+// several rows line up. If text and suffix don't fit together, the suffix
+// stays pinned at the right edge and only the text is windowed -- animated
+// when 'selected', otherwise its beginning. Without caret the row starts at
+// column 0 (single-line headers).
+void drawMenuRow(int y, bool selected, bool caret, const std::string& text,
+                 const char* suffix = "", size_t padTo = 0) {
+  const size_t caretCols = caret ? MENU_CARET_COLS : 0;
+  const size_t avail = MENU_COLS - caretCols;
+  const size_t suffixLen = strlen(suffix);
+
+  std::string shown = text;
+  if (shown.size() < padTo) shown.resize(padTo, ' ');
+
+  size_t window = shown.size();
+  if (shown.size() + suffixLen > avail) window = (suffixLen < avail) ? avail - suffixLen : 1;
+
+  size_t offset = 0;
+  if (selected) {
+    if (marquee.key != text || marquee.keyHasCaret != caret) {
+      marquee.key = text;
+      marquee.keyHasCaret = caret;
+      marquee.startMs = millis();
+    }
+    offset = marqueeOffset(shown.size(), window, millis() - marquee.startMs);
+    if (shown.size() > window) {
+      marquee.active = true;
+      marquee.textLen = shown.size();
+      marquee.window = window;
+      marquee.shownOffset = offset;
+    }
+  }
+
+  display.setCursor(0, y);
+  if (caret) display.print(selected ? "> " : "  ");
+  display.print(shown.substr(offset, window).c_str());
+  if (suffixLen > 0) {
+    display.setCursor((int16_t)((caretCols + window) * 6), y);
+    display.print(suffix);
+  }
+}
+
 // Forward declarations: defined below (after renderSettingsStatus(), closer
 // to their main.cpp-local tip state), but already needed here.
 void renderTipList();
 void renderTipDetail();
 void renderWhiteFingerprintStats();
-void renderColorModelList();
+void renderListLeaf();
 
 // Forward declaration: defined below (closer to performMeasurement(), which
 // populates the associated pendingWhite state), but already needed by
@@ -972,11 +1104,12 @@ void renderSettingsStatus() {
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(1);
+  marquee.active = false;  // set again by drawMenuRow() if the selected row overflows
 
   if (tipMenuStage == TipMenuStage::List)   { renderTipList();   return; }
   if (tipMenuStage == TipMenuStage::Detail) { renderTipDetail(); return; }
   if (tipMenuStage == TipMenuStage::FingerprintStats) { renderWhiteFingerprintStats(); return; }
-  if (colorModelListOpen) { renderColorModelList(); return; }
+  if (listLeafOpen) { renderListLeaf(); return; }
 
   if (editingActive) {
     // Digit/option editing of a leaf -- UNCHANGED compared to the earlier
@@ -1046,25 +1179,22 @@ void renderSettingsStatus() {
   int y = 16;
   for (uint8_t i = start; i < start + VISIBLE_ROWS && i < lvl.count; i++) {
     const SettingsNode& n = lvl.nodes[i];
-    char line[22];
+    bool selected = (i == lvl.index);
     if (n.kind == SettingsNodeKind::Leaf) {
       char val[10];
       if (n.valueLabel) strncpy(val, n.valueLabel(n.getValue()), sizeof(val));
       else snprintf(val, sizeof(val), "%lu", (unsigned long)n.getValue());
       val[sizeof(val) - 1] = '\0';
-      snprintf(line, sizeof(line), "%-10.10s%s", n.name, val);
+      drawMenuRow(y, selected, true, n.name, val, 10);
     } else if (n.kind == SettingsNodeKind::Branch || n.kind == SettingsNodeKind::TipList
-               || n.kind == SettingsNodeKind::ColorModelList) {
+               || n.kind == SettingsNodeKind::ListLeaf) {
       // All three go one level deeper via a long trigger press (TipList/
-      // ColorModelList into their own subflow instead of the generic tree)
-      // -- visually indistinguishable, ">" indicates "leads further in".
-      snprintf(line, sizeof(line), "%-10.10s>", n.name);
+      // ListLeaf into their own subflow instead of the generic tree) --
+      // visually indistinguishable, ">" indicates "leads further in".
+      drawMenuRow(y, selected, true, n.name, ">", 10);
     } else {
-      snprintf(line, sizeof(line), "%s", n.name);
+      drawMenuRow(y, selected, true, n.name);
     }
-    display.setCursor(0, y);
-    display.print(i == lvl.index ? "> " : "  ");
-    display.println(line);
     y += 10;
   }
   // Small scroll hint, only if there actually are more siblings outside the
@@ -1094,19 +1224,15 @@ void renderTipList() {
 
   int y = 16;
   for (uint8_t i = start; i < start + 4 && i < total; i++) {
-    char line[22];
+    bool selected = (i == tipListIndex);
     if (i == 0) {
-      snprintf(line, sizeof(line), "<Back>");
+      drawMenuRow(y, selected, true, "<Back>");
     } else if (i == 1) {
-      snprintf(line, sizeof(line), "Create new tip");
+      drawMenuRow(y, selected, true, "Create new tip");
     } else {
       const MeasurementTip& t = tipCatalog.tips[i - TIP_LIST_FIXED_ENTRIES];
-      snprintf(line, sizeof(line), "%s%s", t.name.c_str(),
-               (t.name == tipCatalog.active) ? " ACTIVE" : "");
+      drawMenuRow(y, selected, true, t.name, (t.name == tipCatalog.active) ? " ACTIVE" : "");
     }
-    display.setCursor(0, y);
-    display.print(i == tipListIndex ? "> " : "  ");
-    display.println(line);
     y += 10;
   }
   if (start > 0) {
@@ -1121,32 +1247,32 @@ void renderTipList() {
   display.display();
 }
 
-// List of the ColorModel menu entry: "<Back>", then every registered
-// ColorDerivationModel (the active one with an " ACTIVE" suffix) -- same
-// scroll window as the generic tree view and the tip list (see
-// computeScrollStart()). No "create new" entry -- unlike tips, models are
-// not user-creatable.
-void renderColorModelList() {
+// List of a ListLeaf menu entry (ColorModel, Bands): "<Back>", then every
+// entry the node's list* function pointers report (the active one with an
+// " ACTIVE" suffix) -- same scroll window as the generic tree view and the
+// tip list (see computeScrollStart()). No "create new" entry -- unlike
+// tips, these entries aren't user-creatable. The tree cursor stays on the
+// ListLeaf node itself (see currentSettingsNode()), so its own 'name' is
+// the screen title ("ColorModel"/"Bands") and its function pointers are
+// what drive this generically, with no per-concept render function needed.
+void renderListLeaf() {
+  const SettingsNode& s = currentSettingsNode();
   display.setCursor(0, 0);
-  display.println("ColorModel");
+  display.println(s.name);
 
-  ColorDerivationModelRegistry& registry = ColorDerivationModelRegistry::instance();
-  uint8_t total = (uint8_t)(COLOR_MODEL_LIST_FIXED_ENTRIES + registry.count());
-  uint8_t start = computeScrollStart(colorModelListIndex, total, 4);
+  size_t count = s.listCount();
+  uint8_t total = (uint8_t)(LIST_LEAF_FIXED_ENTRIES + count);
+  uint8_t start = computeScrollStart(listLeafIndex, total, 4);
 
   int y = 16;
   for (uint8_t i = start; i < start + 4 && i < total; i++) {
-    char line[22];
+    bool selected = (i == listLeafIndex);
     if (i == 0) {
-      snprintf(line, sizeof(line), "<Back>");
+      drawMenuRow(y, selected, true, "<Back>");
     } else {
-      const std::string& name = registry.nameAt(i - COLOR_MODEL_LIST_FIXED_ENTRIES);
-      snprintf(line, sizeof(line), "%s%s", name.c_str(),
-               (name == registry.activeName()) ? " ACTIVE" : "");
+      const std::string& name = s.listName(i - LIST_LEAF_FIXED_ENTRIES);
+      drawMenuRow(y, selected, true, name, (name == s.listActiveName()) ? " ACTIVE" : "");
     }
-    display.setCursor(0, y);
-    display.print(i == colorModelListIndex ? "> " : "  ");
-    display.println(line);
     y += 10;
   }
   if (start > 0) {
@@ -1171,8 +1297,7 @@ void renderTipDetail() {
   const MeasurementTip& tip = tipCatalog.tips[tipDetailIndex];
   bool isActive = (tip.name == tipCatalog.active);
 
-  display.setCursor(0, 0);
-  display.println(tip.name.c_str());
+  drawMenuRow(0, true, false, tip.name);
   if (isActive) {
     display.setCursor(0, 10);
     display.println("ACTIVE");
@@ -1345,7 +1470,8 @@ void renderCurrentView() {
   // currently selected measurement mode, not the generic DisplayMode
   // abbreviation.
   ViewContext ctx{ spectrometer, lastMeasurement, effWhite, effDark, haveMatchingCal,
-                   MEASUREMENT_MODES[measurementModeIndex].cornerLabel, lastLabel, calCheckSettings.filterState };
+                   MEASUREMENT_MODES[measurementModeIndex].cornerLabel, lastLabel,
+                   resolveBandDefinitions(calCheckSettings.sensor.bandDefinitions) };
   VIEW_RENDERERS[static_cast<uint8_t>(currentView)](display, ctx);
 }
 
@@ -1680,7 +1806,9 @@ bool performMeasurement(Precision precision, SampleKind kind) {
   // just like in the sensor-error/non-convergence case above.
   if (kind == SampleKind::White) {
     MeasurementValidity validity = spectrometer.checkValidity(measurement, telemetry.semPerChannel,
-                                                               currentSettings.optical, darkRef, darkRefSem);
+                                                               currentSettings.optical,
+                                                               resolveBandDefinitions(currentSettings.optical.sensor.bandDefinitions),
+                                                               darkRef, darkRefSem);
     if (!validity.ok) {
       busy = false;
       renderWhiteValidityWarning(measurement, validity);
@@ -1808,9 +1936,9 @@ void cycleView() {
       renderCurrentView();
       return;
     }
-    if (colorModelListOpen) {
-      uint8_t total = (uint8_t)(COLOR_MODEL_LIST_FIXED_ENTRIES + ColorDerivationModelRegistry::instance().count());
-      colorModelListIndex = (colorModelListIndex + 1) % total;
+    if (listLeafOpen) {
+      uint8_t total = (uint8_t)(LIST_LEAF_FIXED_ENTRIES + currentSettingsNode().listCount());
+      listLeafIndex = (listLeafIndex + 1) % total;
       renderCurrentView();
       return;
     }
@@ -1875,7 +2003,7 @@ void cycleMode() {
     settingsDepth = 0;
     settingsStack[0] = { SETTINGS_ROOT, sizeof(SETTINGS_ROOT) / sizeof(SETTINGS_ROOT[0]), 0 };
     tipMenuStage = TipMenuStage::Closed;
-    colorModelListOpen = false;
+    listLeafOpen = false;
   }
   if (currentDisplayMode == DisplayMode::Calibration && previous != DisplayMode::Calibration) {
     // Same consideration -- don't unknowingly land on "Dark".
@@ -1899,6 +2027,7 @@ void cycleMode() {
   // see performMeasurement()), the held Measurement is cleanly released in
   // the process.
   pendingWhite = PendingWhiteDecision();
+  marquee.key.clear();  // re-entering Settings restarts a running label's 2 s wait
 
   renderCurrentView();
 
@@ -1954,6 +2083,36 @@ void setup() {
   calStore.loadDark(darkRef, darkRefSem, darkRefSettings);
   calStore.loadWhite(whiteRef, whiteRefSem, whiteRefSettings);
   calStore.loadSettings(currentSettings);
+  // Seed ONLY if empty (very first boot, or a settings blob from before this
+  // feature existed) -- never clobber an already-populated map (e.g. once a
+  // future upload mechanism lets the user add their own). Exact
+  // transcriptions of the formerly hardcoded BANDS_NONE/650NM/700NM tables,
+  // plus the new always-available "AS7341 raw" (all 8 channels, zero
+  // correction, F8 at its datasheet-nominal 680nm/52nm -- see
+  // AS7341Spectrometer.cpp's former BANDS_700NM comment on the 674nm/45nm
+  // redefinition for why that differs from the raw value here).
+  if (currentSettings.bandDefinitionSets.empty()) {
+    currentSettings.bandDefinitionSets["AS7341 raw"] = { {
+      {0,415.0f,26.0f,0.0f,0.0f}, {1,445.0f,30.0f,0.0f,0.0f}, {2,480.0f,36.0f,0.0f,0.0f},
+      {3,515.0f,39.0f,0.0f,0.0f}, {4,555.0f,39.0f,0.0f,0.0f}, {5,590.0f,40.0f,0.0f,0.0f},
+      {6,630.0f,50.0f,0.0f,0.0f}, {7,680.0f,52.0f,0.0f,0.0f},
+    } };
+    currentSettings.bandDefinitionSets["AS7341 NIR-corrected"] = { {
+      {0,415.0f,26.0f,0.355f,0.060f}, {1,445.0f,30.0f,0.109f,0.019f}, {2,480.0f,36.0f,0.089f,0.012f},
+      {3,515.0f,39.0f,0.036f,0.007f}, {4,555.0f,39.0f,0.057f,0.011f}, {5,590.0f,40.0f,0.0f,0.12f},
+      {6,630.0f,50.0f,0.0f,0.0f},
+    } };
+    currentSettings.bandDefinitionSets["AS7341 650nm filter"] = { {
+      {0,415.0f,26.0f,0.0f,0.0f}, {1,445.0f,30.0f,0.0f,0.0f}, {2,480.0f,36.0f,0.0f,0.0f},
+      {3,515.0f,39.0f,0.0f,0.0f}, {4,555.0f,39.0f,0.0f,0.0f}, {5,590.0f,40.0f,0.0f,0.0f},
+    } };
+    currentSettings.bandDefinitionSets["AS7341 700nm filter"] = { {
+      {0,415.0f,26.0f,0.125f,0.045f}, {1,445.0f,30.0f,0.032f,0.017f}, {2,480.0f,36.0f,0.024f,0.013f},
+      {3,515.0f,39.0f,0.009f,0.011f}, {4,555.0f,39.0f,0.026f,0.014f}, {5,590.0f,40.0f,0.0f,0.14f},
+      {6,630.0f,50.0f,0.0f,0.07f}, {7,674.0f,45.0f,0.0f,0.03f},
+    } };
+    calStore.saveSettings(currentSettings);
+  }
   calibrated = calibrationValidFor(currentSettings.optical);
   // No-op (stays on "Default") if the persisted name isn't registered --
   // e.g. a settings blob saved before this field existed, or a firmware
@@ -2131,27 +2290,28 @@ void loop() {
         tipMenuStage = TipMenuStage::Detail;
         renderCurrentView();
       }
-    } else if (colorModelListOpen) {
+    } else if (listLeafOpen) {
       // "<Back>" closes the list (back into the generic tree, positioned on
-      // "ColorModel"); any other entry activates that model immediately --
-      // no detail/confirm step, unlike Tips, since there's only one possible
-      // action here. Stays ON the list afterward (re-rendering shows the
-      // updated " ACTIVE" marker), mirroring how activateTip() also returns
-      // to the Tips List stage rather than leaving the subflow entirely.
+      // the ListLeaf node itself); any other entry activates it immediately
+      // -- no detail/confirm step, unlike Tips, since there's only one
+      // possible action here. Stays ON the list afterward (re-rendering
+      // shows the updated " ACTIVE" marker), mirroring how activateTip()
+      // also returns to the Tips List stage rather than leaving the subflow
+      // entirely.
       if (te == DebouncedButton::Event::LongPress) {
-        if (colorModelListIndex == 0) {
-          colorModelListOpen = false;
+        const SettingsNode& s = currentSettingsNode();
+        if (listLeafIndex == 0) {
+          listLeafOpen = false;
         } else {
-          ColorDerivationModelRegistry& registry = ColorDerivationModelRegistry::instance();
-          activateColorModel(registry.nameAt(colorModelListIndex - COLOR_MODEL_LIST_FIXED_ENTRIES));
+          s.listActivate(s.listName(listLeafIndex - LIST_LEAF_FIXED_ENTRIES));
         }
         renderCurrentView();
       }
     } else if (!editingActive) {
       // Outside of editing, a long trigger press acts differently depending
       // on the node kind: "<Back>" goes one level up, a navigation node
-      // one level down, a leaf starts editing (as before), TipList opens
-      // the tip menu entry.
+      // one level down, a leaf starts editing (as before), TipList/ListLeaf
+      // open their own subflow.
       if (te == DebouncedButton::Event::LongPress) {
         const SettingsNode& s = currentSettingsNode();
         switch (s.kind) {
@@ -2176,9 +2336,9 @@ void loop() {
             tipListIndex = 0;
             renderCurrentView();
             break;
-          case SettingsNodeKind::ColorModelList:
-            colorModelListOpen = true;
-            colorModelListIndex = 0;
+          case SettingsNodeKind::ListLeaf:
+            listLeafOpen = true;
+            listLeafIndex = 0;
             renderCurrentView();
             break;
         }
@@ -2247,6 +2407,12 @@ void loop() {
   // temperature/uptime visibly keep updating.
   if (currentDisplayMode == DisplayMode::Info && (millis() - lastInfoRenderMs) >= 10000UL) {
     lastInfoRenderMs = millis();
+    renderCurrentView();
+  }
+
+  // Settings: a running label (see drawMenuRow()) moves on without any
+  // button press -- redrawn only when its visible window actually changes.
+  if (currentDisplayMode == DisplayMode::Settings && marqueeNeedsRedraw()) {
     renderCurrentView();
   }
 

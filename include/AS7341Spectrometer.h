@@ -44,32 +44,33 @@ public:
   Spectrum getSpectrum(const Measurement& measurement,
                         const Measurement& whiteReference,
                         const Measurement& darkReference,
-                        FilterState filterState) const override;
+                        const BandDefinitionSet& bandDefinitions) const override;
 
   MeasurementValidity checkValidity(const Measurement& raw, const Measurement& rawSem,
                                      const OpticalSettings& settings,
+                                     const BandDefinitionSet& bandDefinitions,
                                      const Measurement& darkMean, const Measurement& darkSem) const override;
   Measurement normalize(const Measurement& raw, const SensorSettings& sensor) const override;
 
 private:
-  // Raw channel indices that, for the given filter, actually enter the
-  // spectrum as a VIS band (see the BANDS_* tables) -- ONLY for checkValidity(),
-  // hence private (not part of the interface, see the Spectrometer.h comment).
+  // Raw channel indices that, for the given band-definition set, actually
+  // enter the spectrum as a VIS band -- ONLY for checkValidity(), hence
+  // private (not part of the interface, see the Spectrometer.h comment).
   // DELIBERATELY without NIR/Clear: NIR would be structurally
   // dark under an IR-cut filter and could not be lifted above the noise
   // floor by anything; Clear is already indirectly covered by the VIS channels.
-  uint8_t relevantChannels(FilterState fs, uint8_t outIdx[N_CH]) const;
+  uint8_t relevantChannels(const BandDefinitionSet& bandDefinitions, uint8_t outIdx[N_CH]) const;
 
   // Computes the calibrated reflectance of the VIS channels usable for the
-  // given FilterState (see the BANDS_* tables in the .cpp) directly into 'out'.
-  // Internally, the NIR reflectance is also determined (same formula), in order
-  // to subtract out optical crosstalk from NIR light -- the strength
-  // of this correction is filter-dependent. The result remains only
-  // R_vis; NIR itself does not flow into the (sensor-independent) Spectrum.
+  // given band-definition set directly into 'out'. Internally, the NIR
+  // reflectance is also determined (same formula), in order to subtract out
+  // optical crosstalk from NIR light -- the strength of this correction is
+  // per-band (see VisBandDef::nirFactor). The result remains only R_vis;
+  // NIR itself does not flow into the (sensor-independent) Spectrum.
   void computeReflectance(const Measurement& measurement,
                           const Measurement& whiteReference,
                           const Measurement& darkReference,
-                          FilterState filterState,
+                          const BandDefinitionSet& bandDefinitions,
                           Spectrum& out) const;
 
   Adafruit_AS7341 as7341_;

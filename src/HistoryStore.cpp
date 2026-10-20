@@ -8,18 +8,28 @@
 
 static const char* HISTORY_PATH = "/history.csv";
 
-// Row format: <label>,<kindNum>,<tempC>,<sessionMs>,<uptimeS>,<filterStateNum>,<gainNum>,<atime>,<astep>,<precisionNum>,<sampleCount>,<relSemWorst|empty>,<channelCount>,<v0>,...,<vN-1>,<sem0|empty>,...,<semN-1|empty>
-// The bounds check on kindNum/filterStateNum/gainNum/precisionNum/channelCount
-// guards against a row mangled by a power loss that still happens to end with
-// '\n'. relSemWorst is an EMPTY field (not "0") when no relSEM was computed --
-// see the MeasurementRecord comment in HistoryStore.h. channelCount is what
-// makes the second (SEM) value block parsable in the first place (without it
-// there would be no way to know where the first block ends) -- rows from
-// BEFORE this extension (without channelCount) are thereby reliably discarded
-// instead of misinterpreted: their first raw value is read as a (guaranteed
-// too large) channelCount, the subsequent read of that many fields runs past
-// the end of the line and fails cleanly (see the bounds check below) -- no
-// migration, as everywhere else.
+// Row format: <label>,<kindNum>,<tempC>,<sessionMs>,<uptimeS>,<tipName>,<bandDefinitionsName>,<gainNum>,<atime>,<astep>,<precisionNum>,<sampleCount>,<relSemWorst|empty>,<channelCount>,<v0>,...,<vN-1>,<sem0|empty>,...,<semN-1|empty>
+// tipName/bandDefinitionsName are plain strings now (no bounds check
+// possible/needed -- tip names are auto-generated "Tip N" and band-
+// definition names are validated comma/newline-free when they're created,
+// see main.cpp), replacing what used to be a single bounds-checked
+// filterStateNum field. The bounds check on kindNum/gainNum/precisionNum/
+// channelCount guards against a row mangled by a power loss that still
+// happens to end with '\n'. relSemWorst is an EMPTY field (not "0") when no
+// relSEM was computed -- see the MeasurementRecord comment in HistoryStore.h.
+// channelCount is what makes the second (SEM) value block parsable in the
+// first place (without it there would be no way to know where the first
+// block ends).
+//
+// Rows from BEFORE the tipName field was inserted (one field shorter at this
+// position) are NOT translated -- same "no migration" philosophy already
+// applied when channelCount was added: the field shift propagates forward
+// (what was gainNum is now read as atime, etc.), and is reliably caught
+// downstream by the existing gainNum/precisionNum/channelCount bounds checks
+// in all realistic cases (e.g. any pre-existing sampleCount above 1, or any
+// raw channel count exceeding the channelCount sanity bound below) -- old
+// rows are thereby cleanly discarded rather than misinterpreted, not
+// migrated, exactly as before.
 static bool parseLine(const std::string& line, MeasurementRecord& rec) {
   size_t pos = 0;
   auto nextField = [&](std::string& out) -> bool {
@@ -50,9 +60,10 @@ static bool parseLine(const std::string& line, MeasurementRecord& rec) {
   rec.uptimeS = static_cast<uint32_t>(strtoul(field.c_str(), nullptr, 10));
 
   if (!nextField(field)) return false;
-  int filterNum = atoi(field.c_str());
-  if (filterNum < 0 || filterNum >= static_cast<int>(FilterState::COUNT)) return false;
-  rec.settings.filterState = static_cast<FilterState>(filterNum);
+  rec.settings.tipName = field;
+
+  if (!nextField(field)) return false;
+  rec.settings.sensor.bandDefinitions = field;
 
   if (!nextField(field)) return false;
   int gainNum = atoi(field.c_str());
@@ -151,7 +162,9 @@ bool HistoryStore::append(const MeasurementRecord& rec) {
   f.print(',');
   f.print(rec.uptimeS);
   f.print(',');
-  f.print((int)rec.settings.filterState);
+  f.print(rec.settings.tipName.c_str());
+  f.print(',');
+  f.print(rec.settings.sensor.bandDefinitions.c_str());
   f.print(',');
   f.print((int)rec.settings.sensor.gain);
   f.print(',');

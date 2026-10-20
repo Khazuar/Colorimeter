@@ -1,16 +1,16 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Settings",
-  "$comment": "Beschreibt RootSettings (include/AppConfig.h, main.cpp::currentSettings) -- die persistierte 'live'-Konfiguration und die Wurzel des Settings-Baums in der Geraete-UI. Gruppiert aktuell 'optical' (OpticalSettings) als einzige thematische Gruppe; kuenftige, andersartige Einstellungen (z.B. Sprache, Bluetooth-Name) kommen als weitere Top-Level-Properties dazu, nicht in 'optical' hinein. Wird auf dem Geraet selbst nicht genutzt (reine Dokumentation/Vorbereitung fuer einen spaeteren Host-seitigen Import/Export). Struct und diese Datei muessen von Hand zusammen gepflegt werden, es gibt keine automatische Generierung/Pruefung. Siehe schema/tips.schema.json fuer den (separaten) Messspitzen-Katalog, dessen Eintraege dieselbe OpticalSettings-Form unter 'optical' tragen.",
+  "$comment": "Beschreibt RootSettings (include/AppConfig.h, main.cpp::currentSettings) -- die persistierte 'live'-Konfiguration und die Wurzel des Settings-Baums in der Geraete-UI. Gruppiert 'optical' (OpticalSettings), 'colorModel' und 'bandDefinitionSets' als separate thematische Gruppen; kuenftige, andersartige Einstellungen (z.B. Sprache, Bluetooth-Name) kommen als weitere Top-Level-Properties dazu, nicht in 'optical' hinein. Wird auf dem Geraet selbst nicht genutzt (reine Dokumentation/Vorbereitung fuer einen spaeteren Host-seitigen Import/Export). Struct und diese Datei muessen von Hand zusammen gepflegt werden, es gibt keine automatische Generierung/Pruefung. Siehe schema/tips.schema.json fuer den (separaten) Messspitzen-Katalog, dessen Eintraege dieselbe OpticalSettings-Form unter 'optical' tragen.",
   "type": "object",
   "properties": {
     "optical": {
       "type": "object",
       "title": "OpticalSettings",
       "properties": {
-        "filter": {
+        "tipName": {
           "type": "string",
-          "enum": ["none", "650nm", "700nm"]
+          "description": "Name of the MeasurementTip this snapshot belongs to/was recorded under (see schema/tips.schema.json). Part of the device's equality check for dark/white reference validity -- a different tip (even with identical sensor settings) requires a fresh calibration."
         },
         "sensor": {
           "type": "object",
@@ -29,18 +29,51 @@
               "type": "integer",
               "minimum": 0,
               "maximum": 65535
+            },
+            "bandDefinitions": {
+              "type": "string",
+              "description": "Name of a band-definition set known to the device (the built-in \"AS7341 raw\", or one of RootSettings.bandDefinitionSets). No fixed enum any more -- the valid set depends on what's loaded on the device."
             }
           },
           "required": ["gain", "atime", "astep"],
           "additionalProperties": false
         }
       },
-      "required": ["filter", "sensor"],
+      "required": ["sensor"],
       "additionalProperties": false
     },
     "colorModel": {
       "type": "string",
       "description": "Name of the selected entry in the firmware's ColorDerivationModelRegistry. Falls back to \"Default\" if missing or not recognized by the running firmware."
+    },
+    "bandDefinitionSets": {
+      "type": "object",
+      "description": "Device-level: every band-definition set this device currently knows about, by name (NOT duplicated into every tip/historical snapshot -- those only carry the active NAME via optical.sensor.bandDefinitions). Seeded once at first boot; for now only ever changed by hand in firmware -- no upload/edit mechanism yet.",
+      "additionalProperties": {
+        "type": "object",
+        "title": "BandDefinitionSet",
+        "properties": {
+          "bands": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "title": "VisBandDef",
+              "properties": {
+                "channelIndex": { "type": "integer", "minimum": 0, "maximum": 7 },
+                "center_nm": { "type": "number" },
+                "fwhm_nm": { "type": "number" },
+                "nirFactor": { "type": "number", "default": 0.0 },
+                "nirFactorErr": { "type": "number", "default": 0.0 }
+              },
+              "required": ["channelIndex", "center_nm", "fwhm_nm"],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": ["bands"],
+        "additionalProperties": false
+      }
     }
   },
   "required": ["optical"],
